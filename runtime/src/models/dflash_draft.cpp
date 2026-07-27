@@ -547,8 +547,11 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     cu(cudaStreamSynchronize(st), "draft sync");
     for (int t = 0; t < B; t++) out_argmax[t] = s.h_out[t];
 
-    // Crop draft KV to pos0 (= start of block) — discards noise, keeps context features
-    // when past was already pos0 and ctx filled the gap. Matches reference crop(start).
+    // Advance past the just-appended ctx+noise, then crop to `pos0` (= block start).
+    // Matches z-lab dflash: past_key_values_draft.update(...) then .crop(start).
+    // Without this, seq_len stays 0, crop(pos0) clamps to 0, and every step rebuilds
+    // from an empty cache — draft quality collapses (τ≈1.x) after the first block.
+    s.seq_len = past + ctx_len + B;
     crop(pos0);
     return true;
 }
