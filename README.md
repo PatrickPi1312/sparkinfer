@@ -4,7 +4,7 @@
 
 **Agentic AI inference. Optimized for every Blackwell GPU.**
 
-**+71% faster** than llama.cpp with Blackwell-native **Custom CUDA kernels** (Qwen3.6-35B-A3B SOTA, RTX 5090, v0.4.1). SparkInfer is the runtime layer for **Private AI** agents — optimized MoE/LLM decoding from desk-side RTX to workstation PRO 6000. Continuously optimized by competition at **[SN74 on Gittensor](https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer)** and **Kernel Design Agents**.
+**+86% faster** than llama.cpp with Blackwell-native **Custom CUDA kernels** (Qwen3.6-35B-A3B SOTA, RTX 5090, v0.4.3). SparkInfer is the runtime layer for **Private AI** agents — optimized MoE/LLM decoding from desk-side RTX to workstation PRO 6000. Continuously optimized by competition at **[SN74 on Gittensor](https://gittensor.io/miners/repository?name=gittensor-ai-lab%2Fsparkinfer)** and **Kernel Design Agents**.
 
 **Why fastest?** Faster inference means more intelligence, more responsive agents, and more efficient compute.
 
@@ -34,15 +34,25 @@ SparkInfer focuses on the models driving the future of AI — not thousands of l
 
 ## Benchmark · Qwen3.6-35B-A3B SOTA
 
-RTX 5090 · same `UD-Q4_K_M` GGUF · greedy bs=1 decode · warm interleaved · **v0.4.1** frontier.
+RTX 5090 · same `UD-Q4_K_M` GGUF · greedy bs=1 · warm interleaved · **v0.4.3** frontier (same-box main guards).
+
+### Decode
 
 | context | SparkInfer | llama.cpp | Δ |
 |---:|---:|---:|---:|
-| 128 | **473** tok/s | 276 tok/s | **+71%** |
-| 512 | **481** tok/s | 276 tok/s | +74% |
-| 4k | **460** tok/s | 276 tok/s | +66% |
-| 16k | **450** tok/s | 281 tok/s | +60% |
-| 32k | **428** tok/s | 280 tok/s | +53% |
+| 128 | **512** tok/s | 276 tok/s | **+86%** |
+| 512 | **506** tok/s | 276 tok/s | +83% |
+| 4k | **486** tok/s | 276 tok/s | +76% |
+| 16k | **467** tok/s | 281 tok/s | +66% |
+| 32k | **437** tok/s | 280 tok/s | +56% |
+
+### Prefill
+
+| context | SparkInfer | llama.cpp | Δ |
+|---:|---:|---:|---:|
+| 4k | **13,800** tok/s | 8,726 tok/s | **+58%** |
+| 16k | **17,700** tok/s | 8,390 tok/s | **+111%** |
+| 32k | **18,150** tok/s | 7,984 tok/s | **+127%** |
 
 Quality parity vs llama.cpp: top-1 **0.953** · KL **0.031** · IFEval **83%** · BFCL **75%**.
 
@@ -60,7 +70,7 @@ Runtime footprint (excluding model weights):
 
 ## Powered by SN74 — moving at the speed of ⚡
 
-Contributors submit PRs; the bot verifies correctness and speed on real RTX 5090 hardware; SN74 rewards verified marginal speedups. **15 releases in 3 weeks** — from first llama.cpp beat to **+71% on Qwen3.6 SOTA**.
+Contributors submit PRs; the bot verifies correctness and speed on real RTX 5090 hardware; SN74 rewards verified marginal speedups. **15 releases in 3 weeks** — from first llama.cpp beat to **+86% decode / +127% prefill @ 32k on Qwen3.6 SOTA**.
 
 1. Pick a narrow bottleneck in the Blackwell decode path.
 2. Submit a PR with source changes and benchmark evidence.
@@ -77,7 +87,7 @@ Miner workflow: [`docs/miner-guide.md`](docs/miner-guide.md).
 
 *Fastest = cost-effective inference* — more tokens per dollar on Blackwell edge first.
 
-- Qwen3.6 SOTA: **+71%** vs llama.cpp on RTX 5090 (473 tok/s @ 128 ctx)
+- Qwen3.6 SOTA: **+86%** decode / **+127%** prefill @ 32k vs llama.cpp on RTX 5090 (512 tok/s decode @ 128 ctx)
 - RTX PRO 6000 — **32k input + 4k output**, full MoE resident
 - RTX Spark + DGX Spark `sm_121` bring-up for desk-side agents
 - Fastest AI runtime at the edge · desktop app, RAG, memory
