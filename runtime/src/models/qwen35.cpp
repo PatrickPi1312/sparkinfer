@@ -153,6 +153,11 @@ struct Qwen35Model::Impl {
     void  *sx_q8 = nullptr;  // pipelined shared-expert Q8_1(h) for down (avoids racing aq81)
     int   *mf_ids = nullptr, *mf_counts = nullptr;
     unsigned int *mf_rc = nullptr;   // fused-router grid-completion counter (persistent, zero-init)
+    // Per-row int8 scales of the routed expert weights, for the batched prefill's fused
+    // quantized-B MoE GEMM (prefill_moe_q.cu). Laid out [layer][expert * rows]; populated
+    // EAGERLY here at load, never lazily -- the scored sweep times each context exactly once
+    // (512 first), so a lazy fill would land inside the very pass it is meant to speed up.
+    float *moe_rs_gate = nullptr, *moe_rs_up = nullptr, *moe_rs_down = nullptr;
     // flash-decoding (KV-split) attention partials
     static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
     int n_splits = 32;
@@ -342,6 +347,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
     cudaFree(p_->sx_h); cudaFree(p_->sx_q8);
     cudaFree(p_->mf_ids); cudaFree(p_->mf_counts); cudaFree(p_->mf_rc);
+    cudaFree(p_->moe_rs_gate); cudaFree(p_->moe_rs_up); cudaFree(p_->moe_rs_down);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->sparse_sel);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
@@ -1368,7 +1374,8 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
-                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down };
     return prefill_batched_run(ctx, prompt_ids, n);
 }
 
@@ -1975,6 +1982,61 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             : (w.router_w && w.gate_q && w.up_q && w.down_q);
         if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
+    }
+    // ---- eager per-row int8 scales of the routed experts (fused quantized-B MoE prefill GEMM) ----
+    // The batched prefill can run the routed GEMMs straight off the native GGUF expert weights
+    // instead of materializing the whole int8 expert pool once per layer (prefill_moe_q.cu). That
+    // needs the per-row int8 scale, which is a property of the FULL row (amax over all `cols`) and
+    // so cannot be derived from a K-tile inside the GEMM. Compute it here with the same kernel the
+    // materialize path uses and keep only its `scale` output: the fused GEMM then quantizes to the
+    // identical int8 bytes by construction, not by re-deriving the scale.
+    // ~120 MB for Qwen3.6-35B-A3B (40 layers x 256 experts x (512+512+2048) rows). Any failure
+    // leaves the pointers null and the prefill simply keeps materializing.
+    // SPARKINFER_PREFILL_MOE_QB=0 skips the precompute entirely.
+    if (!c.dense_ffn && c.n_experts > 0 && c.moe_ffn > 0) {
+        const char* qb_env = getenv("SPARKINFER_PREFILL_MOE_QB");
+        if (!qb_env || qb_env[0] != '0') {
+            const size_t rg = (size_t)c.n_experts * c.moe_ffn;   // gate/up rows per layer
+            const size_t rd = (size_t)c.n_experts * H;           // down rows per layer
+            const size_t ng = rg * (size_t)c.n_layers, nd = rd * (size_t)c.n_layers;
+            const size_t tmp_bytes = 64u << 20;                  // int8 scratch, thrown away
+            signed char* tmp = nullptr;
+            bool ok = cudaMalloc(&s.moe_rs_gate, ng * sizeof(float)) == cudaSuccess;
+            ok = ok && cudaMalloc(&s.moe_rs_up,   ng * sizeof(float)) == cudaSuccess;
+            ok = ok && cudaMalloc(&s.moe_rs_down, nd * sizeof(float)) == cudaSuccess;
+            ok = ok && cudaMalloc(&tmp, tmp_bytes) == cudaSuccess;
+            auto fill = [&](int qtype, const void* src, float* dst, size_t rows, int cols) {
+                const int blk = (qtype == 12) ? 144 : (qtype == 13) ? 176 : 210;
+                const size_t rb = (size_t)(cols >> 8) * (size_t)blk;   // bytes per quantized row
+                const size_t chunk = tmp_bytes / (size_t)cols;
+                for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+                    const size_t nr = (rows - r0 < chunk) ? (rows - r0) : chunk;
+                    if (!kernels::launch_gguf_dequant_rows_i8(
+                            qtype, (const char*)src + r0 * rb, tmp, dst + r0,
+                            (int)nr, cols, s.stream))
+                        return false;
+                }
+                return true;
+            };
+            for (int i = 0; ok && i < c.n_layers; i++) {
+                const Qwen35LayerWeights& lw = s.w.layers[i];
+                if (!lw.gate_q || !lw.up_q || !lw.down_q) { ok = false; break; }
+                ok = fill(lw.gate_qtype, lw.gate_q, s.moe_rs_gate + (size_t)i * rg, rg, H)
+                  && fill(lw.up_qtype,   lw.up_q,   s.moe_rs_up   + (size_t)i * rg, rg, H)
+                  && fill(lw.down_qtype, lw.down_q, s.moe_rs_down + (size_t)i * rd, rd, c.moe_ffn);
+            }
+            if (ok) ok = cudaStreamSynchronize(s.stream) == cudaSuccess;
+            if (tmp) cudaFree(tmp);
+            if (!ok) {
+                cudaFree(s.moe_rs_gate); cudaFree(s.moe_rs_up); cudaFree(s.moe_rs_down);
+                s.moe_rs_gate = s.moe_rs_up = s.moe_rs_down = nullptr;
+                fprintf(stderr, "[prefill-moe] expert row-scale precompute unavailable "
+                                "-> int8 materialize path\n");
+            } else {
+                fprintf(stderr, "[prefill-moe] expert int8 row scales ready (%.0f MB)\n",
+                        (double)((2 * ng + nd) * sizeof(float)) / (1024.0 * 1024.0));
+            }
+        }
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;

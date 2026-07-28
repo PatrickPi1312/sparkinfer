@@ -20,6 +20,7 @@
 #include "sparkinfer/kernels/prefill_fp8.h"
 #include "sparkinfer/kernels/prefill_moe.h"
 #include "sparkinfer/kernels/prefill_router_mma.h"
+#include "sparkinfer/kernels/prefill_moe_q.h"
 #include "sparkinfer/kernels/moe.h"
 
 #include <cuda_runtime.h>
@@ -284,6 +285,30 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (e) return e[0] != '0';
         return N <= 512;
     }();
+    // Fused quantized-B routed GEMM (prefill_moe_q.cu): read the experts in their native GGUF
+    // quantization and decode to int8 inside the B stage, so the per-layer int8 materialize never
+    // happens (~1.6 GB/layer of write + read back). The dequant is a FIXED per-pass cost — it
+    // materializes all 256 experts every layer whatever N — so it dominates at short prompts:
+    // measured 38% of the 512 prefill and 27.5% of the 4k prefill, but only 4.9% at 32k.
+    // It pays only while each expert slice is decoded ~once, i.e. while pairs/expert stays inside a
+    // couple of BM tiles: at BM=128 that is 1 tile at 4k and 2 at 8k, but 8 at 32k, where
+    // re-decoding costs more than materializing. Hence the context cap (default 8192, which is also
+    // the CB mixed-load TTFT prefill size). SPARKINFER_PREFILL_MOE_QB=0 disables.
+    const int moe_qb_maxctx = [&]{
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_QB_MAXCTX");
+        const int v = e ? atoi(e) : 8192;
+        return v > 0 ? v : 8192;
+    }();
+    // Per-weight mask: 1 = gate, 2 = up, 4 = down (default 7 = all three, 0 = off). Per-weight
+    // granularity is what makes the identity checkable: gate/up write their result directly, so
+    // mask 3 vs 0 is a byte-for-byte comparison, whereas the down projection scatters through
+    // float atomicAdd and so carries main's own run-to-run ordering either way.
+    const int moe_qb_mask = [&]{
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_QB");
+        return e ? atoi(e) : 7;
+    }();
+    const bool moe_qb = moe && !moe_serial && !moe_fused && N <= moe_qb_maxctx &&
+                        s.moe_rs_gate && s.moe_rs_up && s.moe_rs_down && moe_qb_mask != 0;
     // Device tilemap + mask dequant: skip per-layer D2H counts sync. Default OFF — opt-in via
     // SPARKINFER_PREFILL_MOE_GPU=1. The #583 default-ON path fails prefill_check (batched vs
     // token-loop TOP1 ~0.44–0.56 @512 vs ~0.88–0.94 with host tilemap; #586). Stale global
@@ -1011,27 +1036,57 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 }
                 }  // !moe_gpu host tilemap path
             } else {
-                // Bulk: expert weights -> int8 rows ONCE per layer (all 256 experts).
-                kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, w.gate_q, Wg_i8, swg, E * mffn, H, st);
-                kernels::launch_gguf_dequant_rows_i8(w.up_qtype,   w.up_q,   Wu_i8, swu, E * mffn, H, st);
-                kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q, Wd_i8, swd, E * H, mffn, st);
+                // Bulk: expert weights -> int8 rows ONCE per layer (all 256 experts) -- unless the
+                // fused quantized-B GEMM takes the weight, in which case it is never materialized.
+                // Each launch_pfm_moe_gemm_qi8 returns false (having launched nothing) for a quant
+                // type or shape it cannot decode, so every weight independently falls back to the
+                // dequant + int8 GEMM pair. Both paths produce the same int8 bytes and the same
+                // int32 accumulation, so the outputs are identical either way.
+                const float* rs_g = moe_qb ? s.moe_rs_gate + (size_t)L * E * mffn : nullptr;
+                const float* rs_u = moe_qb ? s.moe_rs_up   + (size_t)L * E * mffn : nullptr;
+                const float* rs_d = moe_qb ? s.moe_rs_down + (size_t)L * E * H    : nullptr;
+                bool qb_g = false, qb_u = false;
+                if (!moe_fuse_gu && rs_g && (moe_qb_mask & 1))
+                    qb_g = kernels::launch_pfm_moe_gemm_qi8(
+                        w.gate_qtype, mA_i8, msx, w.gate_q, rs_g, pair_tok, pair_w, moffsets,
+                        tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles, moe_bm,
+                        /*a_indirect=*/true, /*c_scatter=*/false, st);
+                if (!moe_fuse_gu && rs_u && (moe_qb_mask & 2))
+                    qb_u = kernels::launch_pfm_moe_gemm_qi8(
+                        w.up_qtype, mA_i8, msx, w.up_q, rs_u, pair_tok, pair_w, moffsets,
+                        tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles, moe_bm, true, false, st);
+                if (!qb_g)
+                    kernels::launch_gguf_dequant_rows_i8(w.gate_qtype, w.gate_q, Wg_i8, swg, E * mffn, H, st);
+                if (!qb_u)
+                    kernels::launch_gguf_dequant_rows_i8(w.up_qtype,   w.up_q,   Wu_i8, swu, E * mffn, H, st);
                 if (moe_fuse_gu) {
                     kernels::launch_pfm_moe_gemm_i8_gate_up_bm16(
                         mA_i8, msx, Wg_i8, swg, Wu_i8, swu, pair_tok, moffsets, tilemap, d_ntiles,
                         hg, hu, mffn, H, max_tiles, /*e_base=*/0, st);
                 } else {
-                    kernels::launch_pfm_moe_gemm_i8_bm(mA_i8, msx, Wg_i8, swg, pair_tok, pair_w, moffsets,
-                                                       tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles, moe_bm,
-                                                       /*a_indirect=*/true, /*c_scatter=*/false, st);
-                    kernels::launch_pfm_moe_gemm_i8_bm(mA_i8, msx, Wu_i8, swu, pair_tok, pair_w, moffsets,
-                                                       tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles, moe_bm,
-                                                       true, false, st);
+                    if (!qb_g)
+                        kernels::launch_pfm_moe_gemm_i8_bm(mA_i8, msx, Wg_i8, swg, pair_tok, pair_w, moffsets,
+                                                           tilemap, d_ntiles, hg, nullptr, mffn, H, max_tiles, moe_bm,
+                                                           /*a_indirect=*/true, /*c_scatter=*/false, st);
+                    if (!qb_u)
+                        kernels::launch_pfm_moe_gemm_i8_bm(mA_i8, msx, Wu_i8, swu, pair_tok, pair_w, moffsets,
+                                                           tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles, moe_bm,
+                                                           true, false, st);
                 }
                 kernels::launch_prefill_swiglu_quant_i8(hg, hu, h_i8, sh, P, mffn, st);
                 pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
-                kernels::launch_pfm_moe_gemm_i8_bm(h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets,
-                                                   tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles, moe_bm,
-                                                   /*a_indirect=*/false, /*c_scatter=*/true, st);
+                bool qb_d = false;
+                if (rs_d && (moe_qb_mask & 4))
+                    qb_d = kernels::launch_pfm_moe_gemm_qi8(
+                        w.down_qtype, h_i8, sh, w.down_q, rs_d, pair_tok, pair_w, moffsets,
+                        tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles, moe_bm,
+                        /*a_indirect=*/false, /*c_scatter=*/true, st);
+                if (!qb_d) {
+                    kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q, Wd_i8, swd, E * H, mffn, st);
+                    kernels::launch_pfm_moe_gemm_i8_bm(h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets,
+                                                       tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles, moe_bm,
+                                                       /*a_indirect=*/false, /*c_scatter=*/true, st);
+                }
             }
             // Shared expert (Qwen3.6 UD): out scaled by sigmoid(hn . gate_inp) per token.
             bf16* shared_out = nullptr;

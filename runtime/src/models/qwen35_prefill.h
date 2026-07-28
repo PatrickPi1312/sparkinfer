@@ -28,6 +28,11 @@ struct Qwen35PrefillCtx {
     bool                 gguf;             // native GGUF load (quantized weights)
     int                  qdim, kvdim;                       // full-attn q / kv dims
     int                  linear_qdim, linear_vdim, linear_qkvdim;  // GDN dims
+    // Per-row int8 scales of the routed expert weights, [layer][expert * rows], precomputed at
+    // load. Non-null enables the fused quantized-B MoE GEMM (no per-layer int8 materialize).
+    const float*         moe_rs_gate;
+    const float*         moe_rs_up;
+    const float*         moe_rs_down;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
