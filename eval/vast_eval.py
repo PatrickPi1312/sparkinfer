@@ -684,6 +684,40 @@ def main():
                 else:
                     print("!! Qwythos download slow — evaluate_bidir.sh will retry (may add time)")
 
+            # Qwythos GGUF vocab is ~248k (Qwen3.5). A leftover Qwen3-30B tokenizer (~151k) in
+            # models35 makes teacher-forced accuracy look like a main regression (~0.88 top1).
+            # ensure_tokenizer also guards this; prefetch here so a fresh box is correct before eval.
+            tok35 = (
+                f"mkdir -p {P35_DIR}; "
+                f"need=0; "
+                f"[ -f {P35_DIR}/tokenizer.json ] || need=1; "
+                f"[ -f {P35_DIR}/.tokenizer_repo ] && "
+                f"[ \"$(cat {P35_DIR}/.tokenizer_repo 2>/dev/null)\" = 'Qwen/Qwen3.5-9B' ] || need=1; "
+                f"if [ \"$need\" = 0 ]; then "
+                f"  v=$(python3 -c \"from tokenizers import Tokenizer; "
+                f"print(Tokenizer.from_file('{P35_DIR}/tokenizer.json').get_vocab_size())\" 2>/dev/null || echo 0); "
+                f"  [ \"${{v:-0}}\" -ge 200000 ] || need=1; "
+                f"fi; "
+                f"if [ \"$need\" = 1 ]; then "
+                f"  echo '>> fetching Qwen3.5-9B tokenizer into models35'; "
+                f"  rm -f {P35_DIR}/tokenizer.json {P35_DIR}/.tokenizer_repo; "
+                f"  HF_HUB_DISABLE_XET=1 hf download Qwen/Qwen3.5-9B tokenizer.json "
+                f"    --local-dir {P35_DIR} >/tmp/tok35.log 2>&1 "
+                f"  || python3 -c \"from huggingface_hub import hf_hub_download as d; "
+                f"d('Qwen/Qwen3.5-9B','tokenizer.json',local_dir='{P35_DIR}')\" >>/tmp/tok35.log 2>&1; "
+                f"  printf '%s\\n' 'Qwen/Qwen3.5-9B' > {P35_DIR}/.tokenizer_repo; "
+                f"fi; "
+                f"python3 -c \"from tokenizers import Tokenizer; "
+                f"print('models35 tokenizer vocab', "
+                f"Tokenizer.from_file('{P35_DIR}/tokenizer.json').get_vocab_size())\""
+            )
+            tr = sh(host, port, tok35, timeout=300)
+            if tr.returncode == 0:
+                print(f">> {(tr.stdout or '').strip() or 'Qwythos tokenizer ok'}")
+            else:
+                print(f"!! Qwythos tokenizer prefetch failed (rc={tr.returncode}) — "
+                      f"evaluate_bidir ensure_tokenizer will retry\n{(tr.stderr or '')[-500:]}")
+
         # Reap any leftover reference server / runner from a previous PR on this kept-alive box —
         # a leaked llama-server holding port 8081 would make this PR's accuracy.sh fail to bind.
         sh(host, port, "pkill -f llama-server 2>/dev/null; pkill -f qwen3_gguf 2>/dev/null; sleep 1; true", timeout=30)
