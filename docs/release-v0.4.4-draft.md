@@ -1,6 +1,6 @@
 # GitHub release notes draft — v0.4.4
 
-Title: `v0.4.4 — DFlash speculative decode for Qwen3.6 + prefill +127% @32k`
+Title: `v0.4.4 — DFlash speculative decode for Qwen3.6 + prefill +127% at 32k`
 
 Copy into the GitHub release body (same structure as v0.4.3). Attested assets are
 produced by tagging `v0.4.4` (workflow `build-attested-binaries`).
@@ -68,14 +68,14 @@ Bench scripts auto-fetch prebuilt tarballs: `bench/scripts/bench.sh --download`.
 
 - **#633** — DFlash block-diffusion speculative decode for Qwen3.6 (opt-in) + draft KV fix
 - **#621** — routed MoE prefill GEMM reads native quantized experts
-- **#614** — tensor-core router / warp top-k / pipelined GDN / fused SwiGLU-quant (~+24% pp @32k)
+- **#614** — tensor-core router / warp top-k / pipelined GDN / fused SwiGLU-quant (~+24% pp at 32k)
 - **#597** — decode-first CB + MoE batched prefill (~−96.6% CB mixed-load TTFT)
 - **#595 / #582 / #583 / #577 / #609 / #598 / #549** — MoE FP8, tilemap, dequant, live-expert gather
 - **#579 / #573** — Qwen3.5 long-ctx prefill (ldmatrix / fp8 GDN)
 - **#608 / #604** — GDN chunk correctness fixes
 - **#588 / #589 / #594 / #592 / #600 / #626** — eval TTFT tiers, CB gates, tokenizer guard
 
-**Verified:** RTX 5090 · DFlash **SPEC_AGREE 100%** · Qwen3.6 decode **~512 tok/s @128 (+86%)** · prefill **~18,150 pp/s @32k (+127%)** · llama.cpp `6f4f53f`.
+**Verified:** RTX 5090 · DFlash **SPEC_AGREE 100%** · Qwen3.6 decode **~512 tok/s at 128 (+86%)** · prefill **~18,150 pp/s at 32k (+127%)** · llama.cpp `6f4f53f`.
 
 ## Contributors
 
