@@ -108,14 +108,33 @@ verify_model() {
   echo ">> model sha256 OK after re-fetch" >&2
 }
 
+# Download tokenizer.json for TOK_REPO into MODELS_DIR. Refuses to reuse a leftover from a
+# different repo — a Qwen3-30B tokenizer (vocab ~151k) in models35 silently tanks Qwythos
+# teacher-forced accuracy (~0.88 top1 / KL~0.20) while long-context still looks fine.
 ensure_tokenizer() {
-  [ -f "$MODELS_DIR/tokenizer.json" ] && return
-  echo ">> downloading tokenizer.json ..." >&2
+  local marker="$MODELS_DIR/.tokenizer_repo" need=0 vocab=0
   mkdir -p "$MODELS_DIR"
+  [ -f "$MODELS_DIR/tokenizer.json" ] || need=1
+  [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$TOK_REPO" ] || need=1
+  if [ "$need" = 0 ] && command -v python3 >/dev/null; then
+    vocab="$(python3 -c "from tokenizers import Tokenizer; print(Tokenizer.from_file(r'$MODELS_DIR/tokenizer.json').get_vocab_size())" 2>/dev/null || echo 0)"
+    case "$TOK_REPO" in
+      *Qwen3.5*|*Qwen3.6*|*Qwen3_5*|*Qwen3_6*)
+        # Qwythos / Qwen3.5 / Qwen3.6 GGUFs embed ~248k tokens.
+        [ "${vocab:-0}" -ge 200000 ] || need=1 ;;
+      *Qwen3-30B*|*Qwen3_30B*)
+        [ "${vocab:-0}" -ge 140000 ] && [ "${vocab:-0}" -lt 200000 ] || need=1 ;;
+    esac
+  fi
+  if [ "$need" = 0 ]; then return 0; fi
+  echo ">> downloading tokenizer.json from $TOK_REPO (replacing mismatched/missing) ..." >&2
+  rm -f "$MODELS_DIR/tokenizer.json" "$marker"
   HF_HUB_DISABLE_XET=1 hf download "$TOK_REPO" tokenizer.json --local-dir "$MODELS_DIR" >&2 || \
   python3 -c "from huggingface_hub import hf_hub_download as d; d('$TOK_REPO','tokenizer.json',local_dir='$MODELS_DIR')" >&2 || \
   curl -fL --progress-bar "https://huggingface.co/${TOK_REPO}/resolve/main/tokenizer.json" \
        -o "$MODELS_DIR/tokenizer.json" >&2
+  [ -f "$MODELS_DIR/tokenizer.json" ] || { echo "!! tokenizer download failed for $TOK_REPO" >&2; return 1; }
+  printf '%s\n' "$TOK_REPO" > "$marker"
 }
 
 # Reuse the persisted llama.cpp only if it's the pinned commit, a clean tree, and the binary still
