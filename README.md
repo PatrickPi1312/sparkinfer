@@ -34,7 +34,7 @@ SparkInfer focuses on the models driving the future of AI — not thousands of l
 
 ## Benchmark · Qwen3.6-35B-A3B SOTA
 
-RTX 5090 · same `UD-Q4_K_M` GGUF · greedy bs=1 · warm interleaved · **v0.4.3** frontier (same-box main guards).
+RTX 5090 · same `UD-Q4_K_M` GGUF · greedy bs=1 · warm interleaved · **v0.4.4** frontier (same-box main guards).
 
 ### Decode
 

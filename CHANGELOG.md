@@ -3,6 +3,120 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.4.4] — 2026-07-28
+
+sparkinfer lands **DFlash block-diffusion speculative decode** for Qwen3.6-35B-A3B — the first
+opt-in multi-token draft path on the native GGUF runtime. Greedy DFlash matches autoregressive
+bit-for-bit (`SPEC_AGREE = 100%`). Default generate stays AR; set `SPARKINFER_DFLASH=1` with the
+z-lab draft weights to enable it.
+
+Alongside DFlash, the Qwen3.6 **prefill frontier climbs again** (README: **+127% vs llama.cpp at
+32k**) and continuous-batching **mixed-load TTFT drops ~97%** on the decode-first CB path.
+
+### ⚡ DFlash — the main story
+
+Block-diffusion draft (`z-lab/Qwen3.6-35B-A3B-DFlash` safetensors) + target UD-Q4_K_M GGUF on RTX 5090.
+
+| | |
+|---|---|
+| **What** | Single-stream DFlash verify + draft KV (update-then-crop) |
+| **Correctness** | Greedy **SPEC_AGREE 100%** vs AR (`qwen3_gguf_dflash_check` / `dflash_accuracy.sh`) |
+| **Opt-in** | `SPARKINFER_DFLASH=1` when a draft is attached; AR path unchanged when unset |
+| **Tools** | `qwen3_gguf_dflash_check`, `qwen3_gguf_dflash_bench`, `bench/scripts/dflash_accuracy.sh` |
+
+CB/server multi-accept stays deferred until the single-stream path proves a tok/s win on top of
+SPEC_AGREE (token-loop verify is the current correctness-first landing).
+
+```bash
+# Correctness gate (multi-seed SPEC + draft-KV canary)
+bench/scripts/dflash_accuracy.sh /path/to/Qwen3.6-35B-A3B.gguf /path/to/Qwen3.6-35B-A3B-DFlash
+
+# Throughput + mean accept length τ
+build/runtime/qwen3_gguf_dflash_bench target.gguf draft_dir 64 <token-ids...>
+```
+
+### 🏆 Qwen3.6 SOTA — decode held, prefill higher
+
+RTX 5090 · same `UD-Q4_K_M` GGUF · greedy bs=1 · llama.cpp `6f4f53f`.
+
+#### Decode (frontier held / README)
+
+| context | SparkInfer | llama.cpp | Δ |
+|---:|---:|---:|---:|
+| 128 | **512** tok/s | 276 tok/s | **+86%** |
+| 512 | **506** tok/s | 276 tok/s | +83% |
+| 4k | **486** tok/s | 276 tok/s | +76% |
+| 16k | **467** tok/s | 281 tok/s | +66% |
+| 32k | **437** tok/s | 280 tok/s | +56% |
+
+#### Prefill (climbed since v0.4.3)
+
+| context | sparkinfer (pp tok/s) | llama.cpp (pp tok/s) | vs llama |
+|---|---:|---:|---:|
+| **4k prefill** | **~13,800** | 8,726 | **+58%** |
+| **16k prefill** | **~17,700** | 8,390 | **+111%** |
+| **32k prefill** | **~18,150** | 7,984 | **+127%** |
+
+Headline: **32k prefill +127% vs llama.cpp** (was +82.7% in v0.4.3).
+
+### Serving — CB mixed-load TTFT
+
+- **#597** — vLLM V1–style decode-first continuous batching + Qwen3.6 MoE batched prefill:
+  **~−96.6% CB mixed-load TTFT** on the interrupt benchmark
+- **#594 / #592 / #600** — score and guard CB mixed-load TTFT for Qwen3.5 and Qwen3.6
+
+### Optimizations landed since v0.4.3
+
+**DFlash**
+
+- **#633** — DFlash block-diffusion speculative decode for Qwen3.6 (opt-in) + draft KV `seq_len` fix
+
+**Qwen3.6 prefill / MoE**
+
+- **#621** — routed MoE prefill GEMM reads native quantized experts (no int8 materialize)
+- **#614** — tensor-core router logits, warp top-k, pipelined GDN scan, fused SwiGLU-quant (**~+24% pp @32k**)
+- **#609** — fast Q5_K gather dequant for MoE down cols=512
+- **#598** — default MoE live-expert gather on
+- **#595** — restore MoE FP8 prefill default (**~+30% pp @16k**)
+- **#583** — GPU MoE tilemap (skip D2H sync)
+- **#582** — fp8 e4m3 tensor-core attn/GDN projections for MoE batched prefill
+- **#577** — coalesce live MoE dequant + fused gate/up
+- **#549** — int8 shared-expert MoE prefill
+
+**Qwen3.5 / GDN / correctness**
+
+- **#579** — ldmatrix GEMM staging, register-resident attention O, fused residual/quantize prefill
+- **#573** — fp8 e4m3 GDN projections + fused SwiGLU-quant for Qwen3.5 long-ctx prefill
+- **#608 / #604** — GDN chunk partial-buffer / final-state fixes
+
+**Eval harness**
+
+- **#588** — H3 `prefill_batched` fidelity veto
+- **#589** — tier prefill labels by TTFT reduction vs main
+- **#626** — reject mismatched Qwen3-30B tokenizer in models35
+- **#627 / #628 / #630** — auto-merge merge-first winners; cron labels-only when GPU down; never rent
+
+### What changed since v0.4.3
+
+| headline | v0.4.3 | v0.4.4 | shift |
+|---|---:|---:|---|
+| Speculative decode | AR only | **DFlash opt-in (SPEC_AGREE 100%)** | **new** |
+| Qwen3.6 prefill at 32k | ~14,587 pp/s (+82.7% vs llama) | **~18,150 pp/s (+127% vs llama)** | **~+24%** |
+| CB mixed-load TTFT | not the headline | **~−96.6%** (decode-first CB) | **new** |
+
+**Verified:** RTX 5090 · DFlash **SPEC_AGREE 100%** · Qwen3.6 decode **~512 tok/s @128 (+86% vs llama)** ·
+prefill **~18,150 pp/s @32k (+127% vs llama)** · llama.cpp `6f4f53f`.
+
+### Contributors
+
+- **@skyrocket2026** — #633 (DFlash), eval CB TTFT gates (#594/#592/#600/#588/#589), tokenizer guard (#626), bot cron/automerge (#627/#628/#630)
+- **@widecloud** — #621 (native quantized MoE GEMM), #614 (router / GDN / SwiGLU-quant prefill)
+- **@Paral1995** — #597 (decode-first CB + MoE batched prefill TTFT)
+- **@fansilas** — #595 (MoE FP8 default), #582 (fp8 attn/GDN), #579/#573 (Qwen3.5 prefill)
+- **@James-CUDA** — #583 (GPU MoE tilemap), #577 (live MoE dequant + fused gate/up)
+- **@inference2026** — #609 (Q5_K gather dequant), #598 (live-expert gather), #549 (int8 shared-expert)
+- **@RealDiligent** — #604 (GDN chunk final-state gate)
+
 ## [0.4.3] — 2026-07-21
 
 sparkinfer's **prefill stack is the headline of this release**: Qwythos (Qwen3.5) is now
