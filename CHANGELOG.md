@@ -74,10 +74,10 @@ Headline: **32k prefill +127% vs llama.cpp** (was +82.7% in v0.4.3).
 **Qwen3.6 prefill / MoE**
 
 - **#621** — routed MoE prefill GEMM reads native quantized experts (no int8 materialize)
-- **#614** — tensor-core router logits, warp top-k, pipelined GDN scan, fused SwiGLU-quant (**~+24% pp @32k**)
+- **#614** — tensor-core router logits, warp top-k, pipelined GDN scan, fused SwiGLU-quant (**~+24% pp at 32k**)
 - **#609** — fast Q5_K gather dequant for MoE down cols=512
 - **#598** — default MoE live-expert gather on
-- **#595** — restore MoE FP8 prefill default (**~+30% pp @16k**)
+- **#595** — restore MoE FP8 prefill default (**~+30% pp at 16k**)
 - **#583** — GPU MoE tilemap (skip D2H sync)
 - **#582** — fp8 e4m3 tensor-core attn/GDN projections for MoE batched prefill
 - **#577** — coalesce live MoE dequant + fused gate/up
@@ -104,8 +104,8 @@ Headline: **32k prefill +127% vs llama.cpp** (was +82.7% in v0.4.3).
 | Qwen3.6 prefill at 32k | ~14,587 pp/s (+82.7% vs llama) | **~18,150 pp/s (+127% vs llama)** | **~+24%** |
 | CB mixed-load TTFT | not the headline | **~−96.6%** (decode-first CB) | **new** |
 
-**Verified:** RTX 5090 · DFlash **SPEC_AGREE 100%** · Qwen3.6 decode **~512 tok/s @128 (+86% vs llama)** ·
-prefill **~18,150 pp/s @32k (+127% vs llama)** · llama.cpp `6f4f53f`.
+**Verified:** RTX 5090 · DFlash **SPEC_AGREE 100%** · Qwen3.6 decode **~512 tok/s at 128 (+86% vs llama)** ·
+prefill **~18,150 pp/s at 32k (+127% vs llama)** · llama.cpp `6f4f53f`.
 
 ### Contributors
 
