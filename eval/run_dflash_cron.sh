@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Cron wrapper for the sparkinfer DFlash PR eval bot — offset from AR bot:
 #
-#   30 */2 * * * /home/autotiny/Desktop/sparkinfer/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1
+#   0 1-23/2 * * * /home/autotiny/Desktop/sparkinfer/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1
+#   (odd hours :00 — 01:00, 03:00, …; AR bot stays on even hours)
 #
 # Policy (same as AR bot):
 #   • Pinned vast.ai GPU only; never rent / never start from cron when down.
