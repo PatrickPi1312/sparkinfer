@@ -62,10 +62,10 @@ fi
 gpu_ready() {
   local key="${SSH_KEY:-$HOME/.ssh/speedy}"
   if [ "${EVAL_TRANSPORT:-vast}" = "ssh" ]; then
-    local host="${EVAL_SSH_HOST:-}" port="${EVAL_SSH_PORT:-22}"
+    local host="${EVAL_SSH_HOST:-}" port="${EVAL_SSH_PORT:-22}" user="${EVAL_SSH_USER:-root}"
     [ -n "$host" ] || return 1
     ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=10 \
-        -o StrictHostKeyChecking=accept-new -p "$port" "root@$host" 'true' 2>/dev/null
+        -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" 'true' 2>/dev/null
     return $?
   fi
   local iid="${VAST_INSTANCE:-}"
