@@ -17,6 +17,7 @@ SparkInfer focuses on the models driving the future of AI — not thousands of l
 | Model | Role |
 |---|---|
 | [**Qwen3.6-35B-A3B**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | Primary SOTA — hybrid Gated-DeltaNet + full-attention MoE |
+| [**Qwen3.6-27B**](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | Dense hybrid — native text-only GGUF decode; vision projector pending |
 | [**Qwythos 9B**](https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF) | Mythos-level reasoning · long-context guard |
 | [**SparkDistill**](https://github.com/gittensor-model-hub/SparkDistill/) | Fable 5 / OpenAI 5.6-level CoT *(coming soon)* |
 | [**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) | Open MoE frontier *(next)* |

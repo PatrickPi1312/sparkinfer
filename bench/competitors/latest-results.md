@@ -4,6 +4,61 @@ Last run: 2026-07-03 on RTX 5090 node `91.224.44.222:40030`.
 
 Raw artifacts: `bench/competitors/results/qwen3_awq_rtx5090_20260703/`
 
+## Qwen3.6-27B serving comparison: SGLang NVFP4 vs llama.cpp Q4_K_M
+
+Reported matched no-cache API run: unique ~520-token prompts, forced 128-token
+outputs, `temperature=0`, warmed servers, and concurrency 1 / 2 / 4. Hardware,
+engine revisions, and artifact paths were not captured with this result, so it
+is recorded separately from the pinned RTX 5090 runs below.
+
+| Metric | SGLang NVFP4 | llama.cpp Q4_K_M |
+|---|---:|---:|
+| Median TTFT | **141.8 ms** | 397.0 ms |
+| C1 aggregate output throughput | 39.86 tok/s | **52.38 tok/s** |
+| C1 mean request time | 3.209 s | **2.442 s** |
+| C2 aggregate output throughput | 77.43 tok/s | **79.65 tok/s** |
+| C2 per-request output throughput | 38.72 tok/s | **39.83 tok/s** |
+| C4 aggregate output throughput | **124.14 tok/s** | 101.69 tok/s |
+| C4 per-request output throughput | **31.04 tok/s** | 25.47 tok/s |
+| C4 mean request time | **4.123 s** | 5.025 s |
+
+llama.cpp's separate native C1 measurements were **1,745 tok/s** for a
+512-token prefill and **71.42 tok/s** for decode.
+
+Takeaway: llama.cpp is faster end-to-end for one request, the engines are near
+parity at two concurrent requests, and SGLang leads at four. SGLang also has a
+substantially lower measured TTFT for this prompt shape. This is a
+runtime-plus-quantization comparison, not a pure engine comparison: SGLang
+uses an NVFP4 checkpoint while llama.cpp uses a Q4_K_M GGUF.
+
+## Qwen3.6-27B: sparkinfer native decode/prefill baseline
+
+Measured 2026-08-06 on RTX 5090 node `91.224.44.227:20149`, sparkinfer built
+from source (CUDA 13.2, sm_120) against `ggml-org/Qwen3.6-27B-GGUF`
+Q4_K_M (`build/qwen3_gguf_bench`, `build/qwen3_gguf_cb_bench`).
+
+| Metric | Value |
+|---|---:|
+| Decode, bs=1, ctx=512 | 95.08 tok/s |
+| Decode, bs=1, ctx=8192 | 77.63 tok/s |
+| Decode, aggregate under continuous batching, concurrency=4, prompt=512 | 68.6 tok/s |
+| Prefill, ctx=512 (sequential KV fill) | 100.46 tok/s |
+| Prefill, ctx=8192 (batched) | 7,254.07 tok/s |
+| VRAM used | 19.3–19.8 GB |
+
+This first load attempt failed before a fix landed: the dense-hybrid GGUF
+config parser assumed the linear-attention path always uses the same Q/K head
+count as full attention (true for the existing Qwen3.5-9B / Qwen3.6-35B-A3B
+models), but this GGUF's linear attention uses 16 Q/K heads against 24
+full-attention heads. That produced a wrong value-head count and a tensor
+shape-check failure on `attn_gate.weight` at load time. Fixed by deriving head
+counts from the actual `attn_gate`/`attn_qkv` tensor shapes instead of
+assuming they match full attention — see `runtime/examples/qwen3_gguf_config.h`.
+
+No same-GGUF llama.cpp comparison yet (`bench/competitors/results/` has no
+Qwen3.6-27B llama.cpp artifact) — the SGLang/llama.cpp table above is a
+separate model/quant pairing and isn't directly comparable to these numbers.
+
 ## vLLM AWQ vs sparkinfer GGUF
 
 vLLM engine: `0.23.1rc1.dev758+g978de8335`

@@ -37,6 +37,21 @@ export SPARKINFER_ROOT="$(pwd)"
 ./build/server/sparkinfer_server -m models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --port 8080
 ```
 
+### Qwen3.6-27B (text-only)
+
+The native dense-hybrid path also loads `Qwen3.6-27B` GGUFs. The base model is
+multimodal, but this server currently supports its text decoder only; do not
+send `image_url` or video content. Its optional vision projector (`mmproj`) is
+not loaded.
+
+```bash
+MODEL_REPO=unsloth/Qwen3.6-27B-GGUF \
+MODEL_FILE=Qwen3.6-27B-Q4_K_M.gguf \
+TOK_REPO=Qwen/Qwen3.6-27B \
+MODEL_NAME=qwen3.6-27b \
+./server/run.sh --download
+```
+
 ## API
 
 | Endpoint | Description |

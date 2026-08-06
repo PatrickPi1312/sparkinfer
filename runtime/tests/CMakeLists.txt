@@ -11,6 +11,10 @@ add_executable(qwen36_config_cpu_test qwen36_config_cpu_test.cpp ../src/gguf.cpp
 set_target_properties(qwen36_config_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME qwen36_config_cpu_test COMMAND qwen36_config_cpu_test)
 
+add_executable(qwen36_27b_config_cpu_test qwen36_27b_config_cpu_test.cpp ../src/gguf.cpp)
+set_target_properties(qwen36_27b_config_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME qwen36_27b_config_cpu_test COMMAND qwen36_27b_config_cpu_test)
+
 # Thermal governor — pure tiering policy (no GPU); links the runtime for classify()/pace() symbols.
 add_executable(thermal_governor_cpu_test thermal_governor_cpu_test.cpp)
 target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)

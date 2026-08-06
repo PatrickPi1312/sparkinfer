@@ -77,12 +77,21 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
         cfg.linear_v_heads = (int)qwen3_meta_int(g, "ssm.group_count", cfg.linear_v_heads);
         cfg.linear_head_dim = (int)qwen3_meta_int(g, "ssm.state_size", cfg.linear_head_dim);
         cfg.linear_conv_kernel = (int)qwen3_meta_int(g, "ssm.conv_kernel", cfg.linear_conv_kernel);
+        // Some dense-hybrid GGUFs (e.g. Qwen3.6-27B) use fewer linear-attention
+        // Q/K heads than full-attention heads, so linear_q_heads can't be assumed
+        // equal to n_q_heads. attn_gate mirrors the value width directly, so read
+        // that first; only then split attn_qkv's remainder evenly into Q and K.
+        if (const sparkinfer::GGUFTensor* gate = g.tensor("blk.0.attn_gate.weight")) {
+            const int v_dim = gate->n_dims >= 2 ? (int)gate->dims[1] : 0;
+            if (v_dim > 0 && cfg.linear_head_dim > 0 && v_dim % cfg.linear_head_dim == 0)
+                cfg.linear_v_heads = v_dim / cfg.linear_head_dim;
+        }
         if (const sparkinfer::GGUFTensor* qkv = g.tensor("blk.0.attn_qkv.weight")) {
             const int qkv_out = qkv->n_dims >= 2 ? (int)qkv->dims[1] : 0;
-            const int q_dim = cfg.linear_q_heads * cfg.linear_head_dim;
-            const int v_dim = qkv_out - 2 * q_dim;
-            if (v_dim > 0 && v_dim % cfg.linear_head_dim == 0)
-                cfg.linear_v_heads = v_dim / cfg.linear_head_dim;
+            const int v_dim = cfg.linear_v_heads * cfg.linear_head_dim;
+            const int qk_dim = qkv_out - v_dim;
+            if (qk_dim > 0 && cfg.linear_head_dim > 0 && qk_dim % (2 * cfg.linear_head_dim) == 0)
+                cfg.linear_q_heads = qk_dim / (2 * cfg.linear_head_dim);
         }
         return;
     }
@@ -109,6 +118,14 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
 }
 
 static const char* qwen3_model_label(const sparkinfer::Qwen35Config& cfg) {
-    if (cfg.dense_ffn) return "Qwen3.5-9B dense hybrid";
+    // Qwen3.6-27B shares the dense hybrid tensor layout with the existing
+    // Qwen3.5 dense path, but has a larger 64-layer / 5120-hidden geometry.
+    // Keep the label precise so startup logs make it clear that the GGUF was
+    // recognized as the intended text decoder rather than the 9B guard model.
+    if (cfg.dense_ffn && cfg.n_layers == 64 && cfg.hidden == 5120 &&
+        cfg.n_q_heads == 24 && cfg.n_kv_heads == 4 && cfg.head_dim == 256 &&
+        cfg.moe_ffn == 17408)
+        return "Qwen3.6-27B dense hybrid (text-only)";
+    if (cfg.dense_ffn) return "Qwen3.5 dense hybrid";
     return cfg.hybrid ? "Qwen3.5/Qwen3.6-35B-A3B hybrid" : "Qwen3-MoE";
 }

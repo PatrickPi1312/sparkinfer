@@ -1,0 +1,72 @@
+# Benchmark target: Qwen3.6-27B Q4_K_M GGUF on RTX 5090.
+# This is a dense hybrid model: 48 Gated DeltaNet layers and 16 full-attention
+# layers, with no routed-expert dispatch.
+
+model: configs/models/qwen36_27b.yaml
+quant: q4_k_m
+
+hardware:
+  name: RTX 5090
+  arch: sm_120
+  vram_gb: 32
+  bandwidth_tbps: 1.79
+  cuda_cores: 21760
+
+decode:
+  batch_sizes: [1, 2, 4]
+  context_lens: [512, 2048, 8192, 32768]
+  dtype: bfloat16
+  # Measured 2026-08-06, same host (RTX 5090), sparkinfer built from source at
+  # this commit (`build/qwen3_gguf_bench`, `build/qwen3_gguf_cb_bench`) against
+  # models27/Qwen3.6-27B-Q4_K_M.gguf (ggml-org/Qwen3.6-27B-GGUF). bs4_ctx512 is
+  # aggregate decode tok/s under the continuous-batching scheduler
+  # (concurrency=4, prompt=512, max_new=128), not a raw synthetic batched-GEMM
+  # decode figure — treat as a scheduler-level number, not directly comparable
+  # to the bs1 rows. ctx2048/ctx32768 and bs2 are not yet measured.
+  baseline_toks_per_sec:
+    bs1_ctx512: 95.08
+    bs1_ctx8192: 77.63
+    bs4_ctx512: 68.6
+  target_toks_per_sec:
+    bs1_ctx512: null
+    bs1_ctx8192: null
+    bs4_ctx512: null
+
+prefill:
+  seq_lens: [512, 2048, 8192, 32768]
+  batch_size: 1
+  dtype: bfloat16
+  # Measured 2026-08-06 alongside the decode baselines above, same GGUF/host.
+  # ctx=512 uses the sequential-KV-fill path; ctx=8192 uses batched prefill —
+  # the ~72x gap reflects that path switch, not a measurement error.
+  baseline_toks_per_sec:
+    ctx512: 100.46
+    ctx8192: 7254.07
+    ctx2048: null
+    ctx32768: null
+
+runtime:
+  sparkinfer_native_decode: true
+  input_support: text_only
+  required_work:
+    - qwen36_27b_same_gguf_parity_against_llama_cpp
+  completed_work:
+    - qwen36_27b_decode_and_ttft_baseline
+    - qwen36_27b_batched_prefill_validation
+
+memory:
+  full_attention_kv_bytes_per_token: 65536
+
+attention:
+  linear_attention:
+    layers: 48
+    qk_heads: 16
+    value_heads: 48
+    head_dim: 128
+    bench_recurrent_state: true
+  full_attention:
+    layers: 16
+    num_kv_heads: 4
+    head_dim: 256
+    rotary_dim: 64
+    bench_full_ctx_attn: true
