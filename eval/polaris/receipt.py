@@ -29,6 +29,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---- Ed25519 via cryptography (already installed on bot + eval boxes) ----
@@ -345,6 +346,33 @@ class AttestationBuilder:
         if guard_data:
             self._measurements["guard"] = guard_data
 
+    def set_dflash_measurements(self, dflash_result: dict):
+        """Extract DFlash + Qwen3.5/3.6 no-regression guard measurements
+        (pr_dflash_bot.py's eval_dflash_on_box() result dict), not a RESULT_JSON verdict —
+        the DFlash bot scores same-box PR-vs-main directly rather than against a frontier."""
+        guard36 = dflash_result.get("guard36") or {}
+        guard35 = dflash_result.get("guard35") or {}
+        self._measurements = {
+            "dflash": {
+                "pr_dflash_tps": _f(dflash_result.get("pr_dflash_tps")),
+                "main_dflash_tps": _f(dflash_result.get("main_dflash_tps")),
+                "pr_ar_tps": _f(dflash_result.get("pr_ar_tps")),
+                "main_ar_tps": _f(dflash_result.get("main_ar_tps")),
+                "mean_accept": _f(dflash_result.get("mean_accept")),
+                "spec_agree": dflash_result.get("spec_agree", ""),
+                "speedup_vs_main": _f(dflash_result.get("speedup_vs_main")),
+                "speedup_vs_ar": _f(dflash_result.get("speedup_vs_ar")),
+            },
+            "qwen_guard": {
+                "ok": bool(dflash_result.get("guard_ok", True)),
+                "problems": dflash_result.get("guard_problems") or [],
+                "qwen36": {str(k): {kk: _f(vv) for kk, vv in v.items()}
+                           for k, v in guard36.items()},
+                "qwen35": {str(k): {kk: _f(vv) for kk, vv in v.items()}
+                           for k, v in guard35.items()},
+            },
+        }
+
     def set_verdict(self, result_json: dict):
         """Extract verdict fields from RESULT_JSON."""
         self._verdict = {
@@ -434,10 +462,18 @@ class ReceiptValidator:
             if k not in a.get("environment", {}):
                 issues.append(f"missing attestation.environment.{k}")
 
-        # Measurements
+        # Measurements — two shapes: AR/bidir bot (measurements.primary, ctx sweep + top1/kl)
+        # or DFlash bot (measurements.dflash + measurements.qwen_guard, no frontier ctx sweep).
         meas = a.get("measurements", {})
-        if "primary" not in meas:
-            issues.append("missing attestation.measurements.primary")
+        if "dflash" in meas:
+            d = meas["dflash"]
+            for k in ["pr_dflash_tps", "main_dflash_tps", "spec_agree"]:
+                if k not in d:
+                    issues.append(f"missing attestation.measurements.dflash.{k}")
+            if "qwen_guard" not in meas:
+                issues.append("missing attestation.measurements.qwen_guard")
+        elif "primary" not in meas:
+            issues.append("missing attestation.measurements.primary or .dflash")
         else:
             p = meas["primary"]
             for k in ["ctx_128_tps", "ctx_512_tps", "ctx_4096_tps", "top1", "kl"]:
@@ -478,6 +514,12 @@ class ReceiptValidator:
             val = primary.get(key)
             if val is not None and isinstance(val, (int, float)) and val < 0:
                 issues.append(f"measurements.primary.{key} is negative: {val}")
+
+        dflash = meas.get("dflash", {})
+        for key in ["pr_dflash_tps", "main_dflash_tps", "pr_ar_tps", "main_ar_tps"]:
+            val = dflash.get(key)
+            if val is not None and isinstance(val, (int, float)) and val < 0:
+                issues.append(f"measurements.dflash.{key} is negative: {val}")
 
         # If clocks_pinned is true, pin_target_mhz should be > 0
         if e.get("clocks_pinned") and not e.get("pin_target_mhz", 0):
@@ -703,7 +745,8 @@ class ReceiptValidator:
         still produces a valid attestation receipt.
         """
         reject = self.attestation.get("verdict", {}).get("pass") is False
-        gate_markers = ("correctness gate", "primary guard", "guard model")
+        gate_markers = ("correctness gate", "primary guard", "guard model",
+                        "DFlash accuracy", "qwen3.5/3.6 guard")
         relevant = [
             line for line in results
             if not (reject and any(m in line for m in gate_markers))
@@ -712,8 +755,11 @@ class ReceiptValidator:
 
     def _recheck_gates(self) -> List[str]:
         """Re-check correctness gates from attested measurements."""
+        meas = self.attestation.get("measurements", {})
+        if "dflash" in meas:
+            return self._recheck_dflash_gates(meas)
         results = []
-        primary = self.attestation.get("measurements", {}).get("primary", {})
+        primary = meas.get("primary", {})
         top1 = primary.get("top1", 0)
         kl = primary.get("kl", 99)
 
@@ -749,6 +795,33 @@ class ReceiptValidator:
                 results.append("✓ guard model: accuracy OK")
             else:
                 results.append("✗ guard model: accuracy REGRESSION")
+
+        return results
+
+    def _recheck_dflash_gates(self, meas: dict) -> List[str]:
+        """DFlash bot's gates: SPEC_AGREE accuracy (dflash_accuracy.sh's own VERDICT PASS
+        already enforces this before the eval proceeds — this is a consistency recheck, not
+        an independent gate) and the Qwen3.5/3.6 no-regression guard."""
+        results = []
+        spec_agree = (meas.get("dflash", {}) or {}).get("spec_agree", "") or ""
+        m = re.search(r"=\s*([0-9.]+)\s*$", spec_agree.strip())
+        if m:
+            ratio = float(m.group(1))
+            if ratio >= 0.999:
+                results.append(f"✓ DFlash accuracy: SPEC_AGREE={ratio:.4f}")
+            else:
+                results.append(f"✗ DFlash accuracy: SPEC_AGREE={ratio:.4f} (<1.0)")
+        else:
+            results.append(f"⚠ DFlash accuracy: could not parse SPEC_AGREE ('{spec_agree}')")
+
+        guard = meas.get("qwen_guard") or {}
+        if guard.get("ok", True):
+            results.append("✓ qwen3.5/3.6 guard: no regression (decode + prefill)")
+        else:
+            for p in guard.get("problems") or []:
+                results.append(f"✗ qwen3.5/3.6 guard: {p}")
+            if not guard.get("problems"):
+                results.append("✗ qwen3.5/3.6 guard: FAILED")
 
         return results
 

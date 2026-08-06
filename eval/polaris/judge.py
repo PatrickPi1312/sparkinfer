@@ -80,8 +80,12 @@ def collect_metadata(args, result_json: dict) -> dict:
 
     # --- Code provenance ---
     repo = os.environ.get("EVAL_REPO", "https://github.com/gittensor-ai-lab/sparkinfer")
-    commit = _git("rev-parse HEAD")
-    scoring_commit = _git("rev-parse origin/main")
+    # Bug (pre-existing): _git()'s cwd defaults to /root/sparkinfer, so without passing
+    # args.sparkinfer_root explicitly this silently returns "" on any other checkout path
+    # (e.g. a bare-metal box with a non-root home dir) — never noticed because every prior
+    # caller happened to run on a vast.ai box at exactly /root/sparkinfer.
+    commit = _git("rev-parse HEAD", cwd=args.sparkinfer_root)
+    scoring_commit = _git("rev-parse origin/main", cwd=args.sparkinfer_root)
     build_hash = compute_build_hash(args.build_dir) if args.build_dir else ""
 
     meta["code_repo"] = repo
@@ -173,6 +177,9 @@ def main():
                     help="Eval script to run (wrapper mode)")
     ap.add_argument("--from-stdin", action="store_true",
                     help="Read RESULT_JSON from stdin instead of running eval")
+    ap.add_argument("--dflash", action="store_true",
+                    help="DFlash mode: stdin is a plain JSON dict (pr_dflash_bot.py's "
+                         "eval_dflash_on_box() result), not a RESULT_JSON-prefixed AR verdict")
     ap.add_argument("--model-file", default="",
                     help="Path to primary model GGUF (for SHA256)")
     ap.add_argument("--guard-model-file", default="",
@@ -185,6 +192,53 @@ def main():
 
     # Allow --build-dir to override the git working directory
     git_root = args.sparkinfer_root
+
+    if args.dflash:
+        try:
+            dflash_result = json.loads(sys.stdin.read())
+        except json.JSONDecodeError as e:
+            print(f">> [polaris-judge] ERROR: invalid --dflash JSON on stdin: {e}", file=sys.stderr)
+            sys.exit(1)
+        meta = collect_metadata(args, {})
+        builder = AttestationBuilder()
+        builder.set_code(
+            repo=meta["code_repo"], commit=meta["code_commit"],
+            build_hash=meta["code_build_hash"],
+            scoring_scripts_commit=meta["code_scoring_scripts_commit"],
+        )
+        builder.set_references(
+            model_sha256=meta["model_sha256"], model_file=meta["model_file"],
+            guard_model_sha256=meta["guard_model_sha256"], guard_model_file=meta["guard_model_file"],
+            llamacpp_commit=meta["llamacpp_commit"], eval_seed=meta["eval_seed"],
+        )
+        builder.set_environment(
+            eval_mode="dflash", decode_tokens=meta["decode_tokens"],
+            gpu_name=meta["gpu_name"], gpu_arch=meta["gpu_arch"],
+            clocks_pinned=meta["clocks_pinned"], clock_mhz=meta["clock_mhz"],
+            clock_spread_mhz=meta["clock_spread_mhz"], pin_target_mhz=meta["pin_target_mhz"],
+            cuda_version=meta["cuda_version"], driver_version=meta["driver_version"],
+        )
+        builder.set_dflash_measurements(dflash_result)
+        pr_tps = dflash_result.get("pr_dflash_tps") or 0
+        main_tps = dflash_result.get("main_dflash_tps") or 0
+        builder.set_verdict({
+            "model": "dflash",
+            "label": dflash_result.get("label", "?"),
+            "pass": dflash_result.get("pass", False),
+            "tps": pr_tps,
+            "delta_tps": pr_tps - main_tps,
+            "pct_over_frontier": dflash_result.get("delta_pct"),
+            "reason": dflash_result.get("reason"),
+        })
+        builder.set_timestamp()
+        attestation = builder.build()
+        print(f"POLARIS_ATTESTATION {json.dumps(attestation, separators=(',', ':'))}")
+        try:
+            with open("/tmp/polaris_attestation.json", "w") as f:
+                json.dump(attestation, f, indent=2)
+        except Exception:
+            pass
+        return
 
     # ---- Get RESULT_JSON ----
     if args.from_stdin:

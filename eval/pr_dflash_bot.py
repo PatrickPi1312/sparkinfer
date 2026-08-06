@@ -19,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +29,7 @@ if HERE not in sys.path:
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from ssh_box import ssh_box_enabled, ssh_box_endpoint  # noqa: E402
+from ssh_box import ssh_box_enabled, ssh_box_endpoint, ssh_box_user  # noqa: E402
 
 # Reuse shared helpers from the AR bot (labels, greenlight, denylist, …).
 import pr_eval_bot as arb  # noqa: E402
@@ -71,6 +72,14 @@ Q36_GUARD_MODELS_DIR = os.path.dirname(DEFAULT_GGUF) or DEFAULT_MODELS_DIR
 Q36_GUARD_MODEL_REPO = os.environ.get("PRIMARY36_MODEL_REPO", "unsloth/Qwen3.6-35B-A3B-GGUF")
 Q36_GUARD_TOK_REPO = os.environ.get("PRIMARY36_TOK_REPO", "Qwen/Qwen3.6-35B-A3B")
 Q35_GUARD_MODELS_DIR = os.environ.get("QWYTHOS_MODELS_DIR", "/workspace/models35")
+_Q35_QUANT_FILES = {
+    "Q4_K_M": "Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf",
+    "Q8_0": "Qwythos-9B-Claude-Mythos-5-1M-Q8_0.gguf",
+    "BF16": "Qwythos-9B-Claude-Mythos-5-1M-BF16.gguf",
+}
+Q35_GUARD_MODEL_FILE = _Q35_QUANT_FILES.get(
+    os.environ.get("PRIMARY_QUANT", "Q4_K_M").upper(), _Q35_QUANT_FILES["Q4_K_M"]
+)
 GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k",
                    65536: "64k", 131072: "128k"}
 
@@ -83,6 +92,24 @@ AUTOMERGE_BLOCK = {
 SCORES_FILE = os.path.expanduser(
     os.environ.get("DFLASH_SCORES_FILE", "~/.sparkinfer_dflash_scores.json")
 )
+
+# Polaris verifiable-compute receipts — same policy as the AR bot (on by default; TDX via
+# POLARIS_API_KEY when configured, else Ed25519 fallback via SPARKINFER_POLARIS_PRIVATE_KEY).
+POLARIS_ENABLED = os.environ.get("POLARIS", "1") != "0"
+POLARIS_API_KEY = os.environ.get("POLARIS_API_KEY", "")
+_POLARIS_PUBKEY_FILE = os.path.join(HERE, "polaris", "sparkinfer_eval.pub")
+
+
+def _load_polaris_pubkey():
+    try:
+        with open(_POLARIS_PUBKEY_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+    except Exception:
+        pass
+    return ""
 
 
 def _load_scores():
@@ -174,8 +201,11 @@ def resolve_ssh(instance_id: int):
     return ip, port
 
 
-def ssh_run(host, port, cmd, timeout=7200):
+def ssh_run(host, port, cmd, timeout=7200, stdin_data=None):
     key = os.environ.get("SSH_KEY", os.path.expanduser("~/.ssh/speedy"))
+    # vast.ai images run as root; a bare-metal SSH box (EVAL_TRANSPORT=ssh) may have a
+    # non-root default account instead — EVAL_SSH_USER overrides (defaults to root).
+    user = ssh_box_user() if ssh_box_enabled() else "root"
     return subprocess.run(
         [
             "ssh", "-i", key,
@@ -183,9 +213,9 @@ def ssh_run(host, port, cmd, timeout=7200):
             "-o", "BatchMode=yes",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=40",
-            "-p", str(port), f"root@{host}", cmd,
+            "-p", str(port), f"{user}@{host}", cmd,
         ],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, timeout=timeout, input=stdin_data,
     )
 
 
@@ -395,6 +425,159 @@ def check_qwen_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
     return (len(problems) == 0, problems)
 
 
+def push_eval_polaris(host, port):
+    """Sync eval/polaris/ (judge.py + receipt.py) to the box from a TRUSTED source before
+    running attestation — mirrors vast_eval.py's push_bench_scripts() protection of the
+    scoring harness. The box's git checkout is whatever ref is being evaluated (the PR's own
+    branch, or main); letting a PR's own commits supply the code that produces its own
+    attestation would let it fake a clean receipt, defeating the entire point of an
+    independently-verifiable one. Prefers origin/main (fetched fresh — a stale local dev tree
+    would be just as untrustworthy a source of truth as the PR itself); set
+    SPARKINFER_USE_LOCAL_POLARIS=1 to force the local working tree instead, for testing
+    eval/polaris changes before they're merged. Returns True on success."""
+    use_local = os.environ.get("SPARKINFER_USE_LOCAL_POLARIS", "").strip().lower() in ("1", "true", "yes")
+    tar_data = None
+    source = "local checkout"
+    extract_root = os.path.join(REMOTE_REPO, "eval")
+    if not use_local:
+        subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT, capture_output=True, timeout=120)
+        arch = subprocess.run(
+            ["git", "archive", "--format=tar.gz", "origin/main", "eval/polaris"],
+            cwd=ROOT, capture_output=True, timeout=120,
+        )
+        if arch.returncode == 0 and arch.stdout:
+            tar_data = arch.stdout
+            source = "origin/main"
+            extract_root = REMOTE_REPO
+    if tar_data is None:
+        polaris_dir = os.path.join(HERE, "polaris")
+        if os.path.isdir(polaris_dir):
+            tar = subprocess.run(["tar", "-C", HERE, "-czf", "-", "polaris"],
+                                  capture_output=True, timeout=120)
+            if tar.returncode == 0 and tar.stdout:
+                tar_data = tar.stdout
+                source = "local checkout"
+                extract_root = os.path.join(REMOTE_REPO, "eval")
+    if tar_data is None:
+        print(">> WARN: no eval/polaris archive — attestation unavailable this run")
+        return False
+    key = os.environ.get("SSH_KEY", os.path.expanduser("~/.ssh/speedy"))
+    user = ssh_box_user() if ssh_box_enabled() else "root"
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
+            tmp.write(tar_data)
+            tmp_path = tmp.name
+        scp = subprocess.run(
+            ["scp", "-P", str(port), "-i", key, "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "BatchMode=yes", tmp_path, f"{user}@{host}:/tmp/si_polaris.tgz"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if scp.returncode != 0:
+            print(f">> WARN: eval/polaris scp failed (rc={scp.returncode}): {scp.stderr[-500:]}")
+            return False
+        extract = (
+            f"mkdir -p {shlex.quote(extract_root)} && "
+            f"tar -xzf /tmp/si_polaris.tgz -C {shlex.quote(extract_root)} && "
+            "rm -f /tmp/si_polaris.tgz"
+        )
+        r = ssh_run(host, port, extract, timeout=60)
+        if r.returncode != 0:
+            print(f">> WARN: eval/polaris extract failed (rc={r.returncode}): {(r.stdout + r.stderr)[-500:]}")
+            return False
+        print(f">> eval/polaris synced from {source} (trusted attestation code)")
+        return True
+    except subprocess.TimeoutExpired:
+        print(">> WARN: eval/polaris sync timed out — attestation unavailable this run")
+        return False
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
+    """Run judge.py --dflash on the box to assemble an unsigned attestation from the eval
+    result, then sign it (TDX via POLARIS_API_KEY, else Ed25519 fallback) — same policy as the
+    AR bot. Returns {"attestation":..., "receipt":...} (receipt omitted if unsigned), or None
+    if Polaris is disabled. Never raises — a Polaris failure must not block the DFlash verdict
+    itself, only omit its receipt.
+
+    Two correctness fixes baked in here:
+    - eval_dflash_on_box() evaluates the PR ref first, then main second, and leaves the box
+      checked out on whichever ran last (main) — so judge.py's `git rev-parse HEAD` would
+      silently attest to the BASELINE commit, not the PR commit the verdict is actually about.
+      Re-checkout pr_ref explicitly before invoking judge.py.
+    - build_polaris_receipt_from_attestation()'s nonce is sha256(commit + model_sha256 +
+      eval_seed); with eval_seed empty (the default), re-evaluating the same commit+model
+      combo — which DFlash re-evals routinely do — produces an IDENTICAL nonce every time.
+      Observed in testing: two attestations with genuinely different measurements came back
+      with the same tdx.result_sha256, consistent with Polaris treating a repeated nonce as
+      a dedup/idempotency key and replaying a cached quote rather than a fresh one. Force a
+      unique eval_seed per call so the nonce — and therefore the quote — can never repeat.
+    """
+    if not POLARIS_ENABLED:
+        return None
+    # Order matters: checkout pr_ref FIRST (so git HEAD is the commit being attested), THEN
+    # sync the trusted judge.py on top of it (so the PR's own — possibly stale or, if malicious,
+    # deliberately broken — copy of eval/polaris/ never runs). Reversed, the checkout would
+    # clobber the just-synced trusted files right back to whatever the PR ref itself carries.
+    checkout_cmd = (
+        f"cd {shlex.quote(REMOTE_REPO)} && "
+        f"git fetch -q origin {shlex.quote(pr_ref)} && git checkout -qf FETCH_HEAD"
+    )
+    r0 = ssh_run(host, port, checkout_cmd, timeout=60)
+    if r0.returncode != 0:
+        print(f">> Polaris: could not checkout {pr_ref} for attestation (rc={r0.returncode}): "
+              f"{(r0.stderr or '')[-300:]}")
+        return None
+    if not push_eval_polaris(host, port):
+        return None
+    q35_gguf = f"{Q35_GUARD_MODELS_DIR}/{Q35_GUARD_MODEL_FILE}"
+    q36_gguf = f"{Q36_GUARD_MODELS_DIR}/{Q36_GUARD_MODEL_FILE}"
+    eval_seed = f"dflash-{int(time.time() * 1000)}"
+    cmd = (
+        f"cd {shlex.quote(REMOTE_REPO)} && "
+        f"SPARKINFER_EVAL_SEED={shlex.quote(eval_seed)} python3 eval/polaris/judge.py --dflash "
+        f"--sparkinfer-root {shlex.quote(REMOTE_REPO)} "
+        f"--build-dir {shlex.quote(REMOTE_REPO)}/build/runtime "
+        f"--model-file {shlex.quote(q36_gguf)} "
+        f"--guard-model-file {shlex.quote(q35_gguf)}"
+    )
+    try:
+        r = ssh_run(host, port, cmd, timeout=120, stdin_data=json.dumps(res))
+    except Exception as e:
+        print(f">> Polaris judge SSH failed: {e}")
+        return None
+    if r.returncode != 0:
+        print(f">> Polaris judge failed (rc={r.returncode}): {(r.stderr or '')[-500:]}")
+        return None
+    polaris_line = next((l for l in (r.stdout or "").splitlines()
+                         if l.startswith("POLARIS_ATTESTATION ")), None)
+    if not polaris_line:
+        print(">> Polaris judge produced no attestation")
+        return None
+    try:
+        attestation = json.loads(polaris_line[len("POLARIS_ATTESTATION "):])
+    except json.JSONDecodeError as e:
+        print(f">> Polaris attestation JSON parse failed: {e}")
+        return None
+    privkey = arb._load_polaris_privkey()
+    if not POLARIS_API_KEY and not privkey:
+        print(">> Polaris: attestation collected but NOT signed (no key configured)")
+        return {"attestation": attestation}
+    try:
+        receipt = arb.build_polaris_receipt_from_attestation(
+            attestation, api_key=POLARIS_API_KEY, privkey=privkey, pubkey=_load_polaris_pubkey(),
+        )
+        return {"attestation": attestation, "receipt": receipt}
+    except Exception as e:
+        print(f">> Polaris signing failed: {e}")
+        return {"attestation": attestation}
+
+
 def eval_dflash_on_box(host, port, pr_ref: str):
     """Run PR accuracy+bench then main bench with same prompt ids. Returns result dict."""
     print(f">> DFlash eval on box: PR ref={pr_ref}")
@@ -425,7 +608,7 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         label = "REJECT"
         passed = False
         reason = "qwen3.5/qwen3.6 no-regression guard failed: " + "; ".join(guard_problems[:6])
-    return {
+    res = {
         "ok": True,
         "label": label,
         "pass": passed and label != "REJECT",
@@ -442,7 +625,13 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         "speedup_vs_ar": round(pr["dflash_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
         "guard_ok": guard_ok,
         "guard_problems": guard_problems,
+        "guard36": pr.get("guard36"),
+        "guard35": pr.get("guard35"),
     }
+    polaris = collect_polaris_attestation(host, port, res, pr_ref)
+    if polaris:
+        res["polaris"] = polaris
+    return res
 
 
 def format_comment(commit: str, res: dict) -> str:
@@ -473,6 +662,18 @@ def format_comment(commit: str, res: dict) -> str:
         problems = res.get("guard_problems") or []
         guard_row = "| Qwen3.5/3.6 guard | ❌ **REGRESSED** — DFlash score voided |\n"
         guard_row += "".join(f"| &nbsp;&nbsp;↳ | `{p}` |\n" for p in problems[:8])
+    polaris = res.get("polaris") or {}
+    receipt = polaris.get("receipt")
+    if receipt:
+        rtype = "TDX (Intel hardware attestation)" if receipt.get("attestation_type") == "tdx-quote" \
+            else "Ed25519 (SparkInfer key)"
+        polaris_row = (
+            f"| Polaris receipt | `{receipt.get('receipt_id', '?')[:16]}…` — {rtype} |\n"
+        )
+    elif polaris.get("attestation"):
+        polaris_row = "| Polaris receipt | collected, not signed (no key configured) |\n"
+    else:
+        polaris_row = ""
     return (
         f"{marker}\n## sparkinfer dflash auto-eval — `eval-dflash:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
@@ -485,6 +686,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"| mean accept τ | {res.get('mean_accept') or 0:.3f} |\n"
         f"| accuracy | {res.get('spec_agree') or 'VERDICT PASS'} |\n"
         f"{guard_row}"
+        f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
         f"{res.get('reason') or ''}\n\n"
         "<sub>Scored on pinned RTX 5090 vs same-box `origin/main` DFlash, gated by a "
@@ -597,7 +799,72 @@ def reconcile_dflash_merge_labels(repo, dry_run=False):
         try_auto_merge_dflash(repo, winner)
 
 
-def apply_result(repo, num, commit, res, dry_run=False):
+def upload_dflash_eval_log(repo, num, title, oid, res):
+    """Commit the DFlash eval result (+ Polaris receipt/attestation) to sparkinfer-log — the
+    same public ledger the AR bot writes to (gittensor-ai-lab/sparkinfer-log), just under a
+    dflash-prefixed run id so it can't collide with an AR-bot entry for the same PR number.
+    Best-effort: never blocks or raises — a log-upload failure must not affect the verdict
+    already posted to the PR."""
+    try:
+        rid = f"dflash-{int(num):04d}-{oid[:7]}"
+        arb._ensure_log_repo()
+        rundir = os.path.join(arb.LOG_DIR, "runs", rid)
+        os.makedirs(rundir, exist_ok=True)
+        polaris = res.get("polaris") or {}
+        receipt = polaris.get("receipt")
+        result = {
+            "id": rid, "pr": int(num), "title": title,
+            "url": f"https://github.com/{repo}/pull/{num}", "commit": oid[:7],
+            "eval_mode": "dflash",
+            "label": res.get("label"), "pass": res.get("pass"), "reason": res.get("reason"),
+            "delta_pct": res.get("delta_pct"),
+            "pr_dflash_tps": res.get("pr_dflash_tps"), "main_dflash_tps": res.get("main_dflash_tps"),
+            "pr_ar_tps": res.get("pr_ar_tps"), "main_ar_tps": res.get("main_ar_tps"),
+            "speedup_vs_main": res.get("speedup_vs_main"), "speedup_vs_ar": res.get("speedup_vs_ar"),
+            "mean_accept": res.get("mean_accept"), "spec_agree": res.get("spec_agree"),
+            "guard_ok": res.get("guard_ok"), "guard_problems": res.get("guard_problems"),
+            "gpu": "RTX 5090 (sm_120)", "date": arb.datetime.date.today().isoformat(),
+        }
+        if receipt:
+            result["polaris"] = True
+            result["polaris_receipt_id"] = receipt.get("receipt_id")
+        json.dump(result, open(os.path.join(rundir, "result.json"), "w"), indent=2)
+        if polaris.get("attestation"):
+            json.dump(polaris["attestation"], open(os.path.join(rundir, "attestation.json"), "w"), indent=2)
+        if receipt:
+            json.dump(receipt, open(os.path.join(rundir, "receipt.json"), "w"), indent=2)
+        ipath = os.path.join(arb.LOG_DIR, "index.json")
+        idx = json.load(open(ipath)) if os.path.exists(ipath) else []
+        idx = [e for e in idx if e.get("id") != rid]
+        idx_entry = {"id": rid, "pr": int(num), "title": title, "label": res.get("label"),
+                     "delta_pct": res.get("delta_pct"), "eval_mode": "dflash", "date": result["date"]}
+        if receipt:
+            idx_entry["polaris"] = True
+            idx_entry["polaris_receipt_id"] = receipt.get("receipt_id", "")[:16]
+        idx.append(idx_entry)
+        idx.sort(key=lambda x: x["id"])
+        json.dump(idx, open(ipath, "w"), indent=2)
+        subprocess.run(["git", "-C", arb.LOG_DIR, "add", "-A"], check=True)
+        msg = f"dflash-eval: #{num} {oid[:7]} -> eval-dflash:{res.get('label')}"
+        if receipt:
+            msg += f" + polaris {receipt.get('receipt_id', '?')[:16]}"
+        commit = subprocess.run(["git", "-C", arb.LOG_DIR, "commit", "-q", "-m", msg], check=False)
+        if commit.returncode != 0:
+            print(">> dflash eval-log upload skipped: nothing to commit")
+            return None
+        push = subprocess.run(["git", "-C", arb.LOG_DIR, "push", "-q"], check=False)
+        if push.returncode != 0:
+            print(f">> dflash eval-log push failed (rc={push.returncode})")
+            return None
+        url = arb.LOG_PAGE + rid
+        print(f">> dflash eval log: {url}")
+        return url
+    except Exception as e:
+        print(f">> dflash eval-log upload failed: {e}")
+        return None
+
+
+def apply_result(repo, num, commit, res, title="", dry_run=False):
     body = format_comment(commit, res)
     label = res.get("label") if res.get("ok") else "REJECT"
     if not res.get("ok"):
@@ -611,6 +878,8 @@ def apply_result(repo, num, commit, res, dry_run=False):
     strip_dflash_eval_labels(repo, num)
     arb.add_label(repo, num, f"{EVAL_PREFIX}{label}")
     arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+    if res.get("ok"):
+        upload_dflash_eval_log(repo, num, title, commit, res)
     if res.get("ok") and res.get("delta_pct") is not None:
         scores = _load_scores()
         scores[str(num)] = {
@@ -699,7 +968,7 @@ def main():
 
         ref = f"pull/{num}/head"
         # Same-repo branches can use headRefName; pull/N/head always works.
-        pending.append((num, head, short, ref))
+        pending.append((num, head, short, ref, pr.get("title", "")))
 
     if not pending:
         reconcile_dflash_merge_labels(args.repo, dry_run=args.dry_run)
@@ -724,15 +993,16 @@ def main():
         print("done — dflash labels only (GPU down).")
         return
 
-    print(f">> SSH root@{host}:{port}")
+    _ssh_user = ssh_box_user() if ssh_box_enabled() else "root"
+    print(f">> SSH {_ssh_user}@{host}:{port}")
 
-    for num, head, short, ref in pending:
+    for num, head, short, ref, title in pending:
         print(f"PR #{num} @ {short}: evaluating DFlash '{ref}' …")
         try:
             res = eval_dflash_on_box(host, port, ref)
         except Exception as e:
             res = {"ok": False, "reason": f"exception: {e}"}
-        apply_result(args.repo, num, head or short, res, dry_run=False)
+        apply_result(args.repo, num, head or short, res, title=title, dry_run=False)
 
     reconcile_dflash_merge_labels(args.repo, dry_run=False)
     print("done — dflash eval pass complete.")

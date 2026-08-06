@@ -12,6 +12,7 @@ this exact output — hardware-attested scoring.
 """
 
 import json
+import re
 import sys
 
 TOP1_BAR = 0.90
@@ -137,9 +138,56 @@ def score(result: dict) -> dict:
     return final
 
 
+def score_dflash(result: dict) -> dict:
+    """Score a DFlash bot result (measurements.dflash / measurements.qwen_guard shape, from
+    pr_dflash_bot.py's eval_dflash_on_box()) — distinct schema from the AR bot's primary/guard
+    RESULT_JSON, so score() above (which reads primary.top1/kl) can't handle it: those fields
+    don't exist in this shape, silently default to 0/99, and score() falls through to an
+    identical REJECT regardless of the real input — which is exactly what produced a constant
+    result_sha256 across genuinely different DFlash evals before this function existed.
+
+    Gate: DFlash accuracy (SPEC_AGREE must be exact) + the Qwen3.5/3.6 no-regression guard.
+    """
+    dflash = result.get("dflash") or {}
+    guard = result.get("qwen_guard") or {}
+
+    if not dflash:
+        return {
+            "label": "REJECT",
+            "pass": False,
+            "reason": "dflash measurements missing (infra error)",
+        }
+
+    spec_agree = str(dflash.get("spec_agree", ""))
+    m = re.search(r"=\s*([0-9.]+)\s*$", spec_agree.strip())
+    ratio = float(m.group(1)) if m else 0.0
+    acc_ok = ratio >= 0.999
+    guard_ok = bool(guard) and bool(guard.get("ok", False))
+
+    final = dict(dflash)
+    final["guard"] = guard
+
+    if not acc_ok:
+        final["label"] = "REJECT"
+        final["pass"] = False
+        final["reason"] = f"DFlash accuracy gate failed: SPEC_AGREE={ratio:.4f} (need >= 0.999)"
+        return final
+    if not guard_ok:
+        reasons = guard.get("problems") or ["qwen3.5/3.6 guard produced no verdict (infra error)"]
+        final["label"] = "REJECT"
+        final["pass"] = False
+        final["reason"] = "qwen3.5/qwen3.6 no-regression guard failed: " + "; ".join(reasons[:6])
+        return final
+
+    final["label"] = "ok"
+    final["pass"] = True
+    final["reason"] = f"DFlash accuracy (SPEC_AGREE={ratio:.4f}) + qwen3.5/3.6 guard both pass"
+    return final
+
+
 def main():
     result = load_result()
-    verdict = score(result)
+    verdict = score_dflash(result) if "dflash" in result else score(result)
     print(json.dumps(verdict))
 
 
