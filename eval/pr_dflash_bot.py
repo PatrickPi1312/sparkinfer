@@ -28,7 +28,7 @@ if HERE not in sys.path:
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from ssh_box import ssh_box_enabled, ssh_box_endpoint  # noqa: E402
+from ssh_box import ssh_box_enabled, ssh_box_endpoint, ssh_box_user  # noqa: E402
 
 # Reuse shared helpers from the AR bot (labels, greenlight, denylist, …).
 import pr_eval_bot as arb  # noqa: E402
@@ -176,6 +176,9 @@ def resolve_ssh(instance_id: int):
 
 def ssh_run(host, port, cmd, timeout=7200):
     key = os.environ.get("SSH_KEY", os.path.expanduser("~/.ssh/speedy"))
+    # vast.ai images run as root; a bare-metal SSH box (EVAL_TRANSPORT=ssh) may have a
+    # non-root default account instead — EVAL_SSH_USER overrides (defaults to root).
+    user = ssh_box_user() if ssh_box_enabled() else "root"
     return subprocess.run(
         [
             "ssh", "-i", key,
@@ -183,7 +186,7 @@ def ssh_run(host, port, cmd, timeout=7200):
             "-o", "BatchMode=yes",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=40",
-            "-p", str(port), f"root@{host}", cmd,
+            "-p", str(port), f"{user}@{host}", cmd,
         ],
         capture_output=True, text=True, timeout=timeout,
     )
@@ -724,7 +727,8 @@ def main():
         print("done — dflash labels only (GPU down).")
         return
 
-    print(f">> SSH root@{host}:{port}")
+    _ssh_user = ssh_box_user() if ssh_box_enabled() else "root"
+    print(f">> SSH {_ssh_user}@{host}:{port}")
 
     for num, head, short, ref in pending:
         print(f"PR #{num} @ {short}: evaluating DFlash '{ref}' …")

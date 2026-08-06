@@ -51,3 +51,10 @@ def ssh_box_enabled():
     if vast_enabled():
         return False
     return ssh_box_endpoint() is not None
+
+
+def ssh_box_user():
+    """Remote SSH user for the fixed box. vast.ai images run as root, so that's the
+    default; a bare-metal box with a non-root account (e.g. cloud-init default users)
+    overrides via EVAL_SSH_USER. Only meaningful when ssh_box_enabled()."""
+    return os.environ.get("EVAL_SSH_USER", "root").strip() or "root"
