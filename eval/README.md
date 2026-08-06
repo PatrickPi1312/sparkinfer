@@ -137,7 +137,14 @@ Policy tests:
 python3 bench/scripts/test_label.py
 ```
 
-## PR auto-evaluation bot
+## PR auto-evaluation bot (retired from cron)
+
+> **Status: scoring is DFlash-only now.** `pr_eval_bot.py`'s casual bidir (Qwen3.5/Qwen3.6) speed
+> scoring is **no longer scheduled** — the every-2-hours cron entry has been removed. Standalone
+> Qwen3.5/Qwen3.6 optimization PRs no longer get an automatic `eval:<LABEL>`; only DFlash PRs are
+> scored (see "DFlash PR auto-evaluation bot" below), gated by a no-regression check on Qwen3.5/3.6
+> decode + prefill. The script and `--labels-only` reconcile path (greenlight / stale-PR closing)
+> still work for manual/ad-hoc runs — it's just not on a timer.
 
 `pr_eval_bot.py` polls open PRs and, for any PR with a **new head commit**, runs the evaluation,
 applies an `eval:<LABEL>` label, and posts the result as a PR comment. **It never merges** — merge
@@ -156,24 +163,36 @@ python eval/pr_eval_bot.py --instance 42134865 --frontier 164 --ceiling 366   # 
 python eval/pr_eval_bot.py --instance 42134865 --dry-run                       # eval but don't post
 ```
 
-**Schedule it every 2 hours** (the wrapper gives cron a sane env + refreshes the evaluator):
+Formerly scheduled every 2 hours via `eval/run_bot_cron.sh`; that crontab entry has been removed
+(see status note above). To run it by hand instead:
 ```bash
-crontab -l 2>/dev/null; echo "0 */2 * * * $PWD/eval/run_bot_cron.sh >> /tmp/sparkinfer_bot.log 2>&1" | crontab -
+python eval/pr_eval_bot.py --instance 42134865 --frontier 164 --ceiling 366   # one poll
+./eval/run_bot_cron.sh --labels-only  # greenlight/stale-PR reconcile only, no GPU
 ```
 Each run: **always uses the pinned GPU** (`VAST_DEFAULT_INSTANCE` /
 `~/.sparkinfer_pinned_instance`). **Never rents** a new one. If the pin is already running and
 SSH works → full eval of new PR commits. If the pin is stopped/unreachable → `--labels-only`
-(greenlight / needs-benchmark / merge-first reconcile, no GPU). Disable with `crontab -e`. Needs
+(greenlight / needs-benchmark / merge-first reconcile, no GPU). Needs
 `gh` authenticated and `VAST_INSTANCE` / `VAST_DEFAULT_INSTANCE` in `.env.eval`
 (`VAST_NO_AUTO_PROVISION=1`).
 
-## DFlash PR auto-evaluation bot
+## DFlash PR auto-evaluation bot (the only scored path)
 
 `pr_dflash_bot.py` evaluates PRs that touch DFlash paths (`dflash*`, `qwen3_gguf_dflash_*`,
 `dflash_accuracy.sh`). It scores **same-box PR DFlash tok/s vs `origin/main` DFlash tok/s**,
 applies `eval-dflash:{XL,L,M,S,XS,none,REJECT}`, picks `dflash-merge-first`, and can auto-merge
 (`SPARKINFER_AUTOMERGE=1`) when accuracy passes (SPEC_AGREE) and the tier is a verified speedup.
-AR `eval:*` labels are left alone.
+
+**Qwen3.5/3.6 no-regression guard.** On the *same PR build* used for the DFlash bench, the bot
+also runs the standard decode + prefill sweep for Qwen3.6 (128/512/4k/16k/32k) and Qwythos/Qwen3.5
+(128/4k/32k/64k decode, 4k/32k/64k/128k prefill) — once for the PR ref, once for `origin/main` —
+and compares every context pairwise (same 0.98 no-regression tolerance as the AR bot's guards). If
+*either* model regresses on *either* metric at *any* context, the DFlash tier is overridden to
+`eval-dflash:REJECT` regardless of how large the DFlash speedup was — the PR comment lists exactly
+which context/metric failed. This means DFlash PRs now need `/workspace/models35` (Qwythos) and
+`/workspace/models36` (Qwen3.6) present on the eval box; the bot downloads/verifies them itself
+(same `_common.sh` `ensure_model`/`ensure_tokenizer` helpers as the AR bot) if missing. Expect
+longer per-PR eval time than before (two extra model sweeps, PR + main).
 
 ```bash
 eval/setup_labels.sh                                  # creates eval-dflash:* + dflash-merge-*

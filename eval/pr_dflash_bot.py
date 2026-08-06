@@ -41,8 +41,13 @@ BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 EVAL_PREFIX = "eval-dflash:"
 DFLASH_MERGE_FIRST = "dflash-merge-first"
 DFLASH_NEEDS_REBASE = "dflash-needs-rebase"
+# Bumped when the scoring/guard logic changes materially (e.g. adding the Qwen3.5/3.6
+# no-regression guard) — old markers from before the bump deliberately DON'T match, so a PR
+# whose head commit hasn't moved since a pre-guard eval is treated as never-evaluated and gets
+# a fresh, guarded run instead of keeping its stale (unguarded) label/score forever.
+EVAL_SCHEMA_VERSION = "v2-qwenguard"
 MARKER_RE = re.compile(
-    r"<!-- sparkinfer-dflash-eval:([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
+    r"<!-- sparkinfer-dflash-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
 )
 DFLASH_PATH_RE = re.compile(r"(?:^|/)(?:dflash|qwen3_gguf_dflash_|dflash_accuracy\.sh)", re.I)
@@ -56,6 +61,18 @@ DEFAULT_DRAFT = os.environ.get(
 DEFAULT_MODELS_DIR = os.environ.get("DFLASH_MODELS_DIR", "/workspace/models36")
 REMOTE_REPO = os.environ.get("DFLASH_REMOTE_REPO", "/root/sparkinfer")
 BENCH_TOKENS = int(os.environ.get("DFLASH_BENCH_TOKENS", "128"))
+
+# Qwen3.5 (Qwythos) + Qwen3.6 no-regression guard — since #667-era policy, DFlash is the only
+# thing that gets a score; it's only valid if the *same PR build* doesn't regress Qwen3.5/3.6
+# decode or prefill vs same-box origin/main. Qwen3.6 reuses the DFlash GGUF (one copy, no extra
+# download); Qwen3.5 uses the standard Qwythos path already used by the AR/bidir bot.
+Q36_GUARD_MODEL_FILE = os.path.basename(DEFAULT_GGUF)
+Q36_GUARD_MODELS_DIR = os.path.dirname(DEFAULT_GGUF) or DEFAULT_MODELS_DIR
+Q36_GUARD_MODEL_REPO = os.environ.get("PRIMARY36_MODEL_REPO", "unsloth/Qwen3.6-35B-A3B-GGUF")
+Q36_GUARD_TOK_REPO = os.environ.get("PRIMARY36_TOK_REPO", "Qwen/Qwen3.6-35B-A3B")
+Q35_GUARD_MODELS_DIR = os.environ.get("QWYTHOS_MODELS_DIR", "/workspace/models35")
+GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k",
+                   65536: "64k", 131072: "128k"}
 
 AUTO_MERGE = os.environ.get("SPARKINFER_AUTOMERGE", "0") == "1"
 AUTOMERGE_BLOCK = {
@@ -184,6 +201,11 @@ def _remote_script(ref: str, do_accuracy: bool, prompt_ids: str | None, n_tokens
     if prompt_ids:
         ids_export = f"PROMPT_IDS={shlex.quote(prompt_ids)}\n"
     acc = "1" if do_accuracy else "0"
+    q36_file = shlex.quote(Q36_GUARD_MODEL_FILE)
+    q36_dir = shlex.quote(Q36_GUARD_MODELS_DIR)
+    q36_repo = shlex.quote(Q36_GUARD_MODEL_REPO)
+    q36_tok = shlex.quote(Q36_GUARD_TOK_REPO)
+    q35_dir = shlex.quote(Q35_GUARD_MODELS_DIR)
     return f"""
 set -euo pipefail
 export PATH=/usr/local/cuda-13.0/bin:/usr/local/cuda/bin:/usr/local/bin:$PATH
@@ -196,6 +218,11 @@ DRAFT={draft}
 MODELS_DIR={models}
 NTOK={n_tokens}
 DO_ACC={acc}
+Q36_GUARD_MODEL_FILE={q36_file}
+Q36_GUARD_MODELS_DIR={q36_dir}
+Q36_GUARD_MODEL_REPO={q36_repo}
+Q36_GUARD_TOK_REPO={q36_tok}
+Q35_GUARD_MODELS_DIR={q35_dir}
 {ids_export}
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
@@ -213,13 +240,14 @@ if [ ! -f "$DRAFT/model.safetensors" ] && [ ! -f "$DRAFT/model.safetensors.index
 fi
 test -f "$GGUF" || {{ echo "FAIL missing GGUF $GGUF"; exit 1; }}
 
-# Build dflash tools (incremental)
+# Build dflash tools + qwen3_gguf_bench (incremental) — the latter drives the Qwen3.5/3.6 guard below.
 mkdir -p build
 if [ ! -f build/CMakeCache.txt ]; then
   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/dflash_cmake.log 2>&1
 fi
-cmake --build build --target qwen3_gguf_dflash_check qwen3_gguf_dflash_bench -j"$(nproc)" >/tmp/dflash_build.log 2>&1
+cmake --build build --target qwen3_gguf_dflash_check qwen3_gguf_dflash_bench qwen3_gguf_bench -j"$(nproc)" >/tmp/dflash_build.log 2>&1
 test -x build/runtime/qwen3_gguf_dflash_bench
+test -x build/runtime/qwen3_gguf_bench
 
 if [ "$DO_ACC" = "1" ]; then
   export MODELS_DIR
@@ -247,11 +275,51 @@ TAU=$(echo "$OUT" | grep '^METRIC MEAN_ACCEPT' | awk '{{print $3}}' | tail -1)
 echo "RESULT_AR_TPS $AR"
 echo "RESULT_DFLASH_TPS $DF"
 echo "RESULT_MEAN_ACCEPT $TAU"
+
+# --- Qwen3.5 / Qwen3.6 no-regression guard (decode + prefill, same build as above) ---
+source bench/scripts/_common.sh
+source bench/scripts/_eval_speed.sh
+# Pin QWYTHOS_MODELS_DIR before sourcing _qwythos.sh: its own default derives from the ambient
+# $MODELS_DIR, which the DFlash steps above already repointed at /workspace/models36 — falling
+# through to that default here would silently resolve to .../models3635.
+export QWYTHOS_MODELS_DIR="$Q35_GUARD_MODELS_DIR"
+source bench/scripts/_qwythos.sh
+SI_BIN="$PWD/build/runtime"; SI_LD=""
+gclks=()
+
+Q35_FILE="$(qwythos_quant_file)"
+export MODELS_DIR="$QWYTHOS_MODELS_DIR" MODEL_REPO="$QWYTHOS_REPO" MODEL_FILE="$Q35_FILE" TOK_REPO="$QWYTHOS_TOK_REPO"
+export MODEL_SHA256="$(qwythos_sha_var)"
+( ensure_model && ensure_tokenizer ) || echo "WARN: qwen3.5 guard model setup failed" >&2
+Q35_GGUF="$QWYTHOS_MODELS_DIR/$Q35_FILE"
+
+export MODELS_DIR="$Q36_GUARD_MODELS_DIR" MODEL_REPO="$Q36_GUARD_MODEL_REPO" MODEL_FILE="$Q36_GUARD_MODEL_FILE" TOK_REPO="$Q36_GUARD_TOK_REPO"
+export MODEL_SHA256="${{QWEN36_MODEL_SHA256:-}}"
+( ensure_model && ensure_tokenizer ) || echo "WARN: qwen3.6 guard model setup failed" >&2
+Q36_GGUF="$Q36_GUARD_MODELS_DIR/$Q36_GUARD_MODEL_FILE"
+
+echo "GUARD_START"
+if bench_sweep_run "$Q36_GGUF" 128 0 1 512 1 4096 1 16384 1 32768 1; then
+  for ctx in 0 512 4096 16384 32768; do
+    echo "GUARD36 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+  done
+else
+  echo "GUARD36_FAILED"
+fi
+if bench_sweep_run "$Q35_GGUF" 128 0 1 4096 1 32768 1 65536 1 131072 1; then
+  for ctx in 0 4096 32768 65536 131072; do
+    echo "GUARD35 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+  done
+else
+  echo "GUARD35_FAILED"
+fi
+echo "GUARD_END"
 """
 
 
 def _parse_remote(stdout: str) -> dict:
     out = {}
+    guard36, guard35 = {}, {}
     for line in (stdout or "").splitlines():
         if line.startswith("RESULT_AR_TPS "):
             out["ar_tps"] = float(line.split()[1])
@@ -265,7 +333,66 @@ def _parse_remote(stdout: str) -> dict:
             out["head"] = line.split()[1]
         elif line.startswith("METRIC SPEC_AGREE"):
             out["spec_agree"] = line.strip()
+        elif line.startswith("GUARD36 "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guard36[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.startswith("GUARD35 "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guard35[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.strip() == "GUARD36_FAILED":
+            out["guard36_failed"] = True
+        elif line.strip() == "GUARD35_FAILED":
+            out["guard35_failed"] = True
+    out["guard36"] = guard36
+    out["guard35"] = guard35
     return out
+
+
+def check_qwen_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """No-regression check: PR vs same-box main, Qwen3.5 + Qwen3.6, decode + prefill, every
+    measured context. Returns (ok, [human-readable regression/failure strings])."""
+    problems = []
+    if pr.get("guard36_failed") or main.get("guard36_failed") or not pr.get("guard36") or not main.get("guard36"):
+        problems.append("qwen3.6 guard measurement unavailable")
+    if pr.get("guard35_failed") or main.get("guard35_failed") or not pr.get("guard35") or not main.get("guard35"):
+        problems.append("qwen3.5 guard measurement unavailable")
+    # Iterate over MAIN's contexts (the reference/expected set), not the PR's — a PR build that
+    # crashes partway through its sweep and never reports a context must not make that context
+    # silently uncheckable. Fail closed: a real main baseline (base > 0) with a missing or zero
+    # PR measurement (cur <= 0) is flagged as a regression, never skipped.
+    for model_name, pr_ctxs, main_ctxs in (
+        ("qwen3.6", pr.get("guard36") or {}, main.get("guard36") or {}),
+        ("qwen3.5", pr.get("guard35") or {}, main.get("guard35") or {}),
+    ):
+        for ctx, main_vals in main_ctxs.items():
+            label = GUARD_CTX_LABEL.get(ctx, str(ctx))
+            pr_vals = pr_ctxs.get(ctx) or {}
+            for metric in ("decode", "prefill"):
+                base = main_vals.get(metric, 0)
+                if base <= 0:
+                    continue  # main itself has no baseline for this metric/ctx — not comparable
+                cur = pr_vals.get(metric, 0)
+                if cur <= 0:
+                    problems.append(
+                        f"{model_name} {metric}@{label}: PR measurement missing/zero "
+                        f"(main {base:.1f}) — treated as regression"
+                    )
+                    continue
+                if cur < base * tol:
+                    pct = 100.0 * (cur - base) / base
+                    problems.append(
+                        f"{model_name} {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
+                        f"{base:.1f} ({pct:+.1f}%)"
+                    )
+    return (len(problems) == 0, problems)
 
 
 def eval_dflash_on_box(host, port, pr_ref: str):
@@ -291,6 +418,13 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         return {"ok": False, "reason": "main bench missing DFLASH_TPS", "log": (r2.stdout or "")[-1500:],
                 "pr": pr}
     label, delta_pct, passed, reason = tier_from_gain(pr["dflash_tps"], main["dflash_tps"])
+    guard_ok, guard_problems = check_qwen_guard(pr, main)
+    if not guard_ok:
+        # DFlash-only scoring is only valid alongside a clean Qwen3.5/3.6 guard — a regression
+        # there overrides any DFlash tier, however good, into REJECT.
+        label = "REJECT"
+        passed = False
+        reason = "qwen3.5/qwen3.6 no-regression guard failed: " + "; ".join(guard_problems[:6])
     return {
         "ok": True,
         "label": label,
@@ -306,6 +440,8 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         "prompt_ids": ids,
         "speedup_vs_main": round(pr["dflash_tps"] / main["dflash_tps"], 3) if main["dflash_tps"] else 0,
         "speedup_vs_ar": round(pr["dflash_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
+        "guard_ok": guard_ok,
+        "guard_problems": guard_problems,
     }
 
 
@@ -317,7 +453,10 @@ def format_comment(commit: str, res: dict) -> str:
         "main_dflash_tps": res.get("main_dflash_tps"),
         "pass": res.get("pass"),
     }
-    marker = f"<!-- sparkinfer-dflash-eval:{commit} {json.dumps(meta, separators=(',', ':'))} -->"
+    marker = (
+        f"<!-- sparkinfer-dflash-eval:{EVAL_SCHEMA_VERSION}:{commit} "
+        f"{json.dumps(meta, separators=(',', ':'))} -->"
+    )
     if not res.get("ok"):
         return (
             f"{marker}\n## sparkinfer dflash auto-eval — error\n\n"
@@ -325,6 +464,15 @@ def format_comment(commit: str, res: dict) -> str:
             f"<details><summary>log tail</summary>\n\n```\n{(res.get('log') or '')[:1800]}\n```\n</details>\n"
         )
     lab = res["label"]
+    guard_ok = res.get("guard_ok")
+    if guard_ok is None:
+        guard_row = "| Qwen3.5/3.6 guard | — |\n"
+    elif guard_ok:
+        guard_row = "| Qwen3.5/3.6 guard | ✅ no regression (decode + prefill) |\n"
+    else:
+        problems = res.get("guard_problems") or []
+        guard_row = "| Qwen3.5/3.6 guard | ❌ **REGRESSED** — DFlash score voided |\n"
+        guard_row += "".join(f"| &nbsp;&nbsp;↳ | `{p}` |\n" for p in problems[:8])
     return (
         f"{marker}\n## sparkinfer dflash auto-eval — `eval-dflash:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
@@ -336,10 +484,12 @@ def format_comment(commit: str, res: dict) -> str:
         f"| DFlash vs AR | {res.get('speedup_vs_ar') or 0:.2f}× |\n"
         f"| mean accept τ | {res.get('mean_accept') or 0:.3f} |\n"
         f"| accuracy | {res.get('spec_agree') or 'VERDICT PASS'} |\n"
+        f"{guard_row}"
         f"| commit | `{commit[:9]}` |\n\n"
         f"{res.get('reason') or ''}\n\n"
-        "<sub>Scored on pinned RTX 5090 vs same-box `origin/main` DFlash. "
-        "AR `eval:*` labels are unchanged.</sub>\n"
+        "<sub>Scored on pinned RTX 5090 vs same-box `origin/main` DFlash, gated by a "
+        "same-build Qwen3.5/3.6 decode+prefill no-regression guard. "
+        "AR `eval:*` labels are frozen (casual bidir eval retired).</sub>\n"
     )
 
 
