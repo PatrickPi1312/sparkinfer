@@ -6,12 +6,12 @@
 namespace sparkinfer {
 namespace dflash_kernels {
 
-// Non-causal GQA attention. q: [q_len, n_q, d], k/v: [kv_len, n_kv, d], out: [q_len, n_q, d] bf16.
+// GQA attention. q: [q_len, n_q, d], k/v: [kv_len, n_kv, d], out: [q_len, n_q, d] bf16.
 // q_pos0 / k_pos0 are absolute positions of index 0. If window > 0, mask keys with
 // (q_pos - k_pos) >= window (sliding window). scale = 1/sqrt(d).
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
-                     int q_pos0, int k_pos0, int window, float scale,
+                     int q_pos0, int k_pos0, int window, bool causal, float scale,
                      cudaStream_t stream);
 
 // In-place RoPE on [seq, n_heads, d] bf16. positions[i] = pos0 + i.
@@ -34,6 +34,11 @@ void launch_rms(const void* x, const void* w, void* out, int rows, int cols,
 // x: [16,K] bf16, W: [N,K] bf16 (native "out,in" layout, same as a single-row GEMV), y: [16,N] bf16.
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
                            cudaStream_t stream);
+
+// Exact batched form of the small-N S=8 split-K BF16 GEMV used by launch_gemv.
+// Collapses multiple row launches into grid.y without changing arithmetic order.
+void launch_gemv_rows_exact(const void* x, const void* W, void* y,
+                            int rows, int N, int K, cudaStream_t stream);
 
 // Same, with fp32 output/accumulate (for the LM head's logits).
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,

@@ -91,7 +91,7 @@ __global__ void k_rope(bf16* x, int seq, int n_heads, int d, int pos0, float the
 // One block per (q_token, q_head). Online softmax over kv_len.
 __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
                        int q_len, int kv_len, int n_q, int n_kv, int d,
-                       int q_pos0, int k_pos0, int window, float scale) {
+                       int q_pos0, int k_pos0, int window, bool causal, float scale) {
     int qt = blockIdx.x;
     int qh = blockIdx.y;
     if (qt >= q_len || qh >= n_q) return;
@@ -115,6 +115,7 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
 
     for (int t = 0; t < kv_len; t++) {
         const int k_pos = k_pos0 + t;
+        if (causal && k_pos > q_pos) continue;
         if (window > 0 && (q_pos - k_pos) >= window) continue;
         const bf16* kv = k + ((size_t)t * n_kv + kv_h) * d;
         float dot = 0.f;
@@ -122,10 +123,22 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
             dot += q_s[i] * b2f(kv[i]);
         red[threadIdx.x] = dot;
         __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-            __syncthreads();
+        // Preserve the original 128-way reduction tree, but stop using block-wide
+        // barriers once only warp 0 remains. The +64 and +32 stages still go through
+        // shared memory; +16..+1 use the equivalent shuffle-down tree. This removes
+        // four barriers per KV token without perturbing draft logits / acceptance.
+        if (threadIdx.x < 64) red[threadIdx.x] += red[threadIdx.x + 64];
+        __syncthreads();
+        if (threadIdx.x < 32) red[threadIdx.x] += red[threadIdx.x + 32];
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float warp_sum = red[threadIdx.x];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                warp_sum += __shfl_down_sync(0xffffffffu, warp_sum, off);
+            if (threadIdx.x == 0) red[0] = warp_sum;
         }
+        __syncthreads();
         float score = red[0] * scale;
         float new_max = fmaxf(max_s, score);
         float e1 = expf(max_s - new_max);
@@ -141,6 +154,88 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
     float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
     for (int i = threadIdx.x; i < d; i += blockDim.x)
         ov[i] = f2b(acc[i] * inv);
+}
+
+// Split the key sequence across the warps of one CTA, then merge their online-
+// softmax states once. This keeps the hd128 Q/output state in registers and exposes
+// parallelism across KV tokens as the sequence grows.
+__global__ void k_attn_multiwarp_hd128(
+    const bf16* __restrict__ q, const bf16* __restrict__ k,
+    const bf16* __restrict__ v, bf16* __restrict__ out,
+    int q_len, int kv_len, int n_q, int n_kv,
+    int q_pos0, int k_pos0, int window, bool causal, float scale) {
+    const int qt = blockIdx.x;
+    const int qh = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    if (qt >= q_len || qh >= n_q) return;
+
+    constexpr int D = 128;
+    constexpr int E = D / 32;
+    const int base = lane * E;
+    const int kv_h = qh / (n_q / n_kv);
+    const bf16* qv = q + ((size_t)qt * n_q + qh) * D + base;
+    bf16* ov = out + ((size_t)qt * n_q + qh) * D + base;
+    float qr[E], acc[E];
+#pragma unroll
+    for (int e = 0; e < E; e++) {
+        qr[e] = b2f(qv[e]);
+        acc[e] = 0.f;
+    }
+
+    float max_s = -1e30f;
+    float sum = 0.f;
+    const int q_pos = q_pos0 + qt;
+    for (int t = warp; t < kv_len; t += nwarps) {
+        const int k_pos = k_pos0 + t;
+        if (causal && k_pos > q_pos) continue;
+        if (window > 0 && (q_pos - k_pos) >= window) continue;
+        const bf16* kv = k + ((size_t)t * n_kv + kv_h) * D + base;
+        float dot = 0.f;
+#pragma unroll
+        for (int e = 0; e < E; e++) dot += qr[e] * b2f(kv[e]);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_down_sync(0xffffffffu, dot, off);
+        const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+        const float new_max = fmaxf(max_s, score);
+        const float e1 = expf(max_s - new_max);
+        const float e2 = expf(score - new_max);
+        sum = sum * e1 + e2;
+        const bf16* vv = v + ((size_t)t * n_kv + kv_h) * D + base;
+#pragma unroll
+        for (int e = 0; e < E; e++) acc[e] = acc[e] * e1 + e2 * b2f(vv[e]);
+        max_s = new_max;
+    }
+
+    extern __shared__ float sm[];
+    float* s_max = sm;
+    float* s_sum = sm + nwarps;
+    float* s_acc = sm + 2 * nwarps;
+    if (lane == 0) {
+        s_max[warp] = max_s;
+        s_sum[warp] = sum;
+    }
+#pragma unroll
+    for (int e = 0; e < E; e++) s_acc[(size_t)warp * D + base + e] = acc[e];
+    __syncthreads();
+    if (warp != 0) return;
+
+    float global_max = -1e30f;
+    for (int w = 0; w < nwarps; w++) global_max = fmaxf(global_max, s_max[w]);
+    float global_sum = 0.f;
+    float result[E] = {0.f, 0.f, 0.f, 0.f};
+    for (int w = 0; w < nwarps; w++) {
+        const float correction = expf(s_max[w] - global_max);
+        global_sum += s_sum[w] * correction;
+#pragma unroll
+        for (int e = 0; e < E; e++)
+            result[e] += s_acc[(size_t)w * D + base + e] * correction;
+    }
+    const float inv = global_sum > 0.f ? 1.f / global_sum : 0.f;
+#pragma unroll
+    for (int e = 0; e < E; e++) ov[e] = f2b(result[e] * inv);
 }
 
 // One warp per output row `n`, computing y[b][n] = sum_k x[b][k] * W[n][k] for all b in
@@ -168,10 +263,14 @@ __global__ void k_gemv_batched(const bf16* __restrict__ x, const bf16* __restric
     const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
     const int K8 = K / 8;
     for (int k8 = lane; k8 < K8; k8 += 32) {
-        const bf16* wv = (const bf16*)&wrow4[k8];
+        // Materialize the wide packets in registers. Merely taking a bf16 pointer
+        // into wrow4 lets ptxas scalarize every unrolled element access.
+        const uint4 wp = wrow4[k8];
+        const bf16* wv = (const bf16*)&wp;
 #pragma unroll
         for (int b = 0; b < BATCH; b++) {
-            const bf16* xv = (const bf16*)&(((const uint4*)(x + (size_t)b * K))[k8]);
+            const uint4 xp = ((const uint4*)(x + (size_t)b * K))[k8];
+            const bf16* xv = (const bf16*)&xp;
 #pragma unroll
             for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
         }
@@ -204,10 +303,12 @@ __global__ void k_gemv_batched_f32(const bf16* __restrict__ x, const bf16* __res
     const uint4* wrow4 = (const uint4*)(W + (size_t)n * K);
     const int K8 = K / 8;
     for (int k8 = lane; k8 < K8; k8 += 32) {
-        const bf16* wv = (const bf16*)&wrow4[k8];
+        const uint4 wp = wrow4[k8];
+        const bf16* wv = (const bf16*)&wp;
 #pragma unroll
         for (int b = 0; b < BATCH; b++) {
-            const bf16* xv = (const bf16*)&(((const uint4*)(x + (size_t)b * K))[k8]);
+            const uint4 xp = ((const uint4*)(x + (size_t)b * K))[k8];
+            const bf16* xv = (const bf16*)&xp;
 #pragma unroll
             for (int j = 0; j < 8; j++) acc[b] += b2f(wv[j]) * b2f(xv[j]);
         }
@@ -221,6 +322,48 @@ __global__ void k_gemv_batched_f32(const bf16* __restrict__ x, const bf16* __res
     if (lane == 0) {
 #pragma unroll
         for (int b = 0; b < BATCH; b++) y[(size_t)b * N + n] = acc[b];
+    }
+}
+
+// Arithmetic-identical to kernels::gemv_f32_sk_kernel<bf16,8> for N<4096,
+// extended with grid.y for independent activation rows. Each CTA still maps to
+// one (batch, output) pair and uses the same per-lane K traversal, XOR warp
+// reduction, and ordered eight-way split sum as the individual launches.
+__global__ void k_gemv_rows_exact_s8(const bf16* __restrict__ x,
+                                     const bf16* __restrict__ W,
+                                     bf16* __restrict__ y, int rows, int N, int K) {
+    const int n = blockIdx.x;
+    const int batch = blockIdx.y;
+    const int split = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (n >= N || batch >= rows) return;
+    const uint4* w4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x + (size_t)batch * K);
+    const int K8 = K / 8;
+    float acc = 0.f;
+    for (int i = split * 32 + lane; i < K8; i += 8 * 32) {
+        const uint4 wp = w4[i];
+        const uint4 xp = x4[i];
+        const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wp);
+        const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xp);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float2 wf = __bfloat1622float2(wh[j]);
+            const float2 xf = __bfloat1622float2(xh[j]);
+            acc += wf.x * xf.x + wf.y * xf.y;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    __shared__ float partial[8];
+    if (lane == 0) partial[split] = acc;
+    __syncthreads();
+    if (split == 0 && lane == 0) {
+        float result = 0.f;
+#pragma unroll
+        for (int s = 0; s < 8; s++) result += partial[s];
+        y[(size_t)batch * N + n] = f2b(result);
     }
 }
 
@@ -258,14 +401,23 @@ void launch_rope_seq(void* x, int seq, int n_heads, int d, int pos0, float theta
 
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
-                     int q_pos0, int k_pos0, int window, float scale,
+                     int q_pos0, int k_pos0, int window, bool causal, float scale,
                      cudaStream_t stream) {
     if (q_len <= 0 || kv_len <= 0) return;
     dim3 grid(q_len, n_q);
+    if (d == 128) {
+        constexpr int THREADS = 512;
+        constexpr int NWARPS = THREADS / 32;
+        constexpr int SMEM = (2 * NWARPS + NWARPS * 128) * sizeof(float);
+        k_attn_multiwarp_hd128<<<grid, THREADS, SMEM, stream>>>(
+            (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)out,
+            q_len, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale);
+        return;
+    }
     int smem = (2 * d + 128) * (int)sizeof(float);
     k_attn<<<grid, 128, smem, stream>>>((const bf16*)q, (const bf16*)k, (const bf16*)v,
                                         (bf16*)out, q_len, kv_len, n_q, n_kv, d,
-                                        q_pos0, k_pos0, window, scale);
+                                        q_pos0, k_pos0, window, causal, scale);
 }
 
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
@@ -275,6 +427,14 @@ void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,
     dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
     k_gemv_batched<16><<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
         (const bf16*)x, (const bf16*)W, (bf16*)y, N, K);
+}
+
+void launch_gemv_rows_exact(const void* x, const void* W, void* y,
+                            int rows, int N, int K, cudaStream_t stream) {
+    if (rows <= 0 || N <= 0) return;
+    dim3 grid(N, rows);
+    k_gemv_rows_exact_s8<<<grid, 8 * 32, 0, stream>>>(
+        (const bf16*)x, (const bf16*)W, (bf16*)y, rows, N, K);
 }
 
 void launch_gemv_batched16_f32(const void* x, const void* W, float* y, int N, int K,
