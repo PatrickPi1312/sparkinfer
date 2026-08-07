@@ -34,6 +34,7 @@
 #include <fstream>
 #include <limits>
 #include <algorithm>
+#include <thread>
 
 namespace sparkinfer {
 
@@ -217,6 +218,10 @@ struct Qwen35Model::Impl {
 
     // DFlash speculative decoding (target-side primitives).
     DFlashDraftModel* dflash_draft = nullptr;
+    // Preserve the native Q6_K head for the draft's multi-row MMVQ while the
+    // target uses its faster, narrower Q4_K requantized copy.
+    const void* dflash_lm_head = nullptr;
+    int dflash_lm_head_type = 0;
     bool dflash_capture = false;
     std::vector<int> dflash_layer_ids;
     int dflash_n_cap = 0;
@@ -1804,7 +1809,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     const int B = dc.block_size;
     const int mask_id = dc.mask_token_id;
 
-    draft.set_shared_weights(embed_weights(), lm_head_weights(), lm_head_quant_type(),
+    draft.set_shared_weights(embed_weights(),
+                             s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights(),
+                             s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type(),
                              s.cfg.vocab, s.cfg.hidden);
     set_dflash_capture(true, dc.target_layer_ids, B);
 
@@ -1844,45 +1851,68 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
+    constexpr int kProposalDepth = 3;
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
-    cu(cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)), "th scratch");
-
+    if (cudaMalloc(&th_scratch, (size_t)B * row_stride * sizeof(bf16)) != cudaSuccess) {
+        close_session(sid);
+        set_dflash_capture(false, {}, 0);
+        draft.reset();
+        return out;
+    }
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
 
-        if (!draft.forward_block(target_hidden, th_len, block.data(), start, draft_ids.data(), s.stream)) {
+        // The target overwrites dflash_hidden while capturing verify row zero. Preserve the
+        // accepted suffix before running that target forward concurrently with the independent
+        // draft stream. The initial full-context buffer is separate and needs no copy.
+        const void* draft_hidden = target_hidden;
+        if (target_hidden == s.dflash_hidden) {
+            cu(cudaMemcpyAsync(th_scratch, target_hidden,
+                               (size_t)th_len * row_stride * sizeof(bf16),
+                               cudaMemcpyDeviceToDevice, s.stream), "dflash overlap stash");
+            cu(cudaStreamSynchronize(s.stream), "dflash overlap stash sync");
+            draft_hidden = th_scratch;
+        }
+
+        int p0 = -1;
+        set_dflash_capture_row(0);
+        std::thread verify0([&] { p0 = forward_token(block[0], start, true); });
+        const bool draft_ok = draft.forward_block(
+            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr);
+        verify0.join();
+        if (!draft_ok) {
             fprintf(stderr, "[dflash] draft forward failed at start=%d\n", start);
             break;
         }
-        for (int i = 1; i < B; i++) block[i] = draft_ids[i];
+        for (int i = 1; i <= kProposalDepth; i++) block[i] = draft_ids[i];
 
         // Incremental verify with early-exit: forward only the accepted prefix, stopping at the
         // first rejected proposal. forward_token advances GDN state + KV per token, so after
         // block[0..keep-1] the recurrent state and KV sit exactly at start+keep -- no snapshot /
         // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
         // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
-        int accept = 0, keep = 0;
-        bool vfail = false;
-        for (int i = 0; i < B; i++) {
-            set_dflash_capture_row(i);
-            const int p = forward_token(block[i], start + i, true);
-            if (p < 0) { vfail = true; break; }
-            posterior[i] = p;
-            accept = i;
-            keep = i + 1;
-            if (i + 1 < B && block[i + 1] != p) break;   // first mismatch -> reject the rest
+        int accept = 0, keep = 1;
+        bool vfail = p0 < 0;
+        posterior[0] = p0;
+        if (!vfail && block[1] == p0) {
+            for (int i = 1; i <= kProposalDepth; i++) {
+                set_dflash_capture_row(i);
+                const int p = forward_token(block[i], start + i, true);
+                if (p < 0) { vfail = true; break; }
+                posterior[i] = p;
+                accept = i;
+                keep = i + 1;
+                if (i < kProposalDepth && block[i + 1] != p) break;
+            }
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
-        // Accepted hiddens are in dflash_hidden rows 0..keep-1 (captured above); hand them to the
-        // next draft block via th_scratch and stash into the context buffer by global position.
-        cu(cudaMemcpyAsync(th_scratch, s.dflash_hidden,
-                           (size_t)keep * row_stride * sizeof(bf16),
-                           cudaMemcpyDeviceToDevice, s.stream), "th keep");
-        for (int i = 0; i < keep; i++) dflash_stash_capture(start + i);
-        cu(cudaStreamSynchronize(s.stream), "th sync");
+        // forward_token() synchronizes after sampling, so the accepted capture rows are already
+        // stable. The draft consumes only this newly accepted suffix; its KV cache retains all
+        // earlier context. Hand the capture buffer over directly instead of copying it to a second
+        // scratch allocation, stashing another unused full-context copy, and synchronizing again.
 
         bool stop = false;
         for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
@@ -1900,7 +1930,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         start += keep;
         accept_sum += (double)keep;
         steps++;
-        target_hidden = th_scratch;
+        target_hidden = s.dflash_hidden;
         th_len = keep;
         if (gov) gov->pace();
     }
@@ -1911,8 +1941,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         stats->ttft_s = std::chrono::duration<double>(t1 - t0).count();
         stats->decode_s = std::chrono::duration<double>(t_end - t_decode0).count();
     }
-    cudaFree(th_scratch);
     close_session(sid);
+    if (th_scratch) cudaFree(th_scratch);
     set_dflash_capture(false, {}, 0);
     draft.reset();
     return out;
@@ -2244,7 +2274,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return layer_index(name) >= ssm_out_min_layer;
         return false;
     };
-    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K", q35_dense9b_requant_default);
+    const bool dual_dflash_lm_head = env_enabled(
+        "SPARKINFER_DFLASH_DUAL_LMHEAD",
+        q36_ud_requant_default && !q35_dense9b_requant_default);
+    const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K",
+                                       q35_dense9b_requant_default || dual_dflash_lm_head);
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
@@ -2293,6 +2327,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
     const char* lm = g.tensor("output.weight") ? "output.weight" : "token_embd.weight";  // tied fallback
+    const GGUFTensor* lm_tensor = g.tensor(lm);
+    if (dual_dflash_lm_head && req_lm_q4 && lm_tensor &&
+        (lm_tensor->ggml_type == 14 || lm_tensor->ggml_type == 8)) {
+        s.dflash_lm_head = dev_quant(lm, s.dflash_lm_head_type);
+    }
     s.w.lm_head = lm_w(lm, s.w.lm_head_type);                 // native [vocab,hidden] for GEMV
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
