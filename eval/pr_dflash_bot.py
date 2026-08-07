@@ -158,12 +158,24 @@ def is_dflash_pr(repo, num) -> bool:
 
 
 def dflash_evaluated_commits(repo, num):
+    """Head commits that already have a REAL scoring verdict posted — infra/transport failures
+    (label:null in the marker's meta JSON) don't count, so a commit that hit a flaky SSH/CUDA/box
+    crash gets picked up again on the next tick instead of being silently skipped forever."""
     r = arb.gh(["pr", "view", str(num), "-R", repo, "--json", "comments"])
     done = set()
     for c in json.loads(r.stdout or "{}").get("comments", []):
-        m = MARKER_RE.search(c.get("body") or "")
-        if m and "sparkinfer dflash auto-eval" in (c.get("body") or ""):
-            done.add(m.group(1))
+        body = c.get("body") or ""
+        m = MARKER_RE.search(body)
+        if not m or "sparkinfer dflash auto-eval" not in body:
+            continue
+        meta_raw = m.group(2)
+        try:
+            meta = json.loads(meta_raw) if meta_raw else {}
+        except json.JSONDecodeError:
+            meta = {}
+        if meta.get("label") is None:
+            continue
+        done.add(m.group(1))
     return done
 
 
@@ -238,6 +250,19 @@ def _remote_script(ref: str, do_accuracy: bool, prompt_ids: str | None, n_tokens
     q35_dir = shlex.quote(Q35_GUARD_MODELS_DIR)
     return f"""
 set -euo pipefail
+# Surface *why* a crash happened instead of just dying silently under set -e — decode common
+# kill/crash exit codes into a human reason and snapshot GPU memory at the moment of failure, so
+# a REJECT from an infra crash (e.g. #684's OOM-during-model-load) shows a real cause instead of
+# a bare truncated stdout tail.
+trap 'rc=$?; ln=$LINENO; reason=""; \\
+  case $rc in \\
+    137) reason="likely OOM-killed (SIGKILL)" ;; \\
+    139) reason="likely segfault (SIGSEGV)" ;; \\
+    134) reason="likely abort (SIGABRT)" ;; \\
+    124) reason="likely timeout" ;; \\
+  esac; \\
+  echo "REMOTE_SCRIPT_FAILED line=$ln exit=$rc reason=$reason" >&2; \\
+  nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader >&2 2>/dev/null || true' ERR
 export PATH=/usr/local/cuda-13.0/bin:/usr/local/cuda/bin:/usr/local/bin:$PATH
 export CUDA_HOME=${{CUDA_HOME:-/usr/local/cuda-13.0}}
 export HF_TOKEN={hf}
@@ -449,7 +474,16 @@ def push_eval_polaris(host, port):
             tar_data = arch.stdout
             source = "origin/main"
             extract_root = REMOTE_REPO
-    if tar_data is None:
+        else:
+            # Do NOT fall back to the local working tree here — that tree can hold unreviewed,
+            # uncommitted edits, and silently attesting with it on a mere network/git hiccup would
+            # defeat the whole point of push_eval_polaris (never trust unreviewed code for
+            # attestation). Fail closed instead; set SPARKINFER_USE_LOCAL_POLARIS=1 to explicitly
+            # opt into the local tree for pre-merge testing.
+            print(">> WARN: origin/main eval/polaris fetch failed — refusing to fall back to the "
+                  "local working tree for a real run — attestation unavailable this run")
+            return False
+    else:
         polaris_dir = os.path.join(HERE, "polaris")
         if os.path.isdir(polaris_dir):
             tar = subprocess.run(["tar", "-C", HERE, "-czf", "-", "polaris"],
@@ -578,6 +612,19 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
         return {"attestation": attestation}
 
 
+def _crash_reason(*outputs: str) -> str | None:
+    """Pull the ERR-trap diagnostic line (line/exit-code/signal + GPU mem snapshot) out of remote
+    script output, so a REJECT from an infra crash carries a real cause instead of just a bare
+    truncated log tail the reader has to decode themselves."""
+    combined = "\n".join(o or "" for o in outputs)
+    lines = combined.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("REMOTE_SCRIPT_FAILED "):
+            extra = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            return line.strip() + (f" | gpu: {extra}" if extra else "")
+    return None
+
+
 def eval_dflash_on_box(host, port, pr_ref: str):
     """Run PR accuracy+bench then main bench with same prompt ids. Returns result dict."""
     print(f">> DFlash eval on box: PR ref={pr_ref}")
@@ -585,7 +632,9 @@ def eval_dflash_on_box(host, port, pr_ref: str):
                                            n_tokens=BENCH_TOKENS))
     if r.returncode != 0:
         tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
-        return {"ok": False, "reason": "PR accuracy/bench failed", "log": tail}
+        crash = _crash_reason(r.stdout, r.stderr)
+        reason = "PR accuracy/bench failed" + (f" — {crash}" if crash else " (no crash diagnostic captured)")
+        return {"ok": False, "reason": reason, "log": tail}
     pr = _parse_remote(r.stdout or "")
     if "dflash_tps" not in pr:
         return {"ok": False, "reason": "PR bench missing DFLASH_TPS", "log": (r.stdout or "")[-1500:]}
@@ -595,7 +644,9 @@ def eval_dflash_on_box(host, port, pr_ref: str):
                                             n_tokens=BENCH_TOKENS))
     if r2.returncode != 0:
         tail = ((r2.stdout or "") + "\n" + (r2.stderr or ""))[-2000:]
-        return {"ok": False, "reason": "main bench failed", "log": tail, "pr": pr}
+        crash = _crash_reason(r2.stdout, r2.stderr)
+        reason = "main bench failed" + (f" — {crash}" if crash else " (no crash diagnostic captured)")
+        return {"ok": False, "reason": reason, "log": tail, "pr": pr}
     main = _parse_remote(r2.stdout or "")
     if "dflash_tps" not in main:
         return {"ok": False, "reason": "main bench missing DFLASH_TPS", "log": (r2.stdout or "")[-1500:],
