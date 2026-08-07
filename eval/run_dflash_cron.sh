@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Cron wrapper for the sparkinfer DFlash PR eval bot — offset from AR bot:
+# Cron wrapper for the sparkinfer DFlash PR eval bot:
 #
-#   0 1-23/2 * * * /home/autotiny/Desktop/sparkinfer/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1
-#   (odd hours :00 — 01:00, 03:00, …; AR bot stays on even hours)
+#   0 * * * * /home/autotiny/Desktop/sparkinfer/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1
+#   (every hour, on the hour)
 #
 # Policy (same as AR bot):
 #   • Pinned vast.ai GPU only; never rent / never start from cron when down.
 #   • Shares /tmp/sparkinfer_bot.lock with run_bot_cron.sh and the sparkinfer-web dashboard-sync
 #     crons (no overlap). The dashboard sync runs every 15 min (*/15 * * * *), which lands on
-#     this cron's own :00 slot every single tick (odd hours :00) — a bare `flock -n` would race
-#     that fast, low-stakes sync job and could lose the entire 2-hour eval window if it happened
-#     to grab the lock first. Wait a bounded amount instead: long enough to outlast a quick
-#     dashboard git-sync, short enough to still bail if something is genuinely stuck.
+#     this cron's own :00 slot every single tick — a bare `flock -n` would race that fast,
+#     low-stakes sync job and could lose an entire eval window if it happened to grab the lock
+#     first. Wait a bounded amount instead: long enough to outlast a quick dashboard git-sync,
+#     short enough to still bail if something is genuinely stuck.
 #   • GPU up → full dflash eval + auto-merge; GPU down → --labels-only.
 export HOME="${HOME:-/home/autotiny}"
 export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"

@@ -200,9 +200,9 @@ eval/setup_labels.sh                                  # creates eval-dflash:* + 
 ./eval/run_dflash_bot.sh --only-prs 636 --reeval       # force one PR
 ```
 
-**Schedule every 2 hours on odd hours** (01:00, 03:00, …; shares `/tmp/sparkinfer_bot.lock` with the AR bot):
+**Schedule every hour, on the hour** (shares `/tmp/sparkinfer_bot.lock` with the AR bot):
 ```bash
-crontab -l 2>/dev/null; echo "0 1-23/2 * * * $PWD/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1" | crontab -
+crontab -l 2>/dev/null; echo "0 * * * * $PWD/eval/run_dflash_cron.sh >> /tmp/sparkinfer_dflash_bot.log 2>&1" | crontab -
 ```
 Pinned GPU only; never rents. If the pin is down → `--labels-only` reconcile.
 
