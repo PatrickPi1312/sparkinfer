@@ -1007,6 +1007,14 @@ def main():
             if not args.dry_run:
                 arb.add_label(args.repo, num, DFLASH_NEEDS_REBASE)
             continue
+        if DFLASH_NEEDS_REBASE in labs and not args.dry_run:
+            # Mergeable now (rebase resolved) but the label from a previous conflict never got
+            # cleared here — reconcile_dflash_merge_labels() unconditionally excludes anything
+            # carrying this label from winner selection, and its own removal only fires on the
+            # already-chosen winner, so a stale label could never be cleared and permanently
+            # locked the PR out of merge-first/auto-merge even after a clean re-eval (#684).
+            print(f"PR #{num}: mergeable again — clearing stale dflash-needs-rebase")
+            arb.remove_label(args.repo, num, DFLASH_NEEDS_REBASE)
 
         if not only:
             status, why = arb.greenlight_status(args.repo, num, labs)
