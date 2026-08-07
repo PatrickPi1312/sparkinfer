@@ -6,7 +6,12 @@
 #
 # Policy (same as AR bot):
 #   • Pinned vast.ai GPU only; never rent / never start from cron when down.
-#   • Shares /tmp/sparkinfer_bot.lock with run_bot_cron.sh (no overlap).
+#   • Shares /tmp/sparkinfer_bot.lock with run_bot_cron.sh and the sparkinfer-web dashboard-sync
+#     crons (no overlap). The dashboard sync runs every 15 min (*/15 * * * *), which lands on
+#     this cron's own :00 slot every single tick (odd hours :00) — a bare `flock -n` would race
+#     that fast, low-stakes sync job and could lose the entire 2-hour eval window if it happened
+#     to grab the lock first. Wait a bounded amount instead: long enough to outlast a quick
+#     dashboard git-sync, short enough to still bail if something is genuinely stuck.
 #   • GPU up → full dflash eval + auto-merge; GPU down → --labels-only.
 export HOME="${HOME:-/home/autotiny}"
 export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"
@@ -16,7 +21,7 @@ export SPARKINFER_AUTOMERGE_ADMIN="${SPARKINFER_AUTOMERGE_ADMIN:-1}"
 export VAST_NO_AUTO_PROVISION=1
 
 exec 9>/tmp/sparkinfer_bot.lock
-flock -n 9 || { echo "[$(date -u +%FT%TZ)] previous bot run still active — skipping dflash tick"; exit 0; }
+flock -w 120 9 || { echo "[$(date -u +%FT%TZ)] lock held 120s+ — previous bot run still active, skipping dflash tick"; exit 0; }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR" || exit 1
