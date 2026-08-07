@@ -306,6 +306,13 @@ test -x build/runtime/qwen3_gguf_bench
 
 if [ "$DO_ACC" = "1" ]; then
   export MODELS_DIR
+  # dflash_accuracy.sh's ensure_tokenizer needs TOK_REPO for the *target* model (Qwen3.6) —
+  # without it, _common.sh's TOK_REPO default ("Qwen/Qwen3-30B-A3B") silently wins, so
+  # gen_eval_prompt.py tokenizes the scored prompt with the wrong (smaller) vocabulary. The
+  # mismatch is invisible downstream: Qwen3.6's vocab is larger, so every resulting id is
+  # still "valid", just semantically meaningless. That corrupted PROMPT_IDS stream is what
+  # both the accuracy check AND the speed bench below score against.
+  export TOK_REPO="$Q36_GUARD_TOK_REPO"
   bash bench/scripts/dflash_accuracy.sh "$GGUF" "$DRAFT" | tee /tmp/dflash_check_out.txt
   grep -q "^VERDICT PASS" /tmp/dflash_check_out.txt
   if [ -z "${{PROMPT_IDS:-}}" ] && [ -f /tmp/dflash_eval_ids.txt ]; then
