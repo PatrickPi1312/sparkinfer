@@ -263,6 +263,23 @@ trap 'rc=$?; ln=$LINENO; reason=""; \\
   esac; \\
   echo "REMOTE_SCRIPT_FAILED line=$ln exit=$rc reason=$reason" >&2; \\
   nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader >&2 2>/dev/null || true' ERR
+# One run does 4 back-to-back multi-GB model load/unload cycles (PR/main DFlash bench + Qwen3.6
+# guard + Qwen3.5 guard) with no gap between them. Observed live (#684, #690): starting the next
+# heavy load before the previous process's VRAM is actually reclaimed by the driver appears to be
+# what silently kills the *whole* remote script (not just the loading binary) around a reload
+# boundary — invisible to the ERR trap above, since a hard kill of the interpreter itself never
+# reaches trap handling. Poll down to a near-empty GPU before each heavy load instead of assuming
+# the previous process's exit already means its memory is free.
+wait_gpu_clear() {{
+  local tries=0 used
+  while [ "$tries" -lt 30 ]; do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    [ -n "$used" ] && [ "$used" -lt 1024 ] 2>/dev/null && return 0
+    sleep 1
+    tries=$((tries + 1))
+  done
+  echo "WARN: GPU memory still ${{used:-unknown}} MiB after ${{tries}}s wait — proceeding anyway" >&2
+}}
 export PATH=/usr/local/cuda-13.0/bin:/usr/local/cuda/bin:/usr/local/bin:$PATH
 export CUDA_HOME=${{CUDA_HOME:-/usr/local/cuda-13.0}}
 export HF_TOKEN={hf}
@@ -329,6 +346,7 @@ else
   echo "PROMPT_IDS $PROMPT_IDS"
 fi
 
+wait_gpu_clear
 OUT=$(build/runtime/qwen3_gguf_dflash_bench "$GGUF" "$DRAFT" "$NTOK" $PROMPT_IDS | tee /tmp/dflash_bench_out.txt)
 echo "$OUT"
 AR=$(echo "$OUT" | grep '^METRIC AR_TPS' | awk '{{print $3}}' | tail -1)
@@ -361,6 +379,7 @@ export MODEL_SHA256="${{QWEN36_MODEL_SHA256:-}}"
 Q36_GGUF="$Q36_GUARD_MODELS_DIR/$Q36_GUARD_MODEL_FILE"
 
 echo "GUARD_START"
+wait_gpu_clear
 if bench_sweep_run "$Q36_GGUF" 128 0 1 512 1 4096 1 16384 1 32768 1; then
   for ctx in 0 512 4096 16384 32768; do
     echo "GUARD36 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
@@ -368,6 +387,7 @@ if bench_sweep_run "$Q36_GGUF" 128 0 1 512 1 4096 1 16384 1 32768 1; then
 else
   echo "GUARD36_FAILED"
 fi
+wait_gpu_clear
 if bench_sweep_run "$Q35_GGUF" 128 0 1 4096 1 32768 1 65536 1 131072 1; then
   for ctx in 0 4096 32768 65536 131072; do
     echo "GUARD35 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
@@ -632,27 +652,55 @@ def _crash_reason(*outputs: str) -> str | None:
     return None
 
 
+def _looks_like_hard_kill(stdout: str, stderr: str) -> bool:
+    """True when a failed run has neither the ERR-trap diagnostic NOR a graceful
+    GUARD36_FAILED/GUARD35_FAILED marker — i.e. the whole remote bash process was killed outright
+    (OOM/session drop around a heavy model-reload boundary, per #684/#690) rather than a single
+    step failing in a way the script could catch and report on its own. A command that's the
+    condition of an `if` (like the guard sweeps) never trips the ERR trap even on an ordinary
+    failure, so seeing neither signal means something killed the interpreter itself."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    if _crash_reason(stdout, stderr):
+        return False
+    if "GUARD36_FAILED" in combined or "GUARD35_FAILED" in combined:
+        return False
+    return True
+
+
+def _ssh_run_resilient(host, port, script: str, label: str):
+    """ssh_run() with one automatic retry when the failure looks like a hard kill rather than a
+    graceful, self-reported failure — cheap insurance against the exact silent-kill pattern that
+    cost #684 and #690 a full eval slot each, since a hard kill gives no actionable diagnostic to
+    act on anyway and a retry is the only way to tell transient from reproducible."""
+    r = ssh_run(host, port, script)
+    if r.returncode != 0 and _looks_like_hard_kill(r.stdout, r.stderr):
+        print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, no graceful "
+              f"GUARD*_FAILED marker) — retrying once")
+        r = ssh_run(host, port, script)
+    return r
+
+
 def eval_dflash_on_box(host, port, pr_ref: str):
     """Run PR accuracy+bench then main bench with same prompt ids. Returns result dict."""
     print(f">> DFlash eval on box: PR ref={pr_ref}")
-    r = ssh_run(host, port, _remote_script(pr_ref, do_accuracy=True, prompt_ids=None,
-                                           n_tokens=BENCH_TOKENS))
+    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, do_accuracy=True, prompt_ids=None,
+                                                       n_tokens=BENCH_TOKENS), "PR run")
     if r.returncode != 0:
         tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
         crash = _crash_reason(r.stdout, r.stderr)
-        reason = "PR accuracy/bench failed" + (f" — {crash}" if crash else " (no crash diagnostic captured)")
+        reason = "PR accuracy/bench failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
         return {"ok": False, "reason": reason, "log": tail}
     pr = _parse_remote(r.stdout or "")
     if "dflash_tps" not in pr:
         return {"ok": False, "reason": "PR bench missing DFLASH_TPS", "log": (r.stdout or "")[-1500:]}
     ids = pr.get("prompt_ids") or ""
     print(f">> PR DFlash={pr['dflash_tps']:.2f} AR={pr.get('ar_tps', 0):.2f} — measuring main …")
-    r2 = ssh_run(host, port, _remote_script("main", do_accuracy=False, prompt_ids=ids,
-                                            n_tokens=BENCH_TOKENS))
+    r2 = _ssh_run_resilient(host, port, _remote_script("main", do_accuracy=False, prompt_ids=ids,
+                                                        n_tokens=BENCH_TOKENS), "main run")
     if r2.returncode != 0:
         tail = ((r2.stdout or "") + "\n" + (r2.stderr or ""))[-2000:]
         crash = _crash_reason(r2.stdout, r2.stderr)
-        reason = "main bench failed" + (f" — {crash}" if crash else " (no crash diagnostic captured)")
+        reason = "main bench failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
         return {"ok": False, "reason": reason, "log": tail, "pr": pr}
     main = _parse_remote(r2.stdout or "")
     if "dflash_tps" not in main:
