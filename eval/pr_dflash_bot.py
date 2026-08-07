@@ -231,7 +231,8 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None):
     )
 
 
-def _remote_script(ref: str, do_accuracy: bool, prompt_ids: str | None, n_tokens: int) -> str:
+def _remote_script(ref: str, do_accuracy: bool, prompt_ids: str | None, n_tokens: int,
+                    prompt_ids_ctx: dict | None = None) -> str:
     """Bash run on the eval box: checkout ref, build, optional accuracy, bench."""
     gguf = shlex.quote(DEFAULT_GGUF)
     draft = shlex.quote(DEFAULT_DRAFT)
@@ -242,6 +243,9 @@ def _remote_script(ref: str, do_accuracy: bool, prompt_ids: str | None, n_tokens
     ids_export = ""
     if prompt_ids:
         ids_export = f"PROMPT_IDS={shlex.quote(prompt_ids)}\n"
+    for ctx, ids in (prompt_ids_ctx or {}).items():
+        if ids:
+            ids_export += f"PROMPT_IDS_{ctx}={shlex.quote(ids)}\n"
     acc = "1" if do_accuracy else "0"
     q36_file = shlex.quote(Q36_GUARD_MODEL_FILE)
     q36_dir = shlex.quote(Q36_GUARD_MODELS_DIR)
@@ -364,8 +368,37 @@ echo "RESULT_AR_TPS $AR"
 echo "RESULT_DFLASH_TPS $DF"
 echo "RESULT_MEAN_ACCEPT $TAU"
 
-# --- Qwen3.5 / Qwen3.6 no-regression guard (decode + prefill, same build as above) ---
+# --- DFlash speed at additional context sizes (512, 4k) — baseline/informational data only for
+# now, not part of the pass/fail gate. Same held-out-prompt discipline as the primary bench above:
+# the PR run generates+caches a fresh held-out prompt per size, the main run reuses the identical
+# ids (passed in via env, below) so PR vs main compares the same prompt, not two independent draws.
 source bench/scripts/_common.sh
+export MODELS_DIR
+export TOK_REPO="$Q36_GUARD_TOK_REPO"
+ensure_tokenizer || echo "WARN: extra-context tokenizer setup failed" >&2
+for ctx in 512 4096; do
+  idsfile="/tmp/dflash_eval_ids_${{ctx}}.txt"
+  case "$ctx" in
+    512) ids="${{PROMPT_IDS_512:-}}" ;;
+    4096) ids="${{PROMPT_IDS_4096:-}}" ;;
+  esac
+  if [ -z "$ids" ] && [ -f "$idsfile" ]; then
+    ids="$(cat "$idsfile")"
+  fi
+  if [ -z "$ids" ]; then
+    ids="$(python3 bench/scripts/gen_eval_prompt.py "${{SPARKINFER_EVAL_SEED:-fixed}}" "$MODELS_DIR/tokenizer.json" bench/scripts/eval_corpus.txt --len "$ctx")"
+    echo "$ids" > "$idsfile"
+  fi
+  wait_gpu_clear
+  CTXOUT=$(build/runtime/qwen3_gguf_dflash_bench "$GGUF" "$DRAFT" "$NTOK" $ids)
+  CAR=$(echo "$CTXOUT" | grep '^METRIC AR_TPS' | awk '{{print $3}}' | tail -1)
+  CDF=$(echo "$CTXOUT" | grep '^METRIC DFLASH_TPS' | awk '{{print $3}}' | tail -1)
+  CTAU=$(echo "$CTXOUT" | grep '^METRIC MEAN_ACCEPT' | awk '{{print $3}}' | tail -1)
+  echo "DFLASH_CTX $ctx ${{CDF:-0}} ${{CAR:-0}} ${{CTAU:-0}}"
+  echo "PROMPT_IDS_$ctx $ids"
+done
+
+# --- Qwen3.5 / Qwen3.6 no-regression guard (decode + prefill, same build as above) ---
 source bench/scripts/_eval_speed.sh
 # Pin QWYTHOS_MODELS_DIR before sourcing _qwythos.sh: its own default derives from the ambient
 # $MODELS_DIR, which the DFlash steps above already repointed at /workspace/models36 — falling
@@ -410,6 +443,7 @@ echo "GUARD_END"
 def _parse_remote(stdout: str) -> dict:
     out = {}
     guard36, guard35 = {}, {}
+    dflash_ctx, prompt_ids_ctx = {}, {}
     for line in (stdout or "").splitlines():
         if line.startswith("RESULT_AR_TPS "):
             out["ar_tps"] = float(line.split()[1])
@@ -419,6 +453,21 @@ def _parse_remote(stdout: str) -> dict:
             out["mean_accept"] = float(line.split()[1])
         elif line.startswith("PROMPT_IDS "):
             out["prompt_ids"] = line[len("PROMPT_IDS "):].strip()
+        elif line.startswith("DFLASH_CTX "):
+            parts = line.split()
+            if len(parts) >= 5:
+                try:
+                    dflash_ctx[int(parts[1])] = {
+                        "dflash_tps": float(parts[2]), "ar_tps": float(parts[3]),
+                        "mean_accept": float(parts[4]),
+                    }
+                except ValueError:
+                    pass
+        elif line.startswith("PROMPT_IDS_"):
+            rest = line[len("PROMPT_IDS_"):]
+            ctx_str, _, ids_str = rest.partition(" ")
+            if ctx_str.isdigit():
+                prompt_ids_ctx[int(ctx_str)] = ids_str.strip()
         elif line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
         elif line.startswith("METRIC SPEC_AGREE"):
@@ -443,6 +492,8 @@ def _parse_remote(stdout: str) -> dict:
             out["guard35_failed"] = True
     out["guard36"] = guard36
     out["guard35"] = guard35
+    out["dflash_ctx"] = dflash_ctx
+    out["prompt_ids_ctx"] = prompt_ids_ctx
     return out
 
 
@@ -702,9 +753,11 @@ def eval_dflash_on_box(host, port, pr_ref: str):
     if "dflash_tps" not in pr:
         return {"ok": False, "reason": "PR bench missing DFLASH_TPS", "log": (r.stdout or "")[-1500:]}
     ids = pr.get("prompt_ids") or ""
+    ctx_ids = pr.get("prompt_ids_ctx") or {}
     print(f">> PR DFlash={pr['dflash_tps']:.2f} AR={pr.get('ar_tps', 0):.2f} — measuring main …")
     r2 = _ssh_run_resilient(host, port, _remote_script("main", do_accuracy=False, prompt_ids=ids,
-                                                        n_tokens=BENCH_TOKENS), "main run")
+                                                        n_tokens=BENCH_TOKENS,
+                                                        prompt_ids_ctx=ctx_ids), "main run")
     if r2.returncode != 0:
         tail = ((r2.stdout or "") + "\n" + (r2.stderr or ""))[-2000:]
         crash = _crash_reason(r2.stdout, r2.stderr)
@@ -742,6 +795,22 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         "guard36": pr.get("guard36"),
         "guard35": pr.get("guard35"),
     }
+    # DFlash speed at additional context sizes — baseline/informational only, not part of the
+    # pass/fail gate (see #703). Same prompt on both sides (threaded via ctx_ids above), so any
+    # difference reflects the code, not a different random draw.
+    dflash_ctx = {}
+    pr_ctx, main_ctx = pr.get("dflash_ctx") or {}, main.get("dflash_ctx") or {}
+    for ctx in sorted(set(pr_ctx) | set(main_ctx)):
+        p, m = pr_ctx.get(ctx), main_ctx.get(ctx)
+        if not p or not m:
+            continue
+        dp, dm = p.get("dflash_tps", 0), m.get("dflash_tps", 0)
+        dflash_ctx[ctx] = {
+            "pr_dflash_tps": dp, "main_dflash_tps": dm,
+            "pr_ar_tps": p.get("ar_tps"), "main_ar_tps": m.get("ar_tps"),
+            "delta_pct": round(100.0 * (dp - dm) / dm, 1) if dm else None,
+        }
+    res["dflash_ctx"] = dflash_ctx
     polaris = collect_polaris_attestation(host, port, res, pr_ref)
     if polaris:
         res["polaris"] = polaris
@@ -788,6 +857,17 @@ def format_comment(commit: str, res: dict) -> str:
         polaris_row = "| Polaris receipt | collected, not signed (no key configured) |\n"
     else:
         polaris_row = ""
+    ctx_rows = ""
+    dctx = res.get("dflash_ctx") or {}
+    for ctx in sorted(dctx):
+        e = dctx[ctx]
+        clabel = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        dp, dm, delta = e.get("pr_dflash_tps"), e.get("main_dflash_tps"), e.get("delta_pct")
+        dtxt = f"{delta:+.1f}%" if delta is not None else "n/a"
+        ctx_rows += (
+            f"| DFlash @{clabel} tok/s *(baseline, informational)* | "
+            f"PR {dp:.2f} vs main {dm:.2f} ({dtxt}) |\n"
+        )
     return (
         f"{marker}\n## sparkinfer dflash auto-eval — `eval-dflash:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
@@ -800,6 +880,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"| mean accept τ | {res.get('mean_accept') or 0:.3f} |\n"
         f"| accuracy | {res.get('spec_agree') or 'VERDICT PASS'} |\n"
         f"{guard_row}"
+        f"{ctx_rows}"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
         f"{res.get('reason') or ''}\n\n"
@@ -937,6 +1018,7 @@ def upload_dflash_eval_log(repo, num, title, oid, res):
             "speedup_vs_main": res.get("speedup_vs_main"), "speedup_vs_ar": res.get("speedup_vs_ar"),
             "mean_accept": res.get("mean_accept"), "spec_agree": res.get("spec_agree"),
             "guard_ok": res.get("guard_ok"), "guard_problems": res.get("guard_problems"),
+            "dflash_ctx": res.get("dflash_ctx"),
             "gpu": "RTX 5090 (sm_120)", "date": arb.datetime.date.today().isoformat(),
         }
         if receipt:
