@@ -427,6 +427,20 @@ for ctx in 512 4096; do
   CTAU=$(echo "$CTXOUT" | grep '^METRIC MEAN_ACCEPT' | awk '{{print $3}}' | tail -1)
   echo "DFLASH_CTX $ctx ${{CDF:-0}} ${{CAR:-0}} ${{CTAU:-0}}"
   echo "PROMPT_IDS_$ctx $ids"
+  # Speed alone at a context isn't proof of correctness — DFlash is a lossless speculative
+  # accelerator, so it should exactly reproduce greedy AR at every context, same bar as the short
+  # prompt. Checked only on the PR side (DO_ACC=1): main's own correctness at these contexts isn't
+  # in question here, only whether the PR regresses it. #707 proved this matters — it fixed a
+  # crash at 512 that a speed-only check could never have caught, and separately looked fast at 4k
+  # while actually diverging from AR (0.0625 SPEC_AGREE) — a corruption-driven speedup that a
+  # speed-only regression check would have happily accepted.
+  if [ "$DO_ACC" = "1" ]; then
+    wait_gpu_clear
+    CHKOUT=$(build/runtime/qwen3_gguf_dflash_check "$GGUF" "$DRAFT" "${{SPARKINFER_DFLASH_CHECK_NEW:-32}}" $ids)
+    CRATIO=$(echo "$CHKOUT" | grep '^METRIC SPEC_AGREE' | tail -1 | awk '{{print $NF}}')
+    CVERDICT=$(echo "$CHKOUT" | grep '^VERDICT' | tail -1 | awk '{{print $2}}')
+    echo "DFLASH_CTX_ACC $ctx ${{CRATIO:-0}} ${{CVERDICT:-FAIL}}"
+  fi
 done
 
 # --- Qwen3.5 / Qwen3.6 no-regression guard (decode + prefill, same build as above) ---
@@ -474,7 +488,7 @@ echo "GUARD_END"
 def _parse_remote(stdout: str) -> dict:
     out = {}
     guard36, guard35 = {}, {}
-    dflash_ctx, prompt_ids_ctx = {}, {}
+    dflash_ctx, dflash_ctx_acc, prompt_ids_ctx = {}, {}, {}
     for line in (stdout or "").splitlines():
         if line.startswith("RESULT_AR_TPS "):
             out["ar_tps"] = float(line.split()[1])
@@ -492,6 +506,13 @@ def _parse_remote(stdout: str) -> dict:
                         "dflash_tps": float(parts[2]), "ar_tps": float(parts[3]),
                         "mean_accept": float(parts[4]),
                     }
+                except ValueError:
+                    pass
+        elif line.startswith("DFLASH_CTX_ACC "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    dflash_ctx_acc[int(parts[1])] = {"spec_agree": float(parts[2]), "verdict": parts[3]}
                 except ValueError:
                     pass
         elif line.startswith("PROMPT_IDS_"):
@@ -524,6 +545,7 @@ def _parse_remote(stdout: str) -> dict:
     out["guard36"] = guard36
     out["guard35"] = guard35
     out["dflash_ctx"] = dflash_ctx
+    out["dflash_ctx_acc"] = dflash_ctx_acc
     out["prompt_ids_ctx"] = prompt_ids_ctx
     return out
 
@@ -821,6 +843,26 @@ def eval_dflash_on_box(host, port, pr_ref: str):
     # best gain. A PR that wins big at one context and quietly regresses at another must not slip
     # through on its best number alone.
     label, delta_pct, passed, reason, best_ctx = score_dflash_multi_ctx(dflash_ctx)
+
+    # Speed alone at a context is not proof of correctness — DFlash is a lossless speculative
+    # accelerator, so it must exactly reproduce greedy AR (SPEC_AGREE VERDICT PASS) at every
+    # measured context, same bar the short prompt already enforces. #707 proved why this matters:
+    # it fixed a crash at 512-ctx that a speed-only check could never catch, and separately looked
+    # faster at 4k while actually diverging from AR — a corruption-driven "speedup" that
+    # score_dflash_multi_ctx alone would have happily accepted. Checked on the PR side only
+    # (main's own correctness there isn't in question, only whether the PR breaks it).
+    acc_problems = []
+    for ctx, e in sorted((pr.get("dflash_ctx_acc") or {}).items()):
+        clabel = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        if e.get("verdict") != "PASS":
+            acc_problems.append(
+                f"DFlash@{clabel}: SPEC_AGREE={e.get('spec_agree', 0):.4f} VERDICT={e.get('verdict', '?')}"
+            )
+    if acc_problems:
+        label = "REJECT"
+        passed = False
+        reason = "DFlash accuracy failed at: " + "; ".join(acc_problems)
+
     guard_ok, guard_problems = check_qwen_guard(pr, main)
     if not guard_ok:
         # DFlash-only scoring is only valid alongside a clean Qwen3.5/3.6 guard — a regression
@@ -828,6 +870,9 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         label = "REJECT"
         passed = False
         reason = "qwen3.5/qwen3.6 no-regression guard failed: " + "; ".join(guard_problems[:6])
+        if acc_problems:
+            reason = ("DFlash accuracy failed at: " + "; ".join(acc_problems) +
+                       " | also: " + reason)
 
     # Headline PR/main tok/s reflect whichever context the label was actually scored at; REJECT
     # has no winning context, so fall back to the primary/short one (0) for display purposes.
@@ -853,6 +898,7 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         "guard36": pr.get("guard36"),
         "guard35": pr.get("guard35"),
         "dflash_ctx": dflash_ctx,
+        "dflash_ctx_acc": pr.get("dflash_ctx_acc"),
     }
     polaris = collect_polaris_attestation(host, port, res, pr_ref)
     if polaris:
@@ -901,6 +947,7 @@ def format_comment(commit: str, res: dict) -> str:
     else:
         polaris_row = ""
     scored_ctx = res.get("scored_ctx")
+    dctx_acc = res.get("dflash_ctx_acc") or {}
     ctx_rows = ""
     dctx = res.get("dflash_ctx") or {}
     for ctx in sorted(dctx):
@@ -910,6 +957,10 @@ def format_comment(commit: str, res: dict) -> str:
         dtxt = f"{delta:+.1f}%" if delta is not None else "n/a"
         star = " ⭐ *(scored)*" if scored_ctx is not None and clabel == scored_ctx else ""
         ctx_rows += f"| DFlash @{clabel} tok/s{star} | PR {dp:.2f} vs main {dm:.2f} ({dtxt}) |\n"
+        acc = dctx_acc.get(ctx)
+        if acc:
+            atxt = "✅ PASS" if acc.get("verdict") == "PASS" else f"❌ **{acc.get('verdict', 'FAIL')}**"
+            ctx_rows += f"| &nbsp;&nbsp;↳ accuracy | {atxt} (SPEC_AGREE={acc.get('spec_agree', 0):.4f}) |\n"
     return (
         f"{marker}\n## sparkinfer dflash auto-eval — `eval-dflash:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
