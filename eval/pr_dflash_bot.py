@@ -147,6 +147,47 @@ def tier_from_gain(pr_tps: float, main_tps: float):
     return "none", pct, True, "ok"
 
 
+def score_dflash_multi_ctx(dflash_ctx: dict):
+    """Score DFlash across every measured context size (128/512/4k) instead of just the short
+    prompt: reject if ANY context regresses beyond REGRESS_TOL — or is missing/zero where main has
+    a real baseline, same fail-closed discipline as check_qwen_guard — otherwise tier from
+    whichever context shows the BEST gain. A PR that wins big at one context and regresses at
+    another must not slip through on its best number alone.
+
+    Returns (label, delta_pct, passed, reason, ctx). ctx is the winning context on success, the
+    worst-regressing context on a regression REJECT, or None only in the degenerate case where no
+    context has any comparable measurement at all — delta_pct is always a real number otherwise,
+    never None, so callers never need to special-case it."""
+    problems = []
+    worst_ctx, worst_pct = None, None
+    candidates = {}  # ctx -> (pr_tps, main_tps)
+    for ctx, e in sorted(dflash_ctx.items()):
+        clabel = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        main_tps = e.get("main_dflash_tps") or 0
+        pr_tps = e.get("pr_dflash_tps") or 0
+        if main_tps <= 0:
+            continue  # main itself has no baseline here — not comparable
+        if pr_tps < REGRESS_TOL * main_tps:
+            pct = 100.0 * (pr_tps - main_tps) / main_tps
+            problems.append(
+                f"DFlash@{clabel}: {pr_tps:.2f} < {100 * REGRESS_TOL:.0f}% of main "
+                f"{main_tps:.2f} ({pct:+.1f}%)"
+            )
+            if worst_pct is None or pct < worst_pct:
+                worst_pct, worst_ctx = pct, ctx
+            continue
+        candidates[ctx] = (pr_tps, main_tps)
+    if problems:
+        return "REJECT", round(worst_pct, 1), False, "DFlash regression at: " + "; ".join(problems), worst_ctx
+    if not candidates:
+        return "REJECT", 0.0, False, "no comparable DFlash context measurements", None
+    best_ctx = max(candidates, key=lambda c: candidates[c][0] / candidates[c][1])
+    pr_tps, main_tps = candidates[best_ctx]
+    label, delta_pct, passed, reason = tier_from_gain(pr_tps, main_tps)
+    clabel = GUARD_CTX_LABEL.get(best_ctx, str(best_ctx))
+    return label, delta_pct, passed, f"{reason} (best at {clabel} context)", best_ctx
+
+
 def dflash_evaluated_commits(repo, num):
     """Head commits that already have a REAL scoring verdict posted — infra/transport failures
     (label:null in the marker's meta JSON) don't count, so a commit that hit a flaky SSH/CUDA/box
@@ -757,7 +798,29 @@ def eval_dflash_on_box(host, port, pr_ref: str):
     if "dflash_tps" not in main:
         return {"ok": False, "reason": "main bench missing DFLASH_TPS", "log": (r2.stdout or "")[-1500:],
                 "pr": pr}
-    label, delta_pct, passed, reason = tier_from_gain(pr["dflash_tps"], main["dflash_tps"])
+    # Fold the primary/short bench into the SAME per-context structure under ctx=0 (matches
+    # GUARD_CTX_LABEL's own "0 -> 128" convention), then iterate MAIN's contexts as the fail-closed
+    # base — same discipline as check_qwen_guard: a PR that crashes partway through its own 512/4k
+    # sweep must not silently drop that context from scoring instead of failing it.
+    main_ctx_raw = {0: {"dflash_tps": main["dflash_tps"], "ar_tps": main.get("ar_tps")},
+                     **(main.get("dflash_ctx") or {})}
+    pr_ctx_raw = {0: {"dflash_tps": pr["dflash_tps"], "ar_tps": pr.get("ar_tps")},
+                  **(pr.get("dflash_ctx") or {})}
+    dflash_ctx = {}
+    for ctx, m in main_ctx_raw.items():
+        p = pr_ctx_raw.get(ctx) or {}
+        dp, dm = p.get("dflash_tps") or 0, m.get("dflash_tps") or 0
+        dflash_ctx[ctx] = {
+            "pr_dflash_tps": dp, "main_dflash_tps": dm,
+            "pr_ar_tps": p.get("ar_tps"), "main_ar_tps": m.get("ar_tps"),
+            "delta_pct": round(100.0 * (dp - dm) / dm, 1) if dm else None,
+        }
+
+    # Score across ALL measured contexts (128/512/4k), not just the short prompt — regression at
+    # ANY of them rejects the whole PR; otherwise the tier comes from whichever context shows the
+    # best gain. A PR that wins big at one context and quietly regresses at another must not slip
+    # through on its best number alone.
+    label, delta_pct, passed, reason, best_ctx = score_dflash_multi_ctx(dflash_ctx)
     guard_ok, guard_problems = check_qwen_guard(pr, main)
     if not guard_ok:
         # DFlash-only scoring is only valid alongside a clean Qwen3.5/3.6 guard — a regression
@@ -765,42 +828,32 @@ def eval_dflash_on_box(host, port, pr_ref: str):
         label = "REJECT"
         passed = False
         reason = "qwen3.5/qwen3.6 no-regression guard failed: " + "; ".join(guard_problems[:6])
+
+    # Headline PR/main tok/s reflect whichever context the label was actually scored at; REJECT
+    # has no winning context, so fall back to the primary/short one (0) for display purposes.
+    h = dflash_ctx[best_ctx] if best_ctx is not None else dflash_ctx[0]
     res = {
         "ok": True,
         "label": label,
         "pass": passed and label != "REJECT",
         "reason": reason,
         "delta_pct": delta_pct,
-        "pr_dflash_tps": pr["dflash_tps"],
-        "pr_ar_tps": pr.get("ar_tps"),
-        "main_dflash_tps": main["dflash_tps"],
-        "main_ar_tps": main.get("ar_tps"),
+        "pr_dflash_tps": h["pr_dflash_tps"],
+        "pr_ar_tps": h.get("pr_ar_tps"),
+        "main_dflash_tps": h["main_dflash_tps"],
+        "main_ar_tps": h.get("main_ar_tps"),
+        "scored_ctx": GUARD_CTX_LABEL.get(best_ctx, str(best_ctx)) if best_ctx is not None else None,
         "mean_accept": pr.get("mean_accept"),
         "spec_agree": pr.get("spec_agree"),
         "prompt_ids": ids,
-        "speedup_vs_main": round(pr["dflash_tps"] / main["dflash_tps"], 3) if main["dflash_tps"] else 0,
-        "speedup_vs_ar": round(pr["dflash_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
+        "speedup_vs_main": round(h["pr_dflash_tps"] / h["main_dflash_tps"], 3) if h.get("main_dflash_tps") else 0,
+        "speedup_vs_ar": round(h["pr_dflash_tps"] / h["pr_ar_tps"], 3) if h.get("pr_ar_tps") else 0,
         "guard_ok": guard_ok,
         "guard_problems": guard_problems,
         "guard36": pr.get("guard36"),
         "guard35": pr.get("guard35"),
+        "dflash_ctx": dflash_ctx,
     }
-    # DFlash speed at additional context sizes — baseline/informational only, not part of the
-    # pass/fail gate (see #703). Same prompt on both sides (threaded via ctx_ids above), so any
-    # difference reflects the code, not a different random draw.
-    dflash_ctx = {}
-    pr_ctx, main_ctx = pr.get("dflash_ctx") or {}, main.get("dflash_ctx") or {}
-    for ctx in sorted(set(pr_ctx) | set(main_ctx)):
-        p, m = pr_ctx.get(ctx), main_ctx.get(ctx)
-        if not p or not m:
-            continue
-        dp, dm = p.get("dflash_tps", 0), m.get("dflash_tps", 0)
-        dflash_ctx[ctx] = {
-            "pr_dflash_tps": dp, "main_dflash_tps": dm,
-            "pr_ar_tps": p.get("ar_tps"), "main_ar_tps": m.get("ar_tps"),
-            "delta_pct": round(100.0 * (dp - dm) / dm, 1) if dm else None,
-        }
-    res["dflash_ctx"] = dflash_ctx
     polaris = collect_polaris_attestation(host, port, res, pr_ref)
     if polaris:
         res["polaris"] = polaris
@@ -847,6 +900,7 @@ def format_comment(commit: str, res: dict) -> str:
         polaris_row = "| Polaris receipt | collected, not signed (no key configured) |\n"
     else:
         polaris_row = ""
+    scored_ctx = res.get("scored_ctx")
     ctx_rows = ""
     dctx = res.get("dflash_ctx") or {}
     for ctx in sorted(dctx):
@@ -854,14 +908,13 @@ def format_comment(commit: str, res: dict) -> str:
         clabel = GUARD_CTX_LABEL.get(ctx, str(ctx))
         dp, dm, delta = e.get("pr_dflash_tps"), e.get("main_dflash_tps"), e.get("delta_pct")
         dtxt = f"{delta:+.1f}%" if delta is not None else "n/a"
-        ctx_rows += (
-            f"| DFlash @{clabel} tok/s *(baseline, informational)* | "
-            f"PR {dp:.2f} vs main {dm:.2f} ({dtxt}) |\n"
-        )
+        star = " ⭐ *(scored)*" if scored_ctx is not None and clabel == scored_ctx else ""
+        ctx_rows += f"| DFlash @{clabel} tok/s{star} | PR {dp:.2f} vs main {dm:.2f} ({dtxt}) |\n"
     return (
         f"{marker}\n## sparkinfer dflash auto-eval — `eval-dflash:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-dflash:{lab}` |\n"
+        f"| scored at context | {scored_ctx or 'n/a'} (best of 128/512/4k; regression at ANY rejects) |\n"
         f"| PR DFlash tok/s | {res['pr_dflash_tps']:.2f} |\n"
         f"| main DFlash tok/s | {res['main_dflash_tps']:.2f} |\n"
         f"| speedup vs main | **{res['speedup_vs_main']:.2f}×** ({res['delta_pct']:+.1f}%) |\n"
@@ -1008,7 +1061,7 @@ def upload_dflash_eval_log(repo, num, title, oid, res):
             "speedup_vs_main": res.get("speedup_vs_main"), "speedup_vs_ar": res.get("speedup_vs_ar"),
             "mean_accept": res.get("mean_accept"), "spec_agree": res.get("spec_agree"),
             "guard_ok": res.get("guard_ok"), "guard_problems": res.get("guard_problems"),
-            "dflash_ctx": res.get("dflash_ctx"),
+            "dflash_ctx": res.get("dflash_ctx"), "scored_ctx": res.get("scored_ctx"),
             "gpu": "RTX 5090 (sm_120)", "date": arb.datetime.date.today().isoformat(),
         }
         if receipt:
