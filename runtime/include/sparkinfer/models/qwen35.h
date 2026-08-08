@@ -205,6 +205,10 @@ private:
     // Returns argmax seed at end-1 for decode, or -1 on failure.
     int ingest_prompt_range(const int* ids, int start, int end);
     void dflash_maybe_capture_layer(int layer);
+    // Depth-adaptive KV-split count for a given seqlen (32/128/160/256 tiers, GQA-8/hd256
+    // occupancy correction). Shared by forward_token()'s normal per-token adaptation and
+    // dflash_generate()'s one-time pre-capture initialization (see qwen35.cpp).
+    int adaptive_nsplits_for(int seqlen) const;
 
     struct Impl;
     Impl* p_;

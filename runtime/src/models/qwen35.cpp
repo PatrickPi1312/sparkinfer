@@ -466,6 +466,34 @@ void Qwen35Model::dflash_maybe_capture_layer(int layer) {
                                        s.dflash_n_cap * H, s.dflash_max_rows, s.stream);
 }
 
+// Depth-adaptive KV-split count for a given seqlen: 32 (short) -> 128 (mid) -> 256 (long), plus
+// the hd256/GQA occupancy correction. Extracted so both forward_token()'s per-token adaptation
+// and dflash_generate()'s one-time pre-capture initialization compute the exact same value —
+// see forward_token() below for why dflash_generate needs its own call to this.
+int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
+    const Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    int want = 32;
+    if ((long)seqlen > 2L * s.split_chunk) want = 128;
+    if ((long)seqlen > 28L * s.split_chunk && (long)seqlen <= 48L * s.split_chunk)
+        want = Impl::MAX_NSPLITS;
+    if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+    if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
+    // hd256/GQA-8 occupancy correction (Qwen3.6 full-attention shape specifically) — see the
+    // #707-era measurement notes this replaces for the exact tuning rationale (flat 160 through
+    // 32k for GQA-8; GQA-4 promotes further at 64k/128k).
+    if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
+        if (c.n_q_heads == c.n_kv_heads * 8)
+            want = 160;
+        else if (c.n_q_heads == c.n_kv_heads * 4) {
+            if ((long)seqlen > 98304L)           want = 128;  // 128k decode (seqlen ~131k)
+            else if ((long)seqlen > 65536L)      want = 192;  // 64k decode band
+            else                                 want = 160;
+        }
+    }
+    return want;
+}
+
 int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
@@ -481,45 +509,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     s.h_scalars[4] = s.dflash_cap_row;
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 5 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
-    // Depth-adaptive KV-split: 32 (short) -> 128 (mid) -> 256 (long). The 8k-12k band
-    // (28*split_chunk < seqlen <= 48*split_chunk) is roofline-bound on 128 splits; promote
-    // to MAX_NSPLITS there only. Past 16k keep the original 64* knee. Math unchanged.
+    // Depth-adaptive KV-split (see adaptive_nsplits_for() above for the tiers/occupancy math).
     // DFlash decode: freeze n_splits while capturing. Adapting it mid-generation (e.g. the
     // 32->160 jump at seqlen>2*split_chunk ~= 512) invalidates + re-captures the separate dflash
     // verify graph mid-stream, which corrupts the compact-verify state and makes DFlash emit a
     // spurious token 0 then repeat (SPEC fails at ctx crossing the boundary; 508-512 etc.). The
     // eval prompt (~128 ctx) never crosses the threshold, so this is free there. Non-dflash decode
-    // keeps adapting.
+    // keeps adapting. dflash_generate() makes its own one-time call to adaptive_nsplits_for()
+    // right before capture begins so this freeze locks in the value correct for the actual
+    // context depth, instead of whatever n_splits happened to be set to beforehand (this block
+    // never runs at all once dflash_capture is set, for the entire generation).
     if (s.adaptive_splits && !s.dflash_capture) {
-        int want = 32;
-        if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 28L * s.split_chunk && (long)seqlen <= 48L * s.split_chunk)
-            want = Impl::MAX_NSPLITS;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
-        if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
-        // hd256/GQA-8 occupancy correction (Qwen3.6 full-attention shape specifically): the
-        // generic 128/256 thresholds above were tuned around the split kernel's assumed
-        // occupancy, but fa_split_gqa_mma_i8_kernel<HEAD_DIM,GQA> is a single template shared
-        // by hd128 and hd256 under the SAME __launch_bounds__(GQA*32, 5) hint — hd256's smem
-        // footprint is ~1.9x hd128's (i8_smem ~33KB vs ~17KB for GQA=8), so its REAL achieved
-        // occupancy is lower than the 5 blocks/SM the generic policy assumes, meaning the split
-        // grid is systematically over-subscribed at this shape. Empirically re-measured (RTX
-        // 5090, same-box A/B, 4k/8k/16k/32k): a flat 160 beats both the 128 and 256 tiers at
-        // every measured point (+2.8% @16k, +4.9% @32k, +3.2% @8k, tied @4k), confirmed
-        // byte-safe (online-softmax combine is exact for any split count; verified top-1=100%,
-        // KL~equal to baseline vs a real llama.cpp reference at 120 sampled 8k-32k positions).
-        // GQA-8 (Qwen3.6): flat 160 through 32k (4k–32k A/B on RTX 5090).
-        // GQA-4 (Qwythos): same through 32k; promote splits at 64k/128k so per-split MMA
-        // chunks do not outgrow occupancy (64k: 192, 128k: 128 — same-box sweeps).
-        if (c.head_dim == 256 && c.n_kv_heads > 0 && want >= 128) {
-            if (c.n_q_heads == c.n_kv_heads * 8)
-                want = 160;
-            else if (c.n_q_heads == c.n_kv_heads * 4) {
-                if ((long)seqlen > 98304L)           want = 128;  // 128k decode (seqlen ~131k)
-                else if ((long)seqlen > 65536L)      want = 192;  // 64k decode band
-                else                                 want = 160;
-            }
-        }
+        const int want = adaptive_nsplits_for(seqlen);
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
@@ -1848,6 +1849,19 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
                              s.cfg.vocab, s.cfg.hidden);
     set_dflash_capture(true, dc.target_layer_ids, B);
+    // forward_token()'s adaptive-split block never runs once dflash_capture is set (see there) —
+    // n_splits would otherwise stay frozen at whatever it was left at before this call, which for
+    // every real dflash_generate() invocation is just the struct's compile-time default (32),
+    // regardless of the actual prompt length. That's only coincidentally correct for short
+    // contexts; verified broken (SPEC_AGREE far below PASS) at 512 and 4096 tokens before this
+    // fix. Initialize it correctly for THIS context now, once, before any capture happens.
+    if (s.adaptive_splits) {
+        const int want = adaptive_nsplits_for((int)prompt.size());
+        if (want != s.n_splits) {
+            s.n_splits = want;
+            invalidate_decode_graph();
+        }
+    }
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
     clear_prefix_cache();
