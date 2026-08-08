@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """sparkinfer DFlash PR auto-evaluator.
 
-Sibling of pr_eval_bot.py for PRs that touch the DFlash speculative-decode path.
+Sibling of pr_eval_bot.py — evaluates any PR whose description claims a real DFlash speedup
+(the same "Tested on RTX 5090" + before/after checklist greenlight_status() already parses),
+regardless of which files it touches.
 Scores same-box PR DFlash tok/s vs origin/main DFlash tok/s, applies eval-dflash:*
 tiers, picks dflash-merge-first, and optionally auto-merges (SPARKINFER_AUTOMERGE=1).
 
@@ -51,7 +53,6 @@ MARKER_RE = re.compile(
     r"<!-- sparkinfer-dflash-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
 )
-DFLASH_PATH_RE = re.compile(r"(?:^|/)(?:dflash|qwen3_gguf_dflash_|dflash_accuracy\.sh)", re.I)
 
 DEFAULT_GGUF = os.environ.get(
     "DFLASH_GGUF", "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
@@ -144,17 +145,6 @@ def tier_from_gain(pr_tps: float, main_tps: float):
         if g >= thr:
             return name, pct, True, "ok"
     return "none", pct, True, "ok"
-
-
-def is_dflash_pr(repo, num) -> bool:
-    files = json.loads(
-        arb.gh(["pr", "view", str(num), "-R", repo, "--json", "files"]).stdout or "{}"
-    ).get("files", [])
-    for f in files:
-        path = f.get("path") or ""
-        if DFLASH_PATH_RE.search(path):
-            return True
-    return False
 
 
 def dflash_evaluated_commits(repo, num):
@@ -1105,9 +1095,7 @@ def main():
     ap.add_argument("--labels-only", action="store_true",
                     help="reconcile dflash-merge-first only — no GPU")
     ap.add_argument("--only-prs", default="",
-                    help="comma-separated PR numbers (bypass greenlight; still require dflash paths unless forced)")
-    ap.add_argument("--force-prs", action="store_true",
-                    help="with --only-prs, evaluate even if paths do not match dflash filter")
+                    help="comma-separated PR numbers (bypass greenlight)")
     args = ap.parse_args()
 
     only = {int(x) for x in args.only_prs.split(",") if x.strip().isdigit()}
@@ -1139,15 +1127,6 @@ def main():
         if arb.HOLD_LABEL in labs:
             print(f"PR #{num}: hold — skip")
             continue
-        if not only or not args.force_prs:
-            if not is_dflash_pr(args.repo, num):
-                if only:
-                    print(f"PR #{num}: not a dflash-path PR — skip (use --force-prs)")
-                continue
-        else:
-            if not is_dflash_pr(args.repo, num):
-                print(f"PR #{num}: force — evaluating despite non-dflash paths")
-
         head = (pr.get("headRefOid") or "")[:40]
         short = head[:9]
         if not args.reeval and head and head in dflash_evaluated_commits(args.repo, num):
