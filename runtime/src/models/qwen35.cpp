@@ -510,16 +510,22 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 5 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
     // Depth-adaptive KV-split (see adaptive_nsplits_for() above for the tiers/occupancy math).
-    // DFlash decode: freeze n_splits while capturing. Adapting it mid-generation (e.g. the
-    // 32->160 jump at seqlen>2*split_chunk ~= 512) invalidates + re-captures the separate dflash
-    // verify graph mid-stream, which corrupts the compact-verify state and makes DFlash emit a
-    // spurious token 0 then repeat (SPEC fails at ctx crossing the boundary; 508-512 etc.). The
-    // eval prompt (~128 ctx) never crosses the threshold, so this is free there. Non-dflash decode
-    // keeps adapting. dflash_generate() makes its own one-time call to adaptive_nsplits_for()
-    // right before capture begins so this freeze locks in the value correct for the actual
-    // context depth, instead of whatever n_splits happened to be set to beforehand (this block
-    // never runs at all once dflash_capture is set, for the entire generation).
-    if (s.adaptive_splits && !s.dflash_capture) {
+    // DFlash DECODE: freeze n_splits once an actual dflash verify graph is captured. Adapting it
+    // while that graph is live (e.g. the 32->160 jump at seqlen>2*split_chunk ~= 512) invalidates
+    // + re-captures it mid-stream, corrupting the compact-verify state (spurious token 0, then
+    // repeat). Gating on dflash_capture alone (rather than dflash_capture && dflash_graph_ready)
+    // was wrong: dflash_capture is set true before prefill even starts, so that blanket guard also
+    // froze n_splits during PREFILL, where sample=false never captures any graph at all and there
+    // is nothing to protect. Prefill then ran every position (short depths included) at whatever
+    // single value happened to be inherited from framework state predating this call, instead of
+    // ramping 32->128->160 with depth the way the reference (AR / pre-freeze) path does — a small
+    // per-split floating-point rounding difference in the quantized-KV reduction that compounds
+    // over thousands of positions into hidden states the draft model no longer agrees with
+    // (verified: SPEC_AGREE collapses at 4k-ctx even though the final prefill logits/argmax token
+    // are unaffected — only DFlash's own stashed hidden-state capture diverges). Gating on
+    // dflash_graph_ready specifically lets prefill keep adapting exactly like the non-DFlash path,
+    // and only starts freezing once there is a live graph that a change would actually corrupt.
+    if (s.adaptive_splits && !(s.dflash_capture && s.dflash_graph_ready)) {
         const int want = adaptive_nsplits_for(seqlen);
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
@@ -1262,6 +1268,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         s.dflash_graph_ready = true;
         s.dflash_graph_attn_mode = attn_graph_mode;
         s.dflash_graph_sparse = sparse_on;
+        {
+            static int dbg = -1;
+            if (dbg < 0) { const char* e = getenv("SPARKINFER_GRAPH_DEBUG"); dbg = (e && e[0]=='1') ? 1 : 0; }
+            if (dbg) {
+                const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
+                fprintf(stderr, "[dflash-graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
+                        position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
+            }
+        }
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
     } else if (capturing_graph) {
         cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
@@ -1849,19 +1864,6 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
                              s.cfg.vocab, s.cfg.hidden);
     set_dflash_capture(true, dc.target_layer_ids, B);
-    // forward_token()'s adaptive-split block never runs once dflash_capture is set (see there) —
-    // n_splits would otherwise stay frozen at whatever it was left at before this call, which for
-    // every real dflash_generate() invocation is just the struct's compile-time default (32),
-    // regardless of the actual prompt length. That's only coincidentally correct for short
-    // contexts; verified broken (SPEC_AGREE far below PASS) at 512 and 4096 tokens before this
-    // fix. Initialize it correctly for THIS context now, once, before any capture happens.
-    if (s.adaptive_splits) {
-        const int want = adaptive_nsplits_for((int)prompt.size());
-        if (want != s.n_splits) {
-            s.n_splits = want;
-            invalidate_decode_graph();
-        }
-    }
 
     const int budget = session_token_budget(prompt.size(), max_new + B, s.cfg.max_seq);
     clear_prefix_cache();
