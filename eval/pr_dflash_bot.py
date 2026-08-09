@@ -216,7 +216,7 @@ def strip_dflash_eval_labels(repo, num):
             arb.remove_label(repo, num, lab)
 
 
-STALE_DAYS = float(os.environ.get("DFLASH_STALE_DAYS", "2"))
+STALE_DAYS = float(os.environ.get("DFLASH_STALE_DAYS", "1"))
 
 
 def _pr_last_activity_ts(repo, num):
