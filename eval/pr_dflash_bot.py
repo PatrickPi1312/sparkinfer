@@ -216,6 +216,71 @@ def strip_dflash_eval_labels(repo, num):
             arb.remove_label(repo, num, lab)
 
 
+STALE_DAYS = float(os.environ.get("DFLASH_STALE_DAYS", "2"))
+
+
+def _pr_last_activity_ts(repo, num):
+    """Last real author activity (most recent commit's committedDate) for an open PR, NOT the
+    PR's own updatedAt -- that field bumps on every bot comment/label change, which would make a
+    PR sitting untouched by its author look "fresh" forever just from our own eval cycle poking
+    it. Falls back to createdAt if commits are somehow unavailable. One gh call per PR (not
+    folded into the bulk `pr list` in main() because requesting commits.authors across ~80 PRs at
+    once blows GitHub's GraphQL node-count limit)."""
+    r = arb.gh(["pr", "view", str(num), "-R", repo, "--json", "commits,createdAt"])
+    try:
+        info = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    dates = [c.get("committedDate") for c in (info.get("commits") or []) if c.get("committedDate")]
+    ts_str = max(dates) if dates else info.get("createdAt")
+    if not ts_str:
+        return None
+    try:
+        return time.mktime(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def close_stale_dflash_prs(repo, prs, dry_run=False):
+    """Close open PRs with no author commit activity in STALE_DAYS+ days -- keeps the dflash
+    eval queue from silently accumulating abandoned PRs that just sit round after round in
+    needs-rebase / RTX-5090-box-unchecked / missing-real-numbers limbo. HOLD_LABEL and the
+    current dflash-merge-first winner are exempt (explicit human/bot decision to keep them open
+    regardless of author activity). Returns the set of PR numbers actually closed, so callers can
+    exclude them from the same round's eval loop."""
+    closed = set()
+    now = time.time()
+    cutoff = STALE_DAYS * 86400
+    for pr in prs:
+        num = pr["number"]
+        if pr.get("isDraft"):
+            continue
+        labs = {l["name"] for l in pr.get("labels", [])}
+        if arb.HOLD_LABEL in labs or DFLASH_MERGE_FIRST in labs:
+            continue
+        ts = _pr_last_activity_ts(repo, num)
+        if ts is None:
+            continue
+        age_days = (now - ts) / 86400
+        if age_days < STALE_DAYS:
+            continue
+        print(f"PR #{num}: stale ({age_days:.1f}d since last commit, threshold {STALE_DAYS}d) — closing")
+        closed.add(num)
+        if dry_run:
+            continue
+        body = (
+            "<!-- sparkinfer-dflash-auto-close-stale -->\n"
+            f"## Closed: stale — no commits in {age_days:.1f} days\n\n"
+            f"This PR has had no new commits in over {STALE_DAYS:g} days — closing automatically "
+            "to keep the dflash eval queue clean. Reopen (or push a new commit / open a fresh "
+            "PR) whenever you're ready to continue; it'll be picked back up on the next eval "
+            "cycle."
+        )
+        arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+        arb.gh(["pr", "close", str(num), "-R", repo])
+    return closed
+
+
 def resolve_ssh(instance_id: int):
     """Return (host, port) for the pinned box."""
     if ssh_box_enabled():
@@ -1246,9 +1311,13 @@ def main():
     ]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
 
+    stale_closed = close_stale_dflash_prs(args.repo, prs, dry_run=args.dry_run) if not only else set()
+
     pending = []
     for pr in prs:
         num = pr["number"]
+        if num in stale_closed:
+            continue
         if only and num not in only:
             continue
         if pr.get("isDraft"):
