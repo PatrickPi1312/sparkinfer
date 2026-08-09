@@ -95,7 +95,7 @@
     "original": 403,
     "date": "2026-07-15",
     "blocked": true,
-    "containment": 0.90
+    "containment": 0.9
   },
   {
     "pr": 298,
@@ -103,6 +103,16 @@
     "original": 121,
     "date": "2026-07-09",
     "blocked": true,
-    "note": "real-time copycat guard; ≥85% vs #121. Block persisted 2026-07-16."
+    "note": "real-time copycat guard; \u226585% vs #121. Block persisted 2026-07-16."
+  },
+  {
+    "pr": 746,
+    "author": "JSONbored",
+    "original": 727,
+    "date": "2026-08-09",
+    "blocked": false,
+    "strike": 1,
+    "containment": null,
+    "note": "manual idea-level flag (not automated diff-containment gate)"
   }
 ]
