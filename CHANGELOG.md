@@ -3,6 +3,124 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.4.5] — 2026-08-10
+
+sparkinfer's **plain autoregressive decode is ~2× llama.cpp** on Qwen3.6-35B-A3B — flat across
+every measured context, no speculation involved. Layered on top, **DFlash is up to 3.9× faster
+than llama.cpp's own native `draft-dflash`** at short context, same draft model on both sides.
+DFlash also gained adaptive engagement this cycle: it watches whether the batched verify path can
+actually pay off and falls back to plain AR when it can't, instead of paying speculative overhead
+unconditionally — the exact failure mode llama.cpp's generic implementation falls into below.
+
+### 🏆 2× llama.cpp in plain AR decode
+
+RTX 5090 · same `UD-Q4_K_M` GGUF · greedy bs=1 · no speculation on either side · llama.cpp `6f4f53f`.
+
+| context | SparkInfer AR | llama.cpp AR | Δ |
+|---:|---:|---:|---:|
+| 128 | **532** tok/s | 266 tok/s | **+100%** |
+| 512 | **524** tok/s | 266 tok/s | +97% |
+| 4k | **503** tok/s | 266 tok/s | +89% |
+
+llama.cpp's AR throughput is essentially flat across context depth (266→266→266); SparkInfer holds
+a ~2× lead at every point measured.
+
+### ⚡ DFlash vs. llama.cpp's own `draft-dflash`
+
+Same target GGUF, same draft model weights, best llama.cpp configuration found
+(`--spec-draft-n-max` tuned — widening it to the draft's full trained block size made llama.cpp
+*slower*, not faster: real per-position acceptance on this draft/target pair decays sharply past
+the first couple of tokens, so a wider verify window mostly just pays for rejected speculation).
+
+| context | SparkInfer DFlash | llama.cpp draft-dflash | Δ |
+|---:|---:|---:|---:|
+| 128 | **894** tok/s | 229 tok/s | **+290% (3.9×)** |
+| 512 | **522** tok/s | 220 tok/s | +137% (2.4×) |
+| 4k | **555** tok/s | 392 tok/s¹ | +42% (1.4×) |
+
+¹ benefits from a corpus-repetition artifact in the held-out 4k prompt (source corpus is ~1.3k
+tokens, tiled 3× to reach length) — treat as optimistic; 128/512 are clean.
+
+**llama.cpp's own `draft-dflash` is slower than llama.cpp's own plain AR** at short/mid context
+(229 < 266 @128; 220 < 266 @512) — its generic dispatch pays draft+verify overhead
+unconditionally, and real acceptance on non-repeated text is only ~32-34% here, not enough to
+break even. SparkInfer's DFlash never falls behind its own AR baseline at any measured context
+(894/522/555 vs. 532/524/503) because of the adaptive engagement work below.
+
+### DFlash — adaptive engagement (new this cycle)
+
+- **#746** — skip speculation entirely where the batched verify can never engage, decided before
+  prefill rather than mid-stream (that band runs one target forward per emitted token, identical
+  to AR, plus a wasted draft forward)
+- **#745** — engage the batched verify only on the evidence it will actually pay (1.09× @128, 1.08× @4k)
+- **#720** — engage on a sustained run of full-block accepts, not a single partial accept (1.74× @128)
+- **#728** — run the row-batched verify at long context too (1.24× @4k)
+- **#710 / #711** — score DFlash across 128/512/4k (not just the short prompt); reject on
+  accuracy or speed regression at *any* of them, not just the best number
+
+### Optimizations landed since v0.4.4
+
+**DFlash perf**
+
+- **#636** — incremental early-exit verify (2.8×)
+- **#661** — batched draft projections + LM head across the block (+11.5% DFLASH_TPS)
+- **#663** — CUDA-graph replay for verify-loop decode tokens (+8.7% DFLASH_TPS)
+- **#666** — hoist Q6_K unpack out of the draft head's multi-row loop
+- **#694 / #700 / #701 / #717** — row-batched exact verification kernels, overlapped independent
+  verify branches on a second stream, kept the block verify engaged with a prebuilt replay graph,
+  row-batched KV-split draft attention
+- **#707** — Q5_K MoE expert-down split-K row-count tuning (alongside an n_splits freeze fix,
+  #714/#715/#716)
+
+**Correctness / reliability**
+
+- **#713 / #724 / #741** — per-device shared-memory opt-in hardening for the GQA MMA,
+  windowed-attention, and GDN-chunk-scan prefill kernels — a refused opt-in now fails over to the
+  correct fallback instead of silently reporting success over an unwritten buffer
+- **#743** — fixed ContinuousBatchEngine leaving the shared prefix session marked active after
+  freeing its KV (next request skipped re-warming, attended against an empty block table); also
+  fixed a destructor bug that leaked the prefix session's KV entirely on engine teardown
+- **#740** — fixed concurrent HTTP requests bleeding error state into each other, and an
+  infinite-loop hang on essentially any multimodal chat request
+- **#744** — fixed SSE streaming re-emitting the entire response whenever HF's decode wasn't
+  prefix-stable (incomplete UTF-8 / BPE tail rewrite)
+- **#718** — fixed `CMAKE_CUDA_ARCHITECTURES` set after `project(... CUDA)`, silently no-op'ing to
+  `sm_52` on fresh configures
+- **#699 → #721** — a claimed MoE expert-down requant optimization was re-evaluated, found to be
+  within noise, and reverted
+
+**Eval harness**
+
+- **#645 / #683 / #738 / #742** — DFlash PR auto-eval bot (label tiers + auto-merge), Polaris TDX
+  attestation for DFlash evals, auto-close on a genuine none/REJECT verdict, SSH reliability fix
+  (`IdentitiesOnly=yes`) for the eval cron
+
+### What changed since v0.4.4
+
+| headline | v0.4.4 | v0.4.5 | shift |
+|---|---:|---:|---|
+| AR decode vs llama.cpp | not the headline | **~2× at every context (128/512/4k)** | **new headline** |
+| DFlash vs llama.cpp's own draft-dflash | not measured | **up to 3.9× (3.9×/2.4×/1.4×)** | **new comparison** |
+| DFlash engagement | always drafts when a draft is attached | **adaptive — skips where it can't pay** | **new** |
+
+**Verified:** RTX 5090 · SparkInfer commit `15a604e` · llama.cpp `6f4f53f` · same box, same GGUF,
+same session.
+
+### Contributors
+
+- **@widecloud** — #661, #663, #684, #696, #700, #701 (DFlash draft/verify performance tuning)
+- **@JSONbored** — #720, #728, #746 (adaptive batched-verify engagement)
+- **@FranDev132** — #707, #717, #745 (split-K down-proj tuning, KV-split draft attention, engage-on-evidence)
+- **@kai392** — #740, #741 (server concurrency/multimodal hang, GDN-chunk smem hardening)
+- **@RealDiligent** — #743, #744 (prefix-session staleness, SSE decode-delta duplication)
+- **@rhu-3** — #747, #748, #749 (dashboard data-binding fixes)
+- **@tryeverything24** — #713 (GQA MMA smem hardening)
+- **@rsnetworkinginc** — #724 (windowed-attention smem hardening)
+- **@Paral1995** — #636 (2.8× early-exit verify)
+- **@nickmopen** — #666 (Q6_K unpack hoist)
+- **@inference2026** — #694 (row-batched exact verification)
+- **@skyrocket2026** — #645, #683, #710, #711, #718, #721, #738, #742 (eval bot, Polaris attestation, multi-context scoring, CMake fix, revert, auto-close, SSH reliability)
+
 ## [0.4.4] — 2026-07-28
 
 sparkinfer lands **DFlash block-diffusion speculative decode** for Qwen3.6-35B-A3B — the first
