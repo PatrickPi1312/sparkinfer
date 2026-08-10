@@ -329,11 +329,17 @@ def resolve_ssh(instance_id: int):
     return ip, port
 
 
-def ssh_run(host, port, cmd, timeout=7200, stdin_data=None):
+def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
+    """via_stdin=True feeds `cmd` to a remote `bash -s` over the SSH channel's stdin instead of
+    passing it as an argv element. The multi-context DFlash sweep embeds full prompt-id lists
+    (32768 token ids at the 32k context alone is ~200KB of decimal text) directly in the script
+    text; passed as a normal command-line argument that exceeds Linux's MAX_ARG_STRLEN (128KB per
+    argv element) and execve() fails with 'Argument list too long' before ssh ever connects."""
     key = os.environ.get("SSH_KEY", os.path.expanduser("~/.ssh/speedy"))
     # vast.ai images run as root; a bare-metal SSH box (EVAL_TRANSPORT=ssh) may have a
     # non-root default account instead — EVAL_SSH_USER overrides (defaults to root).
     user = ssh_box_user() if ssh_box_enabled() else "root"
+    remote = ["bash", "-s"] if via_stdin else [cmd]
     return subprocess.run(
         [
             "ssh", "-i", key,
@@ -348,9 +354,10 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None):
             "-o", "BatchMode=yes",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=40",
-            "-p", str(port), f"{user}@{host}", cmd,
+            "-p", str(port), f"{user}@{host}", *remote,
         ],
-        capture_output=True, text=True, timeout=timeout, input=stdin_data,
+        capture_output=True, text=True, timeout=timeout,
+        input=cmd if via_stdin else stdin_data,
     )
 
 
@@ -880,11 +887,11 @@ def _ssh_run_resilient(host, port, script: str, label: str):
     graceful, self-reported failure — cheap insurance against the exact silent-kill pattern that
     cost #684 and #690 a full eval slot each, since a hard kill gives no actionable diagnostic to
     act on anyway and a retry is the only way to tell transient from reproducible."""
-    r = ssh_run(host, port, script)
+    r = ssh_run(host, port, script, via_stdin=True)
     if r.returncode != 0 and _looks_like_hard_kill(r.stdout, r.stderr):
         print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, no graceful "
               f"GUARD*_FAILED marker) — retrying once")
-        r = ssh_run(host, port, script)
+        r = ssh_run(host, port, script, via_stdin=True)
     return r
 
 
