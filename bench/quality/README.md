@@ -39,11 +39,12 @@ seed_hand_authored/    the original hand-written seed (offline fallback / refere
 python3 scorers.py                     # 10/10 scorer self-tests
 python3 run_quality.py --backend oracle  # gold/scorer sanity for answer-derivable tasks
 python3 run_quality.py --backend mock    # ~0%  - floor
+python3 run_quality.py --self-test-llama-server  # HTTP backend wiring (stdlib stub)
 
 # 2. score sparkinfer on a GPU box:
 python3 run_quality.py --backend sparkinfer \
     --model /workspace/models/Qwen3-30B-A3B-Q4_K_M.gguf \
-    --bin ./build/qwen3_gguf_generate \
+    --bin ./build/runtime/qwen3_gguf_generate \
     --tokenizer /workspace/models/tokenizer.json
 
 # 3. score the llama.cpp reference (start llama-server first, then):
