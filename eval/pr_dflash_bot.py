@@ -929,6 +929,16 @@ def eval_dflash_on_box(host, port, pr_ref: str):
     acc_problems = []
     for ctx, e in sorted((pr.get("dflash_ctx_acc") or {}).items()):
         clabel = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        # Skip a context where DFlash structurally couldn't run at all (e.g. beyond the draft
+        # model's configured max_seq — draft.forward_block() bails out and DFLASH_TPS comes back
+        # 0). VERDICT FAIL there reflects "unsupported context", not a correctness regression the
+        # PR introduced, and every future PR would otherwise auto-REJECT the instant a new context
+        # is added to the sweep ahead of the capability existing (16k added while the draft's
+        # max_seq was still 8192 — see CHANGELOG). A corruption-driven fake speedup (#707's bug)
+        # still gets caught: that produces a nonzero, wrong-but-fast DFLASH_TPS, not a zero one.
+        pr_tps = (dflash_ctx.get(ctx) or {}).get("pr_dflash_tps") or 0
+        if pr_tps <= 0:
+            continue
         if e.get("verdict") != "PASS":
             acc_problems.append(
                 f"DFlash@{clabel}: SPEC_AGREE={e.get('spec_agree', 0):.4f} VERDICT={e.get('verdict', '?')}"
