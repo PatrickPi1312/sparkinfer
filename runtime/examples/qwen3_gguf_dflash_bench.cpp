@@ -84,11 +84,15 @@ int main(int argc, char** argv) {
 
     // AR
     setenv("SPARKINFER_DFLASH", "0", 1);
+    double ar_ttft_s = 0, ar_decode_s = 0;
     auto a0 = std::chrono::steady_clock::now();
-    auto ar = model.generate(prompt, n_tokens);
+    auto ar = model.generate(prompt, n_tokens, nullptr, &ar_ttft_s, &ar_decode_s);
     auto a1 = std::chrono::steady_clock::now();
     const double ar_s = std::chrono::duration<double>(a1 - a0).count();
-    const double ar_tps = ar.empty() ? 0.0 : (double)ar.size() / ar_s;
+    // Decode-only rate, matching DFlash's df_tps below -- at long context (e.g. 32k) prefill
+    // dwarfs a 128-token decode, so a wall-clock rate would report the prefill rate, not decode.
+    const double ar_tps = (ar_decode_s > 0 && !ar.empty()) ? (double)ar.size() / ar_decode_s
+                                                            : (ar.empty() ? 0.0 : (double)ar.size() / ar_s);
 
     // DFlash
     setenv("SPARKINFER_DFLASH", "1", 1);
@@ -104,7 +108,8 @@ int main(int argc, char** argv) {
     printf("\n=== sparkinfer DFlash bench ===\n");
     printf("prompt_tokens : %zu\n", prompt.size());
     printf("gen_tokens    : AR=%zu DFlash=%zu\n", ar.size(), df.size());
-    printf("AR            : %.2f tok/s  (wall %.3fs)\n", ar_tps, ar_s);
+    printf("AR            : %.2f tok/s  (decode %.3fs, ttft %.3fs, wall %.3fs)\n",
+           ar_tps, ar_decode_s, ar_ttft_s, ar_s);
     printf("DFlash        : %.2f tok/s  (decode %.3fs, ttft %.3fs, wall %.3fs)\n",
            df_tps, st.decode_s, st.ttft_s, df_wall);
     printf("mean_accept τ : %.3f  (steps=%d)\n", st.mean_accept, st.steps);

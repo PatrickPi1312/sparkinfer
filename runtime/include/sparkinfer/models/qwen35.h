@@ -89,8 +89,12 @@ public:
     // When a prefix cache is installed (cache_prefix), skips re-prefilling the matching prefix.
     // When SPARKINFER_DFLASH=1 and a draft is attached via set_dflash_draft(), uses DFlash
     // block-diffusion speculative decoding (greedy-equivalent to AR when correct).
+    // Optional out_ttft_s/out_decode_s split prefill from decode wall-clock, same convention as
+    // DFlashStats below -- without this, tok/s computed from total wall time collapses toward the
+    // prefill rate at long context (32k prefill dwarfs a 128-token decode), not the decode rate.
     std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens,
-                              ThermalGovernor* gov = nullptr);
+                              ThermalGovernor* gov = nullptr,
+                              double* out_ttft_s = nullptr, double* out_decode_s = nullptr);
 
     // DFlash speculative generate (greedy). Requires set_dflash_draft(). Returns generated ids.
     // Optional stats: mean acceptance length τ and wall-clock seconds for decode (post-TTFT).

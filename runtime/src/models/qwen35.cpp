@@ -1695,7 +1695,8 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
 
 uint64_t Qwen35Model::active_session() const { return p_->active_seq_id; }
 
-std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
+std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov,
+                                       double* out_ttft_s, double* out_decode_s) {
     Impl& s = *p_;
     if (s.dflash_draft) {
         const char* e = getenv("SPARKINFER_DFLASH");
@@ -1733,8 +1734,11 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     // same prompt length freezes at the final tier from the start, so the two sides would use
     // different split counts for the same position and diverge from each other.
     s.final_seqlen_hint = (int)n + max_new;
+    const auto t0 = std::chrono::steady_clock::now();
     int next = (start >= (int)n && reuse) ? s.prefix_next
                                             : ingest_prompt_range(prompt.data(), start, (int)n);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (out_ttft_s) *out_ttft_s = std::chrono::duration<double>(t1 - t0).count();
     if (next < 0 || next >= s.cfg.vocab) {
         if (sid != 0) close_session(sid);
         else {
@@ -1750,6 +1754,7 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         next = forward_token(next, (int)prompt.size() + i, true);
         if (gov) gov->pace();
     }
+    if (out_decode_s) *out_decode_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 
     if (sid != 0) close_session(sid);
     else {
