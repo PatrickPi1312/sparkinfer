@@ -471,19 +471,21 @@ echo "RESULT_AR_TPS $AR"
 echo "RESULT_DFLASH_TPS $DF"
 echo "RESULT_MEAN_ACCEPT $TAU"
 
-# --- DFlash speed at additional context sizes (512, 4k) — baseline/informational data only for
-# now, not part of the pass/fail gate. Same held-out-prompt discipline as the primary bench above:
-# the PR run generates+caches a fresh held-out prompt per size, the main run reuses the identical
-# ids (passed in via env, below) so PR vs main compares the same prompt, not two independent draws.
+# --- DFlash speed at additional context sizes (512, 4k, 16k) — baseline/informational data only
+# for now, not part of the pass/fail gate. Same held-out-prompt discipline as the primary bench
+# above: the PR run generates+caches a fresh held-out prompt per size, the main run reuses the
+# identical ids (passed in via env, below) so PR vs main compares the same prompt, not two
+# independent draws.
 source bench/scripts/_common.sh
 export MODELS_DIR
 export TOK_REPO="$Q36_GUARD_TOK_REPO"
 ensure_tokenizer || echo "WARN: extra-context tokenizer setup failed" >&2
-for ctx in 512 4096; do
+for ctx in 512 4096 16384; do
   idsfile="/tmp/dflash_eval_ids_${{ctx}}.txt"
   case "$ctx" in
     512) ids="${{PROMPT_IDS_512:-}}" ;;
     4096) ids="${{PROMPT_IDS_4096:-}}" ;;
+    16384) ids="${{PROMPT_IDS_16384:-}}" ;;
   esac
   if [ -z "$ids" ] && [ -f "$idsfile" ]; then
     ids="$(cat "$idsfile")"
