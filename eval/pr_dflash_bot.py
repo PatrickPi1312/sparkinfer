@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -148,25 +149,38 @@ def tier_from_gain(pr_tps: float, main_tps: float):
 
 
 def score_dflash_multi_ctx(dflash_ctx: dict):
-    """Score DFlash across every measured context size (128/512/4k) instead of just the short
+    """Score DFlash across every measured context size (128/512/4k/...) instead of just the short
     prompt: reject if ANY context regresses beyond REGRESS_TOL — or is missing/zero where main has
     a real baseline, same fail-closed discipline as check_qwen_guard — otherwise tier from
     whichever context shows the BEST gain. A PR that wins big at one context and regresses at
     another must not slip through on its best number alone.
 
+    A context where main has NO baseline (main_tps<=0 — e.g. beyond a hardcoded capability limit
+    like the draft KV's max_seq) is normally just skipped as "not comparable". But a PR that makes
+    that exact context WORK (pr_tps>0, and — since pr_tps>0 — still subject to the normal accuracy
+    gate downstream) has restored a capability that literally did not exist before, which a bounded
+    percentage can't represent (dividing by a main_tps of 0). That is categorically bigger than any
+    ordinary speedup, not "no comparable measurement" — score it XL with delta_pct=inf so it always
+    wins any merge-first ranking against a percentage-based tier, and so a real regression
+    elsewhere still overrides it (checked first, same as any other candidate).
+
     Returns (label, delta_pct, passed, reason, ctx). ctx is the winning context on success, the
     worst-regressing context on a regression REJECT, or None only in the degenerate case where no
-    context has any comparable measurement at all — delta_pct is always a real number otherwise,
-    never None, so callers never need to special-case it."""
+    context has any comparable measurement at all — delta_pct is always a real number otherwise
+    (including float('inf') for a capability restoration), never None, so callers never need to
+    special-case a missing value, only an infinite one."""
     problems = []
     worst_ctx, worst_pct = None, None
-    candidates = {}  # ctx -> (pr_tps, main_tps)
+    candidates = {}   # ctx -> (pr_tps, main_tps)
+    restored = []     # ctx where main had no baseline (<=0) but the PR produced real output
     for ctx, e in sorted(dflash_ctx.items()):
         clabel = GUARD_CTX_LABEL.get(ctx, str(ctx))
         main_tps = e.get("main_dflash_tps") or 0
         pr_tps = e.get("pr_dflash_tps") or 0
         if main_tps <= 0:
-            continue  # main itself has no baseline here — not comparable
+            if pr_tps > 0:
+                restored.append(ctx)
+            continue  # main itself has no baseline here — not comparable as a percentage
         if pr_tps < REGRESS_TOL * main_tps:
             pct = 100.0 * (pr_tps - main_tps) / main_tps
             problems.append(
@@ -179,6 +193,12 @@ def score_dflash_multi_ctx(dflash_ctx: dict):
         candidates[ctx] = (pr_tps, main_tps)
     if problems:
         return "REJECT", round(worst_pct, 1), False, "DFlash regression at: " + "; ".join(problems), worst_ctx
+    if restored:
+        best_ctx = restored[0]
+        clabel = GUARD_CTX_LABEL.get(best_ctx, str(best_ctx))
+        return ("XL", float("inf"), True,
+                f"DFlash capability restored at {clabel} context (main had no baseline — "
+                f"was non-functional there; PR produces working, accuracy-gated output)", best_ctx)
     if not candidates:
         return "REJECT", 0.0, False, "no comparable DFlash context measurements", None
     best_ctx = max(candidates, key=lambda c: candidates[c][0] / candidates[c][1])
@@ -991,6 +1011,16 @@ def eval_dflash_on_box(host, port, pr_ref: str):
     return res
 
 
+def _format_speedup_row(res: dict) -> str:
+    """delta_pct is float('inf') when score_dflash_multi_ctx found a context main couldn't run at
+    all (no baseline to divide by) that the PR made work — a bounded percentage can't represent
+    that, so render it as what it actually is instead of a nonsensical '+inf%'."""
+    delta_pct = res.get("delta_pct")
+    if delta_pct is not None and math.isinf(delta_pct):
+        return f"**capability restored** — main produced 0 tok/s at `{res.get('scored_ctx')}` context"
+    return f"**{res['speedup_vs_main']:.2f}×** ({delta_pct:+.1f}%)"
+
+
 def format_comment(commit: str, res: dict) -> str:
     meta = {
         "label": res.get("label"),
@@ -1053,7 +1083,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"| scored at context | {scored_ctx or 'n/a'} (best of 128/512/4k; regression at ANY rejects) |\n"
         f"| PR DFlash tok/s | {res['pr_dflash_tps']:.2f} |\n"
         f"| main DFlash tok/s | {res['main_dflash_tps']:.2f} |\n"
-        f"| speedup vs main | **{res['speedup_vs_main']:.2f}×** ({res['delta_pct']:+.1f}%) |\n"
+        f"| speedup vs main | {_format_speedup_row(res)} |\n"
         f"| PR AR tok/s | {res.get('pr_ar_tps') or 0:.2f} |\n"
         f"| DFlash vs AR | {res.get('speedup_vs_ar') or 0:.2f}× |\n"
         f"| mean accept τ | {res.get('mean_accept') or 0:.3f} |\n"
