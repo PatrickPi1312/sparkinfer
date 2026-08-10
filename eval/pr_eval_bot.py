@@ -856,6 +856,44 @@ def areas_for_pr(repo, num):
     files = json.loads(gh(["pr", "view", str(num), "-R", repo, "--json", "files"]).stdout or "{}").get("files", [])
     return {f["path"].split("/", 1)[0] for f in files} & set(AREAS)
 
+def _column_table_best_gain(body, metric):
+    """Fallback for a column-oriented before/after table -- e.g. multi-context PRs write
+    '| context | before | after | |' with one data row per context ('| 32k | 460.1 | 496.8 |
+    1.08x |'), instead of the template's row-oriented 'before'/'after' as the first cell of
+    their own line. Returns (before, after) for whichever data row shows the largest claimed
+    gain, or (None, None) if no such table exists or no row claims an improvement."""
+    lines = body.splitlines()
+    best, best_gain = (None, None), 0.0
+    for i, ln in enumerate(lines):
+        if "|" not in ln:
+            continue
+        cells = [c.strip().lower() for c in ln.strip().strip("|").split("|")]
+        if "before" not in cells or "after" not in cells:
+            continue
+        if metric == "decode" and "prefill" in ln.lower():
+            continue
+        if metric == "prefill" and "prefill" not in ln.lower():
+            continue
+        bi, ai = cells.index("before"), cells.index("after")
+        for row in lines[i + 1:]:
+            row = row.strip()
+            if not row.startswith("|"):
+                break
+            rcells = [c.strip() for c in row.strip("|").split("|")]
+            if len(rcells) <= max(bi, ai) or re.fullmatch(r"[-:\s]*", rcells[bi]):
+                continue
+            bm = re.search(r"[-+]?\d+\.?\d*", rcells[bi])
+            am = re.search(r"[-+]?\d+\.?\d*", rcells[ai])
+            if not (bm and am):
+                continue
+            try:
+                b, a = float(bm.group(0)), float(am.group(0))
+            except ValueError:
+                continue
+            if a > b and (a - b) > best_gain:
+                best_gain, best = (a - b), (b, a)
+    return best
+
 def _table_val(body, key, metric="decode"):
     """Pull a numeric tok/s from a PR template table row '| before… | <n> |'.
 
@@ -874,7 +912,8 @@ def _table_val(body, key, metric="decode"):
             return float(num.group(0)) if num else None
         except ValueError:
             return None
-    return None
+    b, a = _column_table_best_gain(body, metric)
+    return b if key == "before" else a
 
 def _decode_val(body, key):
     """Decode tok/s from the template decode table (not the prefill table)."""
