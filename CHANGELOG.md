@@ -42,7 +42,7 @@ the first couple of tokens, so a wider verify window mostly just pays for reject
 tokens, tiled 3× to reach length) — treat as optimistic; 128/512 are clean.
 
 **llama.cpp's own `draft-dflash` is slower than llama.cpp's own plain AR** at short/mid context
-(229 < 266 @128; 220 < 266 @512) — its generic dispatch pays draft+verify overhead
+(229 < 266 at 128; 220 < 266 at 512) — its generic dispatch pays draft+verify overhead
 unconditionally, and real acceptance on non-repeated text is only ~32-34% here, not enough to
 break even. SparkInfer's DFlash never falls behind its own AR baseline at any measured context
 (894/522/555 vs. 532/524/503) because of the adaptive engagement work below.
@@ -52,9 +52,9 @@ break even. SparkInfer's DFlash never falls behind its own AR baseline at any me
 - **#746** — skip speculation entirely where the batched verify can never engage, decided before
   prefill rather than mid-stream (that band runs one target forward per emitted token, identical
   to AR, plus a wasted draft forward)
-- **#745** — engage the batched verify only on the evidence it will actually pay (1.09× @128, 1.08× @4k)
-- **#720** — engage on a sustained run of full-block accepts, not a single partial accept (1.74× @128)
-- **#728** — run the row-batched verify at long context too (1.24× @4k)
+- **#745** — engage the batched verify only on the evidence it will actually pay (1.09× at 128, 1.08× at 4k)
+- **#720** — engage on a sustained run of full-block accepts, not a single partial accept (1.74× at 128)
+- **#728** — run the row-batched verify at long context too (1.24× at 4k)
 - **#710 / #711** — score DFlash across 128/512/4k (not just the short prompt); reject on
   accuracy or speed regression at *any* of them, not just the best number
 
