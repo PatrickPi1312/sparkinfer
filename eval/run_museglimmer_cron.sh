@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Cron wrapper for the sparkinfer Muse Glimmer PR eval bot:
 #
-#   0 * * * * /home/autotiny/Desktop/sparkinfer/eval/run_museglimmer_cron.sh >> /tmp/sparkinfer_museglimmer_bot.log 2>&1
-#   (NOT installed yet — install manually after a supervised first run; see the bot's own docstring)
+#   30 * * * * /home/autotiny/Desktop/sparkinfer/eval/run_museglimmer_cron.sh >> /tmp/sparkinfer_museglimmer_bot.log 2>&1
+#   Installed 2026-08-11, offset to :30 (not :00, same as the DFlash bot) so the two don't compete
+#   for /tmp/sparkinfer_bot.lock every tick — flock's 120s wait is meant for short overlaps (e.g. a
+#   dashboard sync script), not two multi-minute full GPU eval runs racing each other every hour.
 #
 # Policy (same as the AR + DFlash bots):
 #   • Pinned eval box only; never rent / never start from cron when down.
