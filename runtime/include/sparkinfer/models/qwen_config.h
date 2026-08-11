@@ -22,6 +22,8 @@ struct Qwen35Config {
     float rms_eps     = 1e-6f;
     int   max_seq     = 4096;   // KV-cache cap for a sequence
     int   eos_id      = 151645;
+    int   eos_id2     = -1;     // second stop token (e.g. Muse Glimmer's <|eot|> alongside
+                                 // <|end_of_text|>); -1 = none, checked wherever eos_id is
 
     // Qwen3.5/Qwen3.6 35B-A3B GGUFs use a hybrid stack: 3 Gated DeltaNet
     // recurrent layers followed by 1 full-attention layer. The legacy Qwen3

@@ -399,7 +399,8 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         return true;
     }
 
-    if (job.next_token == cfg.eos_id || job.decode_emitted >= job.req.max_new_tokens) {
+    if (job.next_token == cfg.eos_id || (cfg.eos_id2 >= 0 && job.next_token == cfg.eos_id2) ||
+        job.decode_emitted >= job.req.max_new_tokens) {
         const auto t_end = std::chrono::steady_clock::now();
         job.generation_ms = std::chrono::duration<double, std::milli>(t_end - job.t_submit).count();
         if (job.saw_first_tok && job.generation_ms > job.ttft_ms && job.decode_emitted > 0) {

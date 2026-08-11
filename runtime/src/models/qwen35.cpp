@@ -1833,7 +1833,7 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
     }
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
-        if (next == s.cfg.eos_id) break;
+        if (next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && next == s.cfg.eos_id2)) break;
         next = forward_token(next, (int)prompt.size() + i, true);
         if (gov) gov->pace();
     }

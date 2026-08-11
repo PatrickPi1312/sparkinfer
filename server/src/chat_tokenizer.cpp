@@ -98,6 +98,16 @@ constexpr const char* kImEnd = "<|" "im_end|>";
 constexpr const char* kThinkOpen = "<" "think>";
 constexpr const char* kThinkClose = "</" "think>";
 
+// Muse Glimmer harmony-style segment markers (server/scripts equivalent of Qwen3.6's
+// im_start/im_end/think tags). See tokenizer.chat_template in the model's GGUF for the
+// canonical jinja this mirrors (system/user/assistant/tool rendering, tool calls and
+// per-tool-namespace recipients are not implemented -- request parsing has no `tools` field
+// yet, so those branches of the upstream template are never exercised here).
+constexpr const char* kMgStart = "<|start|>";
+constexpr const char* kMgMessage = "<|message|>";
+constexpr const char* kMgEot = "<|eot|>";
+constexpr const char* kMgEom = "<|eom|>";
+
 size_t marker_prefix_len(const std::string& data, const char* marker) {
     const size_t n = strlen(marker);
     const size_t max = std::min(data.size(), n > 0 ? n - 1 : 0);
@@ -155,6 +165,7 @@ std::string filter_answer_chunk(std::string& carry, const std::string& piece) {
 
 struct ChatTokenizer::Impl {
     std::unique_ptr<tokenizers::Tokenizer> tok;
+    bool museglimmer = false;
 };
 
 ChatTokenizer::ChatTokenizer() : impl_(std::make_unique<Impl>()) {}
@@ -180,6 +191,8 @@ bool ChatTokenizer::load(const std::string& tokenizer_json_path, std::string& er
             tokenizer_json_path.c_str(), impl_->tok->GetVocabSize());
     return true;
 }
+
+void ChatTokenizer::set_museglimmer(bool on) { impl_->museglimmer = on; }
 
 bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessage>& messages, std::string& err) {
     messages.clear();
@@ -303,7 +316,87 @@ std::string apply_qwen36_chat_template(const std::vector<ChatMessage>& messages,
     return parts.str();
 }
 
-ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking) {
+// Matches tokenizer.chat_template in the Muse Glimmer GGUF for the plain (no tools, no
+// tool_calls, no reasoning_content history) case -- the only case reachable today, since
+// ChatMessage/parse_chat_messages carry no tool/reasoning fields. `current_date` is omitted
+// (the upstream template only emits it when a `current_date`/`strftime_now` template var is
+// supplied, which this server doesn't provide); `knowledge_cutoff` uses the template's own
+// literal default.
+std::string apply_museglimmer_chat_template(const std::vector<ChatMessage>& messages,
+                                             const std::string& reasoning_strength) {
+    std::ostringstream parts;
+    bool has_system = false;
+    for (const auto& m : messages)
+        if (m.role == "system") { has_system = true; break; }
+
+    if (!has_system) {
+        parts << kMgStart << "system" << kMgMessage
+              << "You are a helpful AI assistant.\n"
+                 "Knowledge cutoff: 2026-01-04.\n\n"
+                 "Reasoning strength: " << reasoning_strength << ".\n\n"
+                 "# Valid recipients: \"self\", \"user\"." << kMgEot;
+    }
+    for (const auto& m : messages) {
+        std::string role = m.role;
+        for (auto& c : role) c = (char)tolower((unsigned char)c);
+        if (role == "system") {
+            parts << kMgStart << "system" << kMgMessage << m.content
+                  << "\n\nReasoning strength: " << reasoning_strength << ".\n\n"
+                     "# Valid recipients: \"self\", \"user\"." << kMgEot;
+        } else if (role == "user") {
+            parts << kMgStart << "user" << kMgMessage << m.content << kMgEot;
+        } else if (role == "tool") {
+            parts << kMgStart << "tool" << kMgMessage << m.content << kMgEot;
+        } else {  // assistant history: no recipient/tool_calls fields to reconstruct, so this
+                  // always matches the template's plain-content branch with its default
+                  // recipient='user' (which the template always renders explicitly).
+            parts << kMgStart << "assistant to=user" << kMgMessage << m.content << kMgEot;
+        }
+    }
+    parts << kMgStart << "assistant";
+    return parts.str();
+}
+
+// raw is everything generated after the prompt's trailing "<|start|>assistant" (the prompt
+// itself stops there; the model supplies " to=...<|message|>...<|eom|>" / "...<|eot|>" itself,
+// and re-emits its own "<|start|>assistant to=..." header for each subsequent segment of the
+// same turn -- so re-prepending that first header lets one scan handle every segment uniformly.
+ParsedAssistantOutput parse_museglimmer_output(const std::string& raw, bool enable_thinking) {
+    ParsedAssistantOutput out;
+    const std::string text = std::string(kMgStart) + "assistant" + raw;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t start = text.find(kMgStart, pos);
+        if (start == std::string::npos) break;
+        const size_t msg = text.find(kMgMessage, start);
+        if (msg == std::string::npos) break;  // incomplete trailing header -- drop it
+        const size_t header_start = start + strlen(kMgStart);
+        const bool is_self = text.compare(header_start, msg - header_start, "assistant to=self") == 0;
+        const size_t body_start = msg + strlen(kMgMessage);
+        const size_t eom = text.find(kMgEom, body_start);
+        const size_t eot = text.find(kMgEot, body_start);
+        size_t end = std::string::npos;
+        bool hit_eot = false;
+        if (eom != std::string::npos && (eot == std::string::npos || eom < eot)) {
+            end = eom;
+        } else if (eot != std::string::npos) {
+            end = eot;
+            hit_eot = true;
+        }
+        const std::string body = (end == std::string::npos) ? text.substr(body_start)
+                                                              : text.substr(body_start, end - body_start);
+        if (!is_self) out.content += body;
+        else if (enable_thinking) out.reasoning_content += body;  // else: drop reasoning silently
+        if (end == std::string::npos) break;  // truncated mid-segment (hit max_tokens)
+        if (hit_eot) break;                   // end of assistant turn
+        pos = end + strlen(kMgEom);
+    }
+    return out;
+}
+
+ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking, bool museglimmer) {
+    if (museglimmer) return parse_museglimmer_output(raw, enable_thinking);
+
     ParsedAssistantOutput out;
     if (!enable_thinking) {
         out.content = raw;
@@ -333,12 +426,73 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable
     return out;
 }
 
-ThinkingStreamSplitter::ThinkingStreamSplitter(bool enable_thinking) : enable_thinking_(enable_thinking) {
+ThinkingStreamSplitter::ThinkingStreamSplitter(bool enable_thinking, bool museglimmer)
+    : enable_thinking_(enable_thinking), museglimmer_(museglimmer) {
     if (!enable_thinking_) phase_ = Phase::kInAnswer;
 }
 
 ThinkingStreamSplitter::Delta ThinkingStreamSplitter::feed(const std::string& piece) {
     Delta out;
+
+    if (museglimmer_) {
+        if (mg_done_) return out;
+        std::string data = carry_ + piece;
+        carry_.clear();
+        while (!data.empty()) {
+            if (mg_phase_ == MgPhase::kAwaitStart) {
+                const size_t pos = data.find(kMgStart);
+                if (pos == std::string::npos) {
+                    const size_t keep = marker_prefix_len(data, kMgStart);
+                    if (keep > 0) carry_ = data.substr(data.size() - keep);
+                    break;
+                }
+                data.erase(0, pos + strlen(kMgStart));
+                mg_header_.clear();
+                mg_phase_ = MgPhase::kHeader;
+                continue;
+            }
+            if (mg_phase_ == MgPhase::kHeader) {
+                const size_t pos = data.find(kMgMessage);
+                if (pos == std::string::npos) {
+                    const size_t keep = marker_prefix_len(data, kMgMessage);
+                    mg_header_ += data.substr(0, data.size() - keep);
+                    if (keep > 0) carry_ = data.substr(data.size() - keep);
+                    break;
+                }
+                mg_header_ += data.substr(0, pos);
+                mg_is_self_ = mg_header_ == "assistant to=self";
+                data.erase(0, pos + strlen(kMgMessage));
+                mg_phase_ = MgPhase::kBody;
+                continue;
+            }
+            // mg_phase_ == kBody
+            const size_t eom = data.find(kMgEom);
+            const size_t eot = data.find(kMgEot);
+            size_t end = std::string::npos;
+            bool hit_eot = false;
+            if (eom != std::string::npos && (eot == std::string::npos || eom < eot)) {
+                end = eom;
+            } else if (eot != std::string::npos) {
+                end = eot;
+                hit_eot = true;
+            }
+            std::string& sink = mg_is_self_ ? out.reasoning_content : out.content;
+            const bool emit = !mg_is_self_ || enable_thinking_;
+            if (end == std::string::npos) {
+                const size_t keep = std::max(marker_prefix_len(data, kMgEom), marker_prefix_len(data, kMgEot));
+                const size_t emit_len = data.size() - keep;
+                if (emit_len > 0 && emit) sink += data.substr(0, emit_len);
+                if (keep > 0) carry_ = data.substr(emit_len);
+                break;
+            }
+            if (end > 0 && emit) sink += data.substr(0, end);
+            data.erase(0, end + (hit_eot ? strlen(kMgEot) : strlen(kMgEom)));
+            if (hit_eot) { mg_done_ = true; break; }
+            mg_phase_ = MgPhase::kAwaitStart;
+        }
+        return out;
+    }
+
     std::string data = carry_ + piece;
     carry_.clear();
 
@@ -403,6 +557,14 @@ ThinkingStreamSplitter::Delta ThinkingStreamSplitter::feed(const std::string& pi
 
 void ThinkingStreamSplitter::finish(Delta& tail) {
     tail = {};
+    if (museglimmer_) {
+        if (mg_phase_ == MgPhase::kBody && !carry_.empty()) {
+            if (!mg_is_self_) tail.content = carry_;
+            else if (enable_thinking_) tail.reasoning_content = carry_;
+        }
+        carry_.clear();
+        return;
+    }
     if (enable_thinking_ && phase_ == Phase::kBeforeThink) {
         tail.content = strip_think_markers(prefix_buffer_ + carry_);
         prefix_buffer_.clear();
@@ -431,7 +593,9 @@ bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::ve
     std::vector<ChatMessage> messages;
     if (!parse_chat_messages(request_json, messages, err)) return false;
 
-    const std::string prompt = apply_qwen36_chat_template(messages, enable_thinking);
+    const std::string prompt = impl_->museglimmer
+        ? apply_museglimmer_chat_template(messages, enable_thinking ? "high" : "low")
+        : apply_qwen36_chat_template(messages, enable_thinking);
     const std::vector<int32_t> enc = impl_->tok->Encode(prompt);
     ids.assign(enc.begin(), enc.end());
     if (ids.empty()) {

@@ -65,6 +65,11 @@ static void museglimmer_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::
     cfg.rope_theta = (float)museglimmer_meta_float(g, "rope.freq_base", 500000.f);
     cfg.rms_eps    = (float)museglimmer_meta_float(g, "attention.layer_norm_rms_epsilon", 1e-5f);
     cfg.eos_id     = (int)g.meta_int("tokenizer.ggml.eos_token_id", 200001);
+    // <|eot|> ends a turn same as <|end_of_text|> -- <|eom|> (end-of-message, mid-turn
+    // segment boundary) is deliberately NOT a stop token; see museglimmer's chat template
+    // (kMgEom in server/src/chat_tokenizer.cpp) for why stopping on it would cut a
+    // reasoning-then-answer turn short.
+    cfg.eos_id2    = (int)g.meta_int("tokenizer.ggml.eot_token_id", 200008);
     cfg.vocab      = (int)museglimmer_meta_int(g, "vocab_size", 202048);
     const sparkinfer::GGUFTensor* emb = g.tensor("token_embd.weight");
     if (emb && emb->n_dims >= 2) cfg.vocab = (int)emb->dims[1];

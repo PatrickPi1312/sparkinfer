@@ -240,6 +240,7 @@ int main(int argc, char** argv) {
 
     sparkinfer_server::ModelEngine engine;
     if (!engine.load(model_path, ctx > 0 ? ctx : 0)) return 1;
+    g_tokenizer.set_museglimmer(engine.is_museglimmer());
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
@@ -418,7 +419,7 @@ int main(int argc, char** argv) {
                              }
                              std::vector<int> stream_ids;
                              stream_ids.reserve((size_t)max_tokens);
-                             sparkinfer_server::ThinkingStreamSplitter splitter(enable_thinking);
+                             sparkinfer_server::ThinkingStreamSplitter splitter(enable_thinking, engine.is_museglimmer());
                              // Returning false cancels generation -- the client is gone, so there
                              // is no point spending GPU time finishing the response.
                              auto on_tok = [&](int tid) -> bool {
@@ -497,7 +498,7 @@ int main(int argc, char** argv) {
                  g_prompt_tokens_total += (uint64_t)prompt_ids.size();
                  g_completion_tokens_total += (uint64_t)outcome.tokens.size();
 
-                 const auto parsed = sparkinfer_server::parse_assistant_output(text, enable_thinking);
+                 const auto parsed = sparkinfer_server::parse_assistant_output(text, enable_thinking, engine.is_museglimmer());
 
                  std::ostringstream body;
                  body << "{\"id\":\"" << cid << "\",\"object\":\"chat.completion\",\"created\":" << created

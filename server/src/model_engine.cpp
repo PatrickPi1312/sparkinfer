@@ -162,6 +162,11 @@ int ModelEngine::max_seq() const {
     return impl_->ready ? impl_->cfg.max_seq : 0;
 }
 
+bool ModelEngine::is_museglimmer() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return impl_->ready && impl_->cfg.muse_glimmer;
+}
+
 void ModelEngine::set_prefix_tokens(const std::vector<int>& tokens) {
     std::lock_guard<std::mutex> lock(mu_);
     impl_->prefix_tokens = tokens;
