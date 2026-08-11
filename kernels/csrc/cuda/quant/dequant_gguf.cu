@@ -250,6 +250,27 @@ __global__ void transpose3d_kernel(const __nv_bfloat16* __restrict__ src, __nv_b
     int e = idx / ((long)A * B); int rem = idx % ((long)A * B); int a = rem / B, b = rem % B;
     dst[((long)e * B + b) * A + a] = src[idx];        // [E,A,B] -> [E,B,A]
 }
+// Interleave two per-head projection weights into the layout split_q_gate_kernel (qwen36.cu)
+// expects: out[h][0:hd] = q, out[h][hd:2hd] = gate, per head h. q/gate are native ggml
+// [out,in] storage (in_dim contiguous per output row), so this is a whole-row reorder, not a
+// per-element transform -- combined row h*2*hd+d (d<hd) = q's row h*hd+d; combined row
+// h*2*hd+hd+d = gate's row h*hd+d. Load-time only (once per model load, not perf-critical).
+__global__ void interleave_qgate_rows_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ gate,
+    __nv_bfloat16* __restrict__ out, int n_heads, int head_dim, int in_dim
+) {
+    const long total = (long)n_heads * 2 * head_dim * in_dim;
+    for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (long)gridDim.x * blockDim.x) {
+        const long row = idx / in_dim;
+        const long col = idx % in_dim;
+        const int h = (int)(row / (2 * head_dim));
+        const int r = (int)(row % (2 * head_dim));
+        const bool is_gate = r >= head_dim;
+        const long src_row = (long)h * head_dim + (is_gate ? r - head_dim : r);
+        out[idx] = is_gate ? gate[src_row * in_dim + col] : q[src_row * in_dim + col];
+    }
+}
 
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/quant.h"
@@ -381,6 +402,16 @@ void launch_transpose_bf16(const void* src, void* dst, int rows, int cols, cudaS
 void launch_transpose3d_bf16(const void* src, void* dst, int E, int A, int B, cudaStream_t stream) {
     long n = (long)E*A*B; const int T=256;
     transpose3d_kernel<<<(n+T-1)/T,T,0,stream>>>(reinterpret_cast<const __nv_bfloat16*>(src), reinterpret_cast<__nv_bfloat16*>(dst), E, A, B);
+}
+void launch_interleave_qgate_rows(const void* q, const void* gate, void* out,
+                                  int n_heads, int head_dim, int in_dim, cudaStream_t stream) {
+    const long total = (long)n_heads * 2 * head_dim * in_dim;
+    const int T = 256;
+    long blocks = (total + T - 1) / T;
+    if (blocks > 65535) blocks = 65535;   // kernel grid-strides, so a capped grid is fine
+    interleave_qgate_rows_kernel<<<(unsigned)blocks, T, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(gate),
+        reinterpret_cast<__nv_bfloat16*>(out), n_heads, head_dim, in_dim);
 }
 #endif
 

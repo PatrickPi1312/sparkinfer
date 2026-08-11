@@ -71,6 +71,16 @@ void launch_transpose_bf16(const void* src, void* dst, int rows, int cols,
 void launch_transpose3d_bf16(const void* src, void* dst, int E, int A, int B,
                              cudaStream_t stream = nullptr);        // [E,A,B]->[E,B,A]
 
+// Interleave two [n_heads*head_dim, in_dim] native-ggml (out,in) weight matrices into one
+// [n_heads*2*head_dim, in_dim] matrix laid out per-head as [q_head | gate_head]: the layout
+// split_q_gate_kernel (qwen36.cu) already expects for w.wq when Qwen35LayerWeights::q_has_gate
+// is set. Used at load time when a GGUF ships q and gate as two separate tensors (e.g. Muse
+// Glimmer's attn_q.weight/attn_gate.weight) rather than pre-fused into one (Qwen3.6's
+// convention -- see qwen3_config_from_gguf's expect_dims on attn_q.weight for q_has_gate).
+void launch_interleave_qgate_rows(const void* q, const void* gate, void* out,
+                                  int n_heads, int head_dim, int in_dim,
+                                  cudaStream_t stream = nullptr);
+
 // Requantize a dense-FFN down projection bf16 -> Q4_K (ggml super-block layout consumed
 // by si_vec_dot_q4_K). Load-time only; n_values must be a multiple of 256.
 void launch_ffn_down_requant_q4k(const void* src_bf16, void* dst_q4k, long n_values,

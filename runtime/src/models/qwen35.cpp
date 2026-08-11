@@ -2824,19 +2824,50 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             w.ssm_out = attn_w(b + "ssm_out.weight", w.ssm_out_type);
         } else {
             w.q_has_gate = c.hybrid;
-            const int q_out = w.q_has_gate ? s.qdim * 2 : s.qdim;
-            if (!expect_dims(b + "attn_q.weight", {H, q_out}) ||
-                !expect_dims(b + "attn_k.weight", {H, s.kvdim}) ||
-                !expect_dims(b + "attn_v.weight", {H, s.kvdim}) ||
-                !expect_dims(b + "attn_output.weight", {s.qdim, H}) ||
-                !expect_dims(b + "attn_q_norm.weight", {c.head_dim}) ||
-                !expect_dims(b + "attn_k_norm.weight", {c.head_dim})) return false;
-            w.wq = attn_w(b + "attn_q.weight", w.wq_type);
-            w.wk = attn_w(b + "attn_k.weight", w.wk_type);
-            w.wv = attn_w(b + "attn_v.weight", w.wv_type);
-            w.wo = attn_w(b + "attn_output.weight", w.wo_type);
-            w.q_norm = dense(b + "attn_q_norm.weight", false);
-            w.k_norm = dense(b + "attn_k_norm.weight", false);
+            if (c.muse_glimmer) {
+                // attn_q.weight and attn_gate.weight ship as two separate [H, qdim]
+                // tensors (unlike Qwen3.6's GGUF, which pre-fuses them into one [H,
+                // qdim*2] tensor before writing the file) -- dequantize both to bf16 and
+                // interleave into the per-head [q|gate] layout split_q_gate_kernel
+                // (qwen36.cu) expects. Load-time only; w.wq ends up dense bf16 (wq_type=0)
+                // rather than kept-quantized, same as this path's non-gguf/dense fallback.
+                if (!expect_dims(b + "attn_q.weight", {H, s.qdim}) ||
+                    !expect_dims(b + "attn_gate.weight", {H, s.qdim}) ||
+                    !expect_dims(b + "attn_k.weight", {H, s.kvdim}) ||
+                    !expect_dims(b + "attn_v.weight", {H, s.kvdim}) ||
+                    !expect_dims(b + "attn_output.weight", {s.qdim, H}) ||
+                    !expect_dims(b + "attn_q_norm.weight", {c.head_dim}) ||
+                    !expect_dims(b + "attn_k_norm.weight", {c.head_dim})) return false;
+                const void* qd = dense(b + "attn_q.weight", false);
+                const void* gd = dense(b + "attn_gate.weight", false);
+                if (!qd || !gd) return false;
+                void* combined = nullptr;
+                cu(cudaMalloc(&combined, (size_t)s.qdim * 2 * H * sizeof(bf16)), "qgate interleave alloc");
+                kernels::launch_interleave_qgate_rows(qd, gd, combined, c.n_q_heads, c.head_dim, H, s.stream);
+                cu(cudaStreamSynchronize(s.stream), "qgate interleave sync");
+                s.owned.push_back(combined);
+                w.wq = combined;
+                w.wq_type = 0;
+                w.wk = attn_w(b + "attn_k.weight", w.wk_type);
+                w.wv = attn_w(b + "attn_v.weight", w.wv_type);
+                w.wo = attn_w(b + "attn_output.weight", w.wo_type);
+                w.q_norm = dense(b + "attn_q_norm.weight", false);
+                w.k_norm = dense(b + "attn_k_norm.weight", false);
+            } else {
+                const int q_out = w.q_has_gate ? s.qdim * 2 : s.qdim;
+                if (!expect_dims(b + "attn_q.weight", {H, q_out}) ||
+                    !expect_dims(b + "attn_k.weight", {H, s.kvdim}) ||
+                    !expect_dims(b + "attn_v.weight", {H, s.kvdim}) ||
+                    !expect_dims(b + "attn_output.weight", {s.qdim, H}) ||
+                    !expect_dims(b + "attn_q_norm.weight", {c.head_dim}) ||
+                    !expect_dims(b + "attn_k_norm.weight", {c.head_dim})) return false;
+                w.wq = attn_w(b + "attn_q.weight", w.wq_type);
+                w.wk = attn_w(b + "attn_k.weight", w.wk_type);
+                w.wv = attn_w(b + "attn_v.weight", w.wv_type);
+                w.wo = attn_w(b + "attn_output.weight", w.wo_type);
+                w.q_norm = dense(b + "attn_q_norm.weight", false);
+                w.k_norm = dense(b + "attn_k_norm.weight", false);
+            }
         }
         if (!expect_dims_opt(b + "attn_post_norm.weight", {H}) ||
             !expect_dims_opt(b + "post_attention_norm.weight", {H}) ||
