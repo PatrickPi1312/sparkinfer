@@ -1,5 +1,6 @@
 #include "sparkinfer/inference_engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,27 @@ int prefill_chunk_tokens() {
     return chunk;
 }
 
+// Admission-time queue depth cap. 0 (default) = unlimited, matching prior behaviour --
+// operators opt in to admission control rather than getting a surprise cap.
+int max_queue_depth_config() {
+    static int cap = []{
+        const char* e = getenv("SPARKINFER_MAX_QUEUE_DEPTH");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    return cap;
+}
+
+// Per-request wall-clock deadline from submit to finish. 0 (default) = disabled --
+// long-context prefill alone can legitimately take well over a minute (measured: ~94s TTFT
+// at 32k context), so an aggressive default would misfire on correct, expected-slow requests.
+double request_timeout_s_config() {
+    static double s = []{
+        const char* e = getenv("SPARKINFER_REQUEST_TIMEOUT_S");
+        return e ? std::max(0.0, atof(e)) : 0.0;
+    }();
+    return s;
+}
+
 }  // namespace
 
 struct ContinuousBatchEngine::Job {
@@ -59,8 +81,18 @@ struct ContinuousBatchEngine::Job {
     bool batched_prefill_done = false;
     std::vector<int> output;
     std::string error;
-    std::function<void(int)> on_token;
+    std::function<bool(int)> on_token;  // false return = cancel
     bool done = false;
+    bool overloaded = false;
+    bool timed_out = false;
+    bool cancelled = false;
+
+    std::chrono::steady_clock::time_point t_submit{};
+    std::chrono::steady_clock::time_point t_first{};
+    bool saw_first_tok = false;
+    double ttft_ms = -1.0;
+    double generation_ms = -1.0;
+    double decode_tps = -1.0;
 };
 
 ContinuousBatchEngine::ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,
@@ -95,14 +127,23 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete(const Request& req
 }
 
 ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
-    const Request& req, const std::function<void(int)>& on_token) {
+    const Request& req, const std::function<bool(int)>& on_token) {
     uint64_t rid = 0;
+    EnqueueError err = EnqueueError::NONE;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        rid = submit_locked(Job{0, req, 0, SeqPhase::PREFILL, req.prefill_start, 0, -1, false, {}, {}, on_token, false},
-                            on_token);
+        Job job;
+        job.req = req;
+        job.prefill_pos = req.prefill_start;
+        rid = submit_locked(std::move(job), on_token, &err);
     }
-    if (!rid) return Result{{}, "failed to enqueue request"};
+    if (!rid) {
+        Result out;
+        out.overloaded = (err == EnqueueError::OVERLOADED);
+        out.error = out.overloaded ? "server overloaded: no capacity for this request right now"
+                                    : "failed to enqueue request";
+        return out;
+    }
     return wait_locked(rid);
 }
 
@@ -115,32 +156,48 @@ int ContinuousBatchEngine::num_active() const {
 
 int ContinuousBatchEngine::num_free_kv_blocks() const { return kv_->num_free_blocks(); }
 
-uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<void(int)>& on_token) {
-    if (!model_ || !kv_) return 0;
-    if (job.req.prompt.empty() || job.req.max_new_tokens <= 0) return 0;
+int ContinuousBatchEngine::max_queue_depth() const { return max_queue_depth_config(); }
+
+uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(int)>& on_token,
+                                              EnqueueError* err_out) {
+    EnqueueError err = EnqueueError::BAD_REQUEST;
+    auto fail = [&](EnqueueError e) { if (err_out) *err_out = e; return uint64_t{0}; };
+
+    if (!model_ || !kv_) return fail(err);
+    if (job.req.prompt.empty() || job.req.max_new_tokens <= 0) return fail(err);
+    if ((int)job.req.prompt.size() + job.req.max_new_tokens > model_->config().max_seq)
+        return fail(EnqueueError::BAD_REQUEST);
+
+    const int cap = max_queue_depth_config();
+    if (cap > 0) {
+        int active = 0;
+        for (const auto& kv : jobs_) if (!kv.second->done) active++;
+        if (active >= cap) return fail(EnqueueError::OVERLOADED);
+    }
 
     const int budget = Qwen35Model::session_token_budget(
         job.req.prompt.size(), job.req.max_new_tokens, model_->config().max_seq);
-    if ((int)job.req.prompt.size() + job.req.max_new_tokens > model_->config().max_seq) return 0;
 
     uint64_t seq_id = 0;
     if (job.req.use_prefix_session) {
         seq_id = 0;
-        if (!kv_->allocate(seq_id, budget)) return 0;
+        if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
         model_->activate_session(seq_id);
     } else {
         seq_id = model_->open_session(budget);
-        if (!seq_id) return 0;
+        if (!seq_id) return fail(EnqueueError::OVERLOADED);
     }
 
     job.request_id = next_req_id_.fetch_add(1);
     job.seq_id = seq_id;
     job.on_token = on_token;
     job.prefill_pos = job.req.prefill_start;
+    job.t_submit = std::chrono::steady_clock::now();
     auto ptr = std::make_unique<Job>(std::move(job));
     const uint64_t rid = ptr->request_id;
     jobs_[rid] = std::move(ptr);
     cv_.notify_one();
+    if (err_out) *err_out = EnqueueError::NONE;
     return rid;
 }
 
@@ -152,7 +209,15 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     });
     auto it = jobs_.find(request_id);
     if (it == jobs_.end()) return Result{{}, "request not found"};
-    Result out{it->second->output, it->second->error};
+    Result out;
+    out.tokens = it->second->output;
+    out.error = it->second->error;
+    out.overloaded = it->second->overloaded;
+    out.timed_out = it->second->timed_out;
+    out.cancelled = it->second->cancelled;
+    out.ttft_ms = it->second->ttft_ms;
+    out.generation_ms = it->second->generation_ms;
+    out.decode_tps = it->second->decode_tps;
     jobs_.erase(it);
     return out;
 }
@@ -229,6 +294,35 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     const Qwen35Config& cfg = model_->config();
     model_->activate_session(job.seq_id);
 
+    // Shared "finish this job" helper: closes/frees whatever KV/session it holds and marks
+    // done. step_job's several early-exit paths (timeout, cancel, invalid seed, eos/max_tokens)
+    // all need exactly this cleanup -- duplicating it inline four times is how one of those
+    // paths quietly drifts out of sync with the others. A lambda (not a free function) because
+    // Job is private to ContinuousBatchEngine; only code with this member function's access can
+    // name it.
+    auto finish_job = [this](Job& j) {
+        j.done = true;
+        if (j.seq_id != 0) model_->close_session(j.seq_id);
+        else {
+            kv_->free(j.seq_id);
+            if (j.req.use_prefix_session) model_->release_prefix_session();
+        }
+        j.seq_id = 0;
+    };
+
+    const double timeout_s = request_timeout_s_config();
+    if (timeout_s > 0.0) {
+        const double elapsed_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - job.t_submit).count();
+        if (elapsed_s > timeout_s) {
+            job.error = "request timeout after " + std::to_string(elapsed_s) + "s (limit " +
+                        std::to_string(timeout_s) + "s)";
+            job.timed_out = true;
+            finish_job(job);
+            return true;
+        }
+    }
+
     if (job.phase == SeqPhase::PREFILL) {
         const int n = (int)job.req.prompt.size();
         const int chunk = prefill_chunk_tokens();
@@ -274,30 +368,40 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
 
     if (job.next_token < 0 || job.next_token >= cfg.vocab) {
         job.error = "prefill produced invalid seed token";
-        job.done = true;
-        if (job.seq_id != 0) model_->close_session(job.seq_id);
-        else {
-            kv_->free(job.seq_id);
-            // Match generate(): KV is gone — soft-invalidate so the server does not
-            // skip cache_prefix() on the next exclusive prefix hit.
-            if (job.req.use_prefix_session) model_->release_prefix_session();
-        }
-        job.seq_id = 0;
+        // Match generate(): KV is gone — soft-invalidate so the server does not
+        // skip cache_prefix() on the next exclusive prefix hit (finish_job's
+        // use_prefix_session branch below handles that).
+        finish_job(job);
         return true;
     }
 
+    // Timestamp before on_token so SSE/network backpressure never enters GPU metrics.
+    const auto t_emit = std::chrono::steady_clock::now();
+    if (!job.saw_first_tok) {
+        job.t_first = t_emit;
+        job.saw_first_tok = true;
+        job.ttft_ms = std::chrono::duration<double, std::milli>(job.t_first - job.t_submit).count();
+    }
     job.output.push_back(job.next_token);
-    if (job.on_token) job.on_token(job.next_token);
     job.decode_emitted++;
+    // false => caller (e.g. the HTTP layer, when the client disconnected mid-stream) wants
+    // generation stopped now. Not an error -- free resources same as a normal finish.
+    if (job.on_token && !job.on_token(job.next_token)) {
+        job.cancelled = true;
+        job.generation_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - job.t_submit).count();
+        finish_job(job);
+        return true;
+    }
 
     if (job.next_token == cfg.eos_id || job.decode_emitted >= job.req.max_new_tokens) {
-        job.done = true;
-        if (job.seq_id != 0) model_->close_session(job.seq_id);
-        else {
-            kv_->free(job.seq_id);
-            if (job.req.use_prefix_session) model_->release_prefix_session();
+        const auto t_end = std::chrono::steady_clock::now();
+        job.generation_ms = std::chrono::duration<double, std::milli>(t_end - job.t_submit).count();
+        if (job.saw_first_tok && job.generation_ms > job.ttft_ms && job.decode_emitted > 0) {
+            const double decode_ms = std::max(job.generation_ms - job.ttft_ms, 1.0);
+            job.decode_tps = (double)job.decode_emitted * 1000.0 / decode_ms;
         }
-        job.seq_id = 0;
+        finish_job(job);
         return true;
     }
 

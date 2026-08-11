@@ -13,6 +13,12 @@ namespace sparkinfer_server {
 struct CompletionResult {
     std::vector<int> tokens;
     std::string error;  // empty on success
+    bool overloaded = false;  // true => caller should return 429, not a generic 4xx
+    bool timed_out = false;   // true => a per-request deadline was exceeded
+    bool cancelled = false;   // true => on_token returned false; not an error
+    double ttft_ms = -1.0;
+    double generation_ms = -1.0;
+    double decode_tps = -1.0;
 };
 
 // Thread-safe wrapper around sparkinfer::Qwen35Model + GGUF load.
@@ -40,9 +46,16 @@ public:
     // Greedy decode. Tokens are in .tokens; on failure .tokens is empty and .error is set.
     CompletionResult complete(const std::vector<int>& prompt_ids, int max_new_tokens);
 
-    // Same, but invokes cb after each generated token (for SSE streaming).
+    // Same, but invokes on_token after each generated token (for SSE streaming). on_token
+    // returns false to cancel generation early (client disconnected); the result then comes
+    // back with .cancelled = true, not an error.
     CompletionResult complete_streaming(const std::vector<int>& prompt_ids, int max_new_tokens,
-                                        const std::function<void(int)>& on_token);
+                                        const std::function<bool(int)>& on_token);
+
+    // Live occupancy, for capacity-reporting endpoints. 0/0 if the model isn't loaded yet.
+    int active_requests() const;
+    int free_kv_blocks() const;
+    int max_queue_depth() const;
 
 private:
     struct Impl;

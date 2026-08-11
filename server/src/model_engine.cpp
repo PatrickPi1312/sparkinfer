@@ -176,9 +176,24 @@ CompletionResult ModelEngine::complete(const std::vector<int>& prompt_ids, int m
     return complete_streaming(prompt_ids, max_new_tokens, nullptr);
 }
 
+int ModelEngine::active_requests() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->num_active() : 0;
+}
+
+int ModelEngine::free_kv_blocks() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->num_free_kv_blocks() : 0;
+}
+
+int ModelEngine::max_queue_depth() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->max_queue_depth() : 0;
+}
+
 CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_ids,
                                                  int max_new_tokens,
-                                                 const std::function<void(int)>& on_token) {
+                                                 const std::function<bool(int)>& on_token) {
     CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
@@ -221,7 +236,19 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
             req.prefill_start = (int)impl_->prefix_tokens.size();
             req.use_prefix_session = true;
         } else {
-            if (!prefix_match) impl_->model->clear_prefix_cache();
+            // clear_prefix_cache() frees whatever session is currently active on the shared
+            // Qwen35Model (kv->free(active_seq_id)) -- but the continuous-batch worker thread
+            // calls activate_session() for whichever job it's stepping right now, on its own
+            // thread, independent of this mutex. Calling clear here without the same
+            // prefix_exclusive guard the "use prefix" branch above already has meant an
+            // unrelated new request (any request that doesn't match the prefix -- the common
+            // case whenever no prefix is configured at all) could free the KV blocks out from
+            // under an actively-decoding, completely unrelated job. Reproduced directly: under
+            // concurrent load this corrupts the KV cache ("[kv] copy block table: an illegal
+            // memory access was encountered", poisoning the CUDA context for the rest of the
+            // process). Skipping the clear when non-exclusive just defers it -- cache_prefix()
+            // already re-primes correctly the next time the prefix session is actually used.
+            if (!prefix_match && prefix_exclusive) impl_->model->clear_prefix_cache();
             req.prefill_start = 0;
             req.use_prefix_session = false;
         }
@@ -233,9 +260,19 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     auto result = impl_->batch_engine->complete_streaming(req, on_token);
 
     std::lock_guard<std::mutex> lock(mu_);
+    out.overloaded = result.overloaded;
+    out.timed_out = result.timed_out;
+    out.cancelled = result.cancelled;
+    out.ttft_ms = result.ttft_ms;
+    out.generation_ms = result.generation_ms;
+    out.decode_tps = result.decode_tps;
     if (!result.error.empty()) {
         out.error = result.error;
         fprintf(stderr, "[sparkinfer-server] %s\n", out.error.c_str());
+        return out;
+    }
+    if (result.cancelled) {
+        out.tokens = std::move(result.tokens);
         return out;
     }
 

@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
         clock::time_point prev{};
         bool have_prev = false;
         const auto t_submit = clock::now();
-        auto on_tok = [&](int) {
+        auto on_tok = [&](int) -> bool {
             decode_tokens.fetch_add(1, std::memory_order_relaxed);
             if (measure_long && long_ttft_us.load(std::memory_order_relaxed) < 0) {
                 const auto us =
@@ -146,7 +146,7 @@ int main(int argc, char** argv) {
                         .count();
                 long_ttft_us.store(us, std::memory_order_relaxed);
             }
-            if (!track_itl) return;
+            if (!track_itl) return true;
             const auto now = clock::now();
             if (have_prev) {
                 const auto us =
@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
             }
             prev = now;
             have_prev = true;
+            return true;
         };
         auto r = batch.complete_streaming(req, on_tok);
         if (measure_long) {

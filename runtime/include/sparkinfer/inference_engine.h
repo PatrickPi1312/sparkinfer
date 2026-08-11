@@ -36,6 +36,17 @@ public:
     struct Result {
         std::vector<int> tokens;
         std::string error;
+        // true => caller should surface 429 (no capacity right now), not a generic 4xx —
+        // the request itself was fine, there was just nowhere to run it.
+        bool overloaded = false;
+        // true => a per-request deadline (SPARKINFER_REQUEST_TIMEOUT_S) was exceeded.
+        bool timed_out = false;
+        // true => on_token returned false (client went away mid-stream); not an error.
+        bool cancelled = false;
+        // GPU-side timings (exclude SSE/on_token backpressure).
+        double ttft_ms = -1.0;
+        double generation_ms = -1.0;
+        double decode_tps = -1.0;
     };
 
     ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,
@@ -50,14 +61,20 @@ public:
     Result complete(const Request& req);
 
     // Streaming completion: on_token is invoked on the worker thread as tokens are produced.
-    Result complete_streaming(const Request& req, const std::function<void(int)>& on_token);
+    // on_token returns false to cancel generation early (e.g. the client disconnected) --
+    // the request then finishes with Result::cancelled = true, not an error.
+    Result complete_streaming(const Request& req, const std::function<bool(int)>& on_token);
 
     int num_active() const;
     int num_free_kv_blocks() const;
+    // Admission-time queue depth cap (SPARKINFER_MAX_QUEUE_DEPTH, 0 = unlimited). Requests
+    // beyond this are rejected as overloaded before any KV allocation is attempted.
+    int max_queue_depth() const;
 
 private:
     struct Job;
-    uint64_t submit_locked(Job job, const std::function<void(int)>& on_token);
+    enum class EnqueueError { NONE, BAD_REQUEST, OVERLOADED };
+    uint64_t submit_locked(Job job, const std::function<bool(int)>& on_token, EnqueueError* err_out);
     Result wait_locked(uint64_t request_id);
     void worker_loop();
     bool step_job(Job& job, bool chunked = false);
