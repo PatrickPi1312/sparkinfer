@@ -145,6 +145,16 @@ __global__ void decode_feedback_kernel(int* __restrict__ scalars,
     scalars[3] += 1;
 }
 
+// Gemma2-style final-logit softcap, in place: logits[v] = tanh(logits[v] * scale / cap) * cap.
+// One block per row, grid-stride over vocab.
+__global__ void logit_softcap_kernel(float* __restrict__ logits, int vocab,
+                                     float scale, float cap) {
+    float* L = logits + (size_t)blockIdx.x * vocab;
+    const float inv_cap = 1.f / cap;
+    for (int v = threadIdx.x; v < vocab; v += blockDim.x)
+        L[v] = tanhf(L[v] * scale * inv_cap) * cap;
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 
@@ -169,6 +179,11 @@ void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab, cuda
 
 void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream) {
     decode_feedback_kernel<<<1, 1, 0, stream>>>(scalars, out_id);
+}
+
+void launch_logit_softcap(float* logits, int n_rows, int vocab, float scale, float cap,
+                          cudaStream_t stream) {
+    logit_softcap_kernel<<<n_rows, 256, 0, stream>>>(logits, vocab, scale, cap);
 }
 #endif
 

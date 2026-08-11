@@ -200,6 +200,7 @@ struct Qwen35Model::Impl {
     int*   swa_vlen = nullptr;     // compact view seq_len (device scalar)
     int    swa_budget = 0;         // sliding_window tokens / block_size, rounded up
     int    swa_vsplits = 32;       // KV splits over the (small, fixed-size) swa view
+    bf16*  emb_norm_ones = nullptr; // [hidden] all-1.0, for the unweighted post-embedding RMSNorm
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
     bool use_pq = true;   // SPARKINFER_PQ=0 disables the pre-quantized GEMV path
@@ -392,6 +393,12 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         p_->swa_vsplits = vs;
         fprintf(stderr, "[muse-glimmer] sliding-window: %d tokens (%d blocks), every-4th-layer global/NoPE\n",
                 cfg.sliding_window, p_->swa_budget);
+        // Unweighted RMSNorm applied to the token embedding before layer 0 (no learned
+        // per-channel weight -- launch_rmsnorm always takes one, so fill a constant-1.0
+        // buffer once at load time and reuse it as that "weight").
+        p_->emb_norm_ones = p_->alloc<bf16>(H);
+        std::vector<bf16> ones(H, (bf16)0x3F80u);   // bf16 bit pattern for 1.0f
+        cudaMemcpy(p_->emb_norm_ones, ones.data(), (size_t)H * sizeof(bf16), cudaMemcpyHostToDevice);
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
@@ -442,7 +449,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->sparse_sel);
     cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
-    cudaFree(p_->swa_vtbl); cudaFree(p_->swa_vlen);
+    cudaFree(p_->swa_vtbl); cudaFree(p_->swa_vlen); cudaFree(p_->emb_norm_ones);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
     // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
@@ -714,6 +721,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
+    if (c.muse_glimmer && s.emb_norm_ones)
+        kernels::launch_rmsnorm(s.x, s.emb_norm_ones, s.x, 1, H, c.rms_eps, st);
 
     int* btable = s.kv->block_table(s.active_seq_id);
     // GQA-8 sparse: materialize the sink+window compact view once per decode step (the
@@ -1353,6 +1362,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
     else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
     else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
+    if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
+        kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 

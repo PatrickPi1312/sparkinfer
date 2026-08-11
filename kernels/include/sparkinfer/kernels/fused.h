@@ -63,6 +63,12 @@ void launch_embedding(const int* ids, const void* table, void* out,
 void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab,
                    cudaStream_t stream = nullptr);
 
+// Gemma2/Muse-Glimmer-style final-logit softcap, applied in place before any
+// argmax/sampling reads logits: logits[v] = tanh(logits[v] * scale / cap) * cap.
+// logits: [n_rows, vocab] (fp32).
+void launch_logit_softcap(float* logits, int n_rows, int vocab, float scale, float cap,
+                          cudaStream_t stream = nullptr);
+
 // Benchmark-only decode feedback: tok = out_id; pos/writepos/seqlen += 1.
 // Capturable, so a decode CUDA graph can self-feed during throughput timing.
 void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream = nullptr);
