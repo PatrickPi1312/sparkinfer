@@ -44,4 +44,16 @@ gh label create "dflash-merge-first" -R "$REPO" --color "0E8A16" \
 gh label create "dflash-needs-rebase" -R "$REPO" --color "FBCA04" \
    --description "verified DFlash speedup but not this round's dflash-merge-first" --force >/dev/null
 
-echo "eval:*, eval-dflash:*, area:*, *-context, regression-*, dflash-merge-* labels ready on $REPO"
+# Muse Glimmer bot (eval/pr_museglimmer_bot.py) — 128-token AR decode only, scored + accuracy-gated
+# separately from eval:*/eval-dflash:* (see pr_museglimmer_bot.py's apply_result() for why it does
+# NOT mirror to eval:*).
+for k in "${!C[@]}"; do
+  gh label create "eval-museglimmer:$k" -R "$REPO" --color "${C[$k]}" \
+     --description "sparkinfer Muse Glimmer 128-decode vs-main speed tier: $k" --force >/dev/null
+done
+gh label create "museglimmer-merge-first" -R "$REPO" --color "0E8A16" \
+   --description "round winner: biggest verified Muse Glimmer 128-decode speedup — auto-merge candidate" --force >/dev/null
+gh label create "museglimmer-needs-rebase" -R "$REPO" --color "FBCA04" \
+   --description "verified Muse Glimmer speedup but not this round's museglimmer-merge-first" --force >/dev/null
+
+echo "eval:*, eval-dflash:*, eval-museglimmer:*, area:*, *-context, regression-*, dflash-merge-*, museglimmer-merge-* labels ready on $REPO"
