@@ -811,7 +811,10 @@ def format_comment(commit: str, res: dict) -> str:
         f"{res.get('reason') or ''}\n\n"
         "<sub>Scored on the pinned eval box vs same-box `origin/main`, 128-token AR decode only "
         "(no DFlash, no long-context, no prefill) — Muse Glimmer's narrow, deliberately strict "
-        "eval scope. Correctness gated against a live llama.cpp reference on the same GGUF. "
+        "eval scope. This is informational, not a judgment on your PR: a `none` label just means "
+        "no measurable Muse Glimmer 128-decode speedup was found, which is expected and fine if "
+        "that isn't what your change is about — this bot never closes PRs. "
+        "Correctness gated against a live llama.cpp reference on the same GGUF. "
         "Automated — **not merged**; merge manually after review.</sub>\n"
     )
 
@@ -1017,18 +1020,20 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
-        if label in ("none", "REJECT"):
-            close_body = (
-                "<!-- sparkinfer-museglimmer-auto-close -->\n"
-                f"## Closed: sparkinfer museglimmer auto-eval — `eval-museglimmer:{label}`\n\n"
-                f"This PR's Muse Glimmer 128-decode speed measured **{res.get('delta_pct')}%** vs "
-                f"main, {'and failed the accuracy gate' if not res.get('accuracy_ok') else 'with no verified improvement' if label == 'none' else '(regression)'} "
-                "— closing automatically. Reopen (or open a fresh PR) if you have a fix or a "
-                "different approach."
-            )
-            arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
-            arb.gh(["pr", "close", str(num), "-R", repo])
-            print(f">> auto-closed PR #{num} (eval-museglimmer:{label})")
+        # Deliberately NO auto-close on "none"/"REJECT" here, unlike pr_dflash_bot.py. That
+        # behavior is only sound when a bot's greenlight scope is actually restricted to PRs
+        # claiming improvement on the SAME axis it scores -- pr_dflash_bot.py's greenlight check
+        # is itself just as generic (any PR with a checked "tested" box + a decode/prefill
+        # before/after table, not DFlash-specific), so in practice this bot -- reusing that same
+        # generic arb.greenlight_status() -- ends up evaluating essentially any performance PR in
+        # the repo regardless of whether it touches Muse Glimmer at all. A PR that never intended
+        # to improve Muse Glimmer's 128-decode speed will routinely and correctly score "none" on
+        # that axis; auto-closing it for that would be closing an unrelated contributor's PR over
+        # a metric they were never trying to move. Confirmed live: the very first supervised run
+        # of this bot did exactly that to a real external contributor's unrelated DFlash PR
+        # (#768, reopened + apologized for immediately) before this comment/code existed. Score,
+        # label, comment -- never close. Only close_stale_museglimmer_prs() (inactivity-based,
+        # not verdict-based) may close a PR in this bot.
 
 
 def main():
