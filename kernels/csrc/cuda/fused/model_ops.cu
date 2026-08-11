@@ -3,6 +3,7 @@
 // Portable CUDA — runs on sm_89 .. sm_120 (RTX 5090).
 
 #include <cuda_bf16.h>
+#include <cstdio>
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
 #endif
@@ -155,8 +156,65 @@ __global__ void logit_softcap_kernel(float* __restrict__ logits, int vocab,
         L[v] = tanhf(L[v] * scale * inv_cap) * cap;
 }
 
+// DEBUG ONLY (Muse Glimmer bring-up, see fused.h). One block, tree reduction of sum-of-
+// squares -> L2 norm, plus the first 3 raw values, printed from thread 0 via device printf.
+__global__ void mg_debug_bf16_kernel(const __nv_bfloat16* __restrict__ x, int n,
+                                     int tag, int layer, int step) {
+    __shared__ float red[256];
+    float local = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = __bfloat162float(x[i]);
+        local += v * v;
+    }
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float v0 = n > 0 ? __bfloat162float(x[0]) : 0.f;
+        float v1 = n > 1 ? __bfloat162float(x[1]) : 0.f;
+        float v2 = n > 2 ? __bfloat162float(x[2]) : 0.f;
+        printf("[mgstage] step=%d layer=%d tag=%d n=%d l2=%.6f v0=%.6f v1=%.6f v2=%.6f\n",
+               step, layer, tag, n, sqrtf(red[0]), v0, v1, v2);
+    }
+}
+
+__global__ void mg_debug_f32_kernel(const float* __restrict__ x, int n,
+                                    int tag, int layer, int step) {
+    __shared__ float red[256];
+    float local = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = x[i];
+        local += v * v;
+    }
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float v0 = n > 0 ? x[0] : 0.f;
+        float v1 = n > 1 ? x[1] : 0.f;
+        float v2 = n > 2 ? x[2] : 0.f;
+        printf("[mgstage] step=%d layer=%d tag=%d n=%d l2=%.6f v0=%.6f v1=%.6f v2=%.6f\n",
+               step, layer, tag, n, sqrtf(red[0]), v0, v1, v2);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
+
+void launch_mg_debug_bf16(const void* x_bf16, int n, int tag, int layer, int step, cudaStream_t stream) {
+    mg_debug_bf16_kernel<<<1, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16), n, tag, layer, step);
+}
+
+void launch_mg_debug_f32(const float* x_f32, int n, int tag, int layer, int step, cudaStream_t stream) {
+    mg_debug_f32_kernel<<<1, 256, 0, stream>>>(x_f32, n, tag, layer, step);
+}
 
 void launch_embedding(const int* ids, const void* table, void* out,
                       int n_tokens, int hidden, cudaStream_t stream) {

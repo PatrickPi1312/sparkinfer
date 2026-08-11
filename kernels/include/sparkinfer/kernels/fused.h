@@ -122,4 +122,13 @@ void launch_qwen36_gated_norm_q8(const void* x_bf16, const void* z_bf16,
                                  int v_heads, int head_dim, float eps,
                                  cudaStream_t stream = nullptr);
 
+// DEBUG ONLY (Muse Glimmer bring-up): prints "[mgstage] step=.. layer=.. tag=.. n=..
+// l2=.. v0=.. v1=.. v2=.." via device printf. Capturable (no host sync), so it can be
+// dropped into a CUDA-graph-captured forward pass -- it fires once per launch/replay.
+// Gated at every call site behind SPARKINFER_MG_STAGE_DEBUG; safe to leave compiled in.
+void launch_mg_debug_bf16(const void* x_bf16, int n, int tag, int layer, int step,
+                          cudaStream_t stream = nullptr);
+void launch_mg_debug_f32(const float* x_f32, int n, int tag, int layer, int step,
+                         cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

@@ -153,6 +153,7 @@ struct Qwen35Model::Impl {
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
     bf16 *qraw = nullptr, *qgate = nullptr;
+    bf16 *dbg_xn_dump = nullptr;   // DEBUG ONLY (SPARKINFER_MG_STAGE_DEBUG): [n_layers, H] xn snapshot
     bf16 *lin_qkv = nullptr, *lin_q = nullptr, *lin_k = nullptr, *lin_v = nullptr;
     bf16 *lin_z = nullptr, *lin_alpha = nullptr, *lin_beta = nullptr;
     bf16 *lin_gdn = nullptr, *lin_norm = nullptr, *shared_gate_tmp = nullptr;
@@ -438,6 +439,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->d_shared_ids); cudaFree(p_->d_shared_w);
     // Qwen3.6 Gated-DeltaNet buffers (allocated only for the hybrid model)
     cudaFree(p_->qraw); cudaFree(p_->qgate);
+    cudaFree(p_->dbg_xn_dump);
     cudaFree(p_->lin_qkv); cudaFree(p_->lin_q); cudaFree(p_->lin_k); cudaFree(p_->lin_v);
     cudaFree(p_->lin_z); cudaFree(p_->lin_alpha); cudaFree(p_->lin_beta);
     cudaFree(p_->lin_gdn); cudaFree(p_->lin_norm); cudaFree(p_->lin_conv_state); cudaFree(p_->lin_state);
@@ -531,6 +533,42 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     int seqlen = position + 1;
     cudaStream_t st = s.stream;
     const bool dflash_cap = s.dflash_capture;
+
+    // DEBUG ONLY (Muse Glimmer bring-up bisection): SPARKINFER_MG_STAGE_DEBUG=1 dumps
+    // L2 norm + first 3 values of the residual stream at each pipeline stage, for every
+    // forward_token call. Forces a fresh capture+launch every step (never replays an old
+    // graph) so the "step" label baked into each debug kernel's launch params is always
+    // accurate -- acceptable perf hit for a short debug run only. Remove once the bug hunt
+    // concludes; harmless no-op (env unset) otherwise.
+    static int mg_dbg = -1;
+    if (mg_dbg < 0) { const char* e = getenv("SPARKINFER_MG_STAGE_DEBUG"); mg_dbg = (e && e[0] == '1') ? 1 : 0; }
+    const bool mgd = c.muse_glimmer && mg_dbg;
+    if (mgd && s.graph_ready) {
+        cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph);
+        s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
+    }
+    auto dbg_bf16 = [&](const void* p, int n, int tag, int layer) {
+        if (mgd) kernels::launch_mg_debug_bf16(p, n, tag, layer, position, st);
+    };
+    auto dbg_f32 = [&](const float* p, int n, int tag, int layer) {
+        if (mgd) kernels::launch_mg_debug_f32(p, n, tag, layer, position, st);
+    };
+    // DEBUG ONLY: SPARKINFER_MG_DUMP_STEP=<position> additionally raw-dumps tag=10 (this
+    // layer's pre-attn-norm xn) for EVERY layer at that one decode step into a [n_layers,H]
+    // bf16 device buffer, D2H-copied and written to SPARKINFER_MG_DUMP_FILE (default
+    // /tmp/mg_xn_dump.bin) right after this step's graph launch is synced. Lets a later-layer
+    // hypothesis be checked against a from-scratch Python reference seeded with sparkinfer's
+    // OWN xn for that layer, without needing to replicate every earlier layer.
+    static int dump_step = -2;
+    if (dump_step < -1) { const char* e = getenv("SPARKINFER_MG_DUMP_STEP"); dump_step = e ? atoi(e) : -1; }
+    const bool mgdump = mgd && dump_step == position;
+    if (mgdump && !s.dbg_xn_dump)
+        cu(cudaMalloc(&s.dbg_xn_dump, (size_t)(c.n_layers + 1) * H * sizeof(bf16)), "dbg_xn_dump alloc");
+    auto dbg_xn_snapshot = [&](const void* p, int layer) {
+        if (mgdump) cu(cudaMemcpyAsync(s.dbg_xn_dump + (size_t)layer * H, p, (size_t)H * sizeof(bf16),
+                                       cudaMemcpyDeviceToDevice, st), "dbg_xn_dump copy");
+    };
+
     s.h_scalars[0] = token_id;
     s.h_scalars[1] = position;
     s.h_scalars[2] = position;
@@ -721,8 +759,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
     kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
+    dbg_bf16(s.x, H, 0, -1);   // tag 0: post-embedding, pre emb_norm
     if (c.muse_glimmer && s.emb_norm_ones)
         kernels::launch_rmsnorm(s.x, s.emb_norm_ones, s.x, 1, H, c.rms_eps, st);
+    dbg_bf16(s.x, H, 1, -1);   // tag 1: post emb_norm
 
     int* btable = s.kv->block_table(s.active_seq_id);
     // GQA-8 sparse: materialize the sink+window compact view once per decode step (the
@@ -749,7 +789,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
-        bool xn_q8_ready = fnq && L > 0;
+        dbg_bf16(s.xn, H, 10, L);   // tag 10: pre-attn-norm output (this layer's normed input)
+        dbg_xn_snapshot(s.xn, L);
+        // xn_q8_ready assumes the PREVIOUS layer's tail already emitted Q8_1(this layer's xn)
+        // into s.aq81 as a side effect (true for architectures whose post-MoE tail runs
+        // launch_add_rmsnorm2_q8 / add_rmsnorm3_q8). Muse Glimmer's tail is the sandwich-norm
+        // pair launch_norm_then_add + a plain launch_rmsnorm (see the c.muse_glimmer branch
+        // below) -- neither emits a Q8 side channel. Trusting xn_q8_ready==true here for L>0
+        // left s.aq81 permanently stuck holding layer 0's Q8_1(xn): every K/V projection at
+        // L=1..n_layers-1 (both wk_type=12 Q4_K and wv_type=14 Q6_K route through proj_xn's
+        // mmvq_q4k/mmvq_q6k branches, which read s.aq81 unconditionally) ran against the wrong
+        // layer's quantized activation. Force a fresh quantize every layer for muse_glimmer.
+        bool xn_q8_ready = fnq && L > 0 && !c.muse_glimmer;
         auto prepare_xn_quant = [&](bool any_q4k, bool any_q6k, bool any_q80) {
             if (!s.gguf || !s.use_pq) return;
             if (xn_q8_ready) return;
@@ -956,6 +1007,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             const bool qkgate_fuse = w.q_has_gate && partial_rope && kv8 && s.use_qkfuse && H == 2048;
             if (w.q_has_gate && !qkgate_fuse)
                 kernels::launch_qwen36_split_q_gate(s.qraw, s.q, s.qgate, c.n_q_heads, c.head_dim, st);
+            dbg_bf16(s.q, s.qdim, 11, L);      // tag 11: Q, raw split, pre QK-norm
+            dbg_bf16(s.qgate, s.qdim, 12, L);  // tag 12: attn gate proj, pre-sigmoid
+            dbg_bf16(s.k, s.kvdim, 13, L);     // tag 13: K, raw, pre QK-norm
 
             if (!w.q_has_gate && !partial_rope && (s.use_attnin || kv8)) {
                 // Qwen3-MoE frontier: fused int8 QK-norm + RoPE + KV-append (unchanged vs main)
@@ -1003,6 +1057,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                         kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
                         kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
                     }
+                    dbg_bf16(s.q, s.qdim, 20, L);   // tag 20: Q, post QK-norm, pre-RoPE
+                    dbg_bf16(s.k, s.kvdim, 21, L);  // tag 21: K, post QK-norm, pre-RoPE
                     if (c.muse_glimmer && !w.swa) {
                         // Global/NoPE layer: no rotation at all (Q/K are already QK-normed
                         // above) -- append K/V as-is. Every 4th layer per sliding_window_pattern.
@@ -1012,6 +1068,25 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                         kernels::launch_rope_kv_append_partial(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
                                                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
                                                                c.rope_theta, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                    } else if (c.muse_glimmer) {
+                        // Muse Glimmer's SWA layers need "normal" (consecutive-pair,
+                        // LLAMA_ROPE_TYPE_NORM) rotation, NOT the NeoX (split-half) pairing
+                        // every other kernel below implements -- llama.cpp's own
+                        // llama_model_rope_type() puts LLM_ARCH_MUSE_GLIMMER in the same
+                        // LLAMA_ROPE_TYPE_NORM bucket as LLM_ARCH_LLAMA, while every arch this
+                        // codebase was actually built for (Qwen2/3/3MoE, Gemma) is
+                        // LLAMA_ROPE_TYPE_NEOX. Reusing launch_rope_kv_append here rotated the
+                        // wrong pair of dimensions together for every position > 0 (position 0
+                        // is a no-op rotation under either convention, which is why this hid
+                        // during the earliest single-token bring-up checks): Q/K stayed
+                        // well-formed but phase-wrong, so attention still produced a plausible
+                        // softmax over the wrong distribution instead of visibly breaking.
+                        // Unconditional (not gated on s.use_ropekv) so a SPARKINFER_ROPEKV=0
+                        // override can't silently fall through to the NeoX plain-launch_rope
+                        // path in the final else below.
+                        kernels::launch_rope_kv_append_normal(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
+                                                              c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
+                                                              s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     } else if (s.use_ropekv) {
                         kernels::launch_rope_kv_append(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
                                                        c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
@@ -1021,6 +1096,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                         launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, btable, s.d_writepos, 1,
                                          c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
                     }
+                    dbg_bf16(s.q, s.qdim, 22, L);   // tag 22: Q, post RoPE-or-passthrough (SDPA input)
+                    dbg_bf16(s.k, s.kvdim, 23, L);  // tag 23: K, post RoPE-or-passthrough (SDPA input)
                 }
             }
 
@@ -1082,8 +1159,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                                                kscale, vscale, kv8 ? 1 : 0,
                                                attn_gate_q8 ? s.qgate : nullptr);
             }
+            dbg_bf16(s.attn, s.qdim, 30, L);   // tag 30: SDPA output, pre-gate
             if (w.q_has_gate && !attn_gate_q8)
                 kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
+            dbg_bf16(s.attn, s.qdim, 31, L);   // tag 31: SDPA output, post sigmoid-gate
 
             // ---- O projection (main's int8 mmvq path) ----
             if (s.gguf && s.use_pq && w.wo_type == 12) {
@@ -1102,6 +1181,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
             else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
             else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
+            dbg_bf16(s.ao, H, 40, L);   // tag 40: attn_o_proj output (post wo)
         }
 
         if (c.muse_glimmer) {
@@ -1109,8 +1189,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // output alone, not the sum -- see launch_norm_then_add), then hn = RMSNorm(h,
             // ffn_norm) is a genuine separate pre-FFN norm, not post_attn_norm doing double
             // duty like every other architecture here.
-            kernels::launch_norm_then_add(s.x, s.ao, w.post_attn_norm, s.h, 1, H, c.rms_eps, st);
+            //
+            // The sandwich (post_attn_norm/post_ffn_norm) RMSNorm uses its OWN eps (1e-8,
+            // upstream's `post_norm_eps` in muse-glimmer.cpp), distinct from the model's
+            // normal rms_eps (1e-5, used for attn_norm/ffn_norm/q_norm/k_norm) -- reusing
+            // c.rms_eps here silently gives wrong post-attn/post-ffn norms.
+            kernels::launch_norm_then_add(s.x, s.ao, w.post_attn_norm, s.h, 1, H, 1e-8f, st);
+            dbg_bf16(s.h, H, 50, L);   // tag 50: h = x + sandwich_norm(ao)  (post-attn residual)
             kernels::launch_rmsnorm(s.h, w.ffn_norm, s.hn, 1, H, c.rms_eps, st);
+            dbg_bf16(s.hn, H, 51, L);  // tag 51: hn = pre-FFN norm(h)
         } else if (fnq) {
             // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm). When fnq, also emit
             // Q8_1(hn) into aq81 so the MoE gate/up mmvq skips its own quantize node (the
@@ -1193,11 +1280,24 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         if (c.dense_ffn) {
             // Qwen3.5 dense SwiGLU: keep gate/up/down quantized and run the same MMVQ
             // expert-FFN path as MoE decode — bf16 dequant+GEMV diverged ~40pp vs llama.cpp.
+            //
+            // input_q8 must be a valid Q8_1 quantization of s.hn (the FFN's actual input) or
+            // null (letting the kernel quantize s.hn itself). `fnq` only guarantees that for
+            // architectures whose post-attention step runs launch_add_rmsnorm2_q8, which emits
+            // Q8_1(hn) as a side effect of computing hn. Muse Glimmer's sandwich norm does not:
+            // its post-attn step is launch_norm_then_add (writes s.h, no Q8 emission) followed
+            // by a plain launch_rmsnorm into s.hn (see the c.muse_glimmer branch above) -- s.aq81
+            // at this point still holds Q8_1(xn) from this same layer's QKV-input quantize
+            // (prepare_xn_quant, earlier in this iteration), not Q8_1(hn). Passing that stale
+            // buffer here fed the gate/up MMVQ kernel the wrong activation vector entirely:
+            // garbage FFN output that still looked like a confident (but wrong) distribution
+            // downstream, rather than crashing or NaN-ing. Force nullptr for muse_glimmer so
+            // launch_moe_expert_ffn_q4k quantizes s.hn fresh instead of trusting the stale cache.
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
                                                1, c.top_k, H, c.moe_ffn,
-                                               fnq ? s.aq81 : nullptr, st);
+                                               (fnq && !c.muse_glimmer) ? s.aq81 : nullptr, st);
         } else if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
             // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
@@ -1320,13 +1420,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             else launch_residual_add(s.routed, s.shared, s.routed, H, st);
         }
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+        dbg_bf16(s.routed, H, 60, L);   // tag 60: routed = dense FFN(hn) output, pre sandwich-norm
         if (c.muse_glimmer) {
             // Sandwich norm: x = h + RMSNorm(routed) * post_ffn_norm (norm the FFN output
             // alone, not the sum -- mirrors the post-attention step above). No shared
             // expert on this architecture (dense_ffn, n_shared=0), so shared_to_fold is
             // always null here. xn = RMSNorm(x, nextnorm) is the next layer's ordinary
             // pre-attn norm (or final_norm on the last layer), unaffected by the sandwich.
-            kernels::launch_norm_then_add(s.h, s.routed, w.post_ffn_norm, s.x, 1, H, c.rms_eps, st);
+            // Same 1e-8 post_norm_eps as the post-attn sandwich norm above -- see that comment.
+            kernels::launch_norm_then_add(s.h, s.routed, w.post_ffn_norm, s.x, 1, H, 1e-8f, st);
+            dbg_bf16(s.x, H, 70, L);   // tag 70: x = h + sandwich_norm(routed)  (layer output)
             kernels::launch_rmsnorm(s.x, nextnorm, s.xn, 1, H, c.rms_eps, st);
         } else if (shared_to_fold) {
             if (fnq)
@@ -1340,6 +1443,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         dflash_maybe_capture_layer(L);
     }
     // xn now holds RMSNorm(x_final, final_norm)
+    dbg_bf16(s.xn, H, 80, -2);   // tag 80: final-norm output (lm_head input)
+    dbg_xn_snapshot(s.xn, c.n_layers);   // extra slot: final-norm output, for lm_head cross-check
     if (!sample) {
         if (capturing_graph) {
             cu(cudaStreamEndCapture(st, &s.cu_prefill_graph), "end prefill capture");
@@ -1351,19 +1456,31 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         cu(cudaStreamSynchronize(st), "prefill sync");
         return token_id;
     }
+    // Third instance of the same stale-Q8_1-cache pattern as prepare_xn_quant's xn_q8_ready
+    // (L>0) and the dense_ffn gate/up input above: `fnq` only promises aq81==Q8_1(xn) here
+    // because the fnq path's final-layer tail is launch_add_rmsnorm2_q8/add_rmsnorm3_q8,
+    // which writes xn AND emits Q8_1(xn) into aq81 as a side effect. Muse Glimmer's final-
+    // layer tail is the c.muse_glimmer sandwich-norm branch above (launch_norm_then_add then
+    // a plain launch_rmsnorm into s.xn) -- no Q8 side channel. `fnq` itself doesn't check
+    // c.muse_glimmer (it's just s.gguf/use_fnq/use_pq/use_llama), so with fnq true this
+    // silently fed the LM head a stale aq81 left over from the last layer's fresh
+    // prepare_xn_quant(xn) quantize (a *different*, pre-final-norm activation vector) --
+    // wrong logits on every single decode step. Force a fresh quantize for muse_glimmer.
     if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
-        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
+        if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
         kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
     else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
-        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
+        if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
         kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
     else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
     else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
     else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
+    dbg_f32(s.logits, c.vocab, 90, -2);   // tag 90: raw logits (pre logit_scale/softcap)
     if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
         kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
+    dbg_f32(s.logits, c.vocab, 91, -2);   // tag 91: final logits (post logit_scale/softcap)
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
@@ -1404,6 +1521,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
 
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
     cu(cudaStreamSynchronize(st), "sync");
+    if (mgdump) {
+        std::vector<bf16> host((size_t)(c.n_layers + 1) * H);
+        cu(cudaMemcpy(host.data(), s.dbg_xn_dump, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
+           "dbg_xn_dump readback");
+        const char* path = getenv("SPARKINFER_MG_DUMP_FILE");
+        FILE* f = fopen(path ? path : "/tmp/mg_xn_dump.bin", "wb");
+        if (f) { fwrite(host.data(), sizeof(bf16), host.size(), f); fclose(f); }
+        fprintf(stderr, "[mg-debug] dumped xn[layer,H=%d] for step=%d, %d layers -> %s\n",
+                H, position, c.n_layers, path ? path : "/tmp/mg_xn_dump.bin");
+    }
     return *s.h_out_id;
 }
 
@@ -2476,7 +2603,14 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 "cache are sized correctly.\n");
         return false;
     }
-    if (hybrid_file || s.cfg.dense_ffn) {
+    // Qwythos/Qwen3.6 hybrid-file backfill: assumes any dense-FFN or hybrid-detected GGUF
+    // wants the Gated-DeltaNet SSM interleave (full_attn_interval defaulted to 4). Muse
+    // Glimmer is also a dense-FFN GGUF (dense_file=true) but has NO linear/SSM layers at
+    // all -- museglimmer_config_from_gguf already set every one of these fields correctly
+    // (full_attn_interval=0 deliberately, to keep is_linear_layer() false for every layer),
+    // so skip this backfill for it rather than let full_attn_interval<=0 get overwritten to
+    // 4 and misroute layer 0 into looking for attn_qkv.weight/ssm_* tensors that don't exist.
+    if ((hybrid_file || s.cfg.dense_ffn) && !s.cfg.muse_glimmer) {
         s.cfg.hybrid = true;
         if (dense_file) s.cfg.dense_ffn = true;
         if (s.cfg.full_attn_interval <= 0) s.cfg.full_attn_interval = 4;
@@ -2812,6 +2946,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         Qwen35LayerWeights& w = s.w.layers[i];
         w.linear_attn = is_linear_layer(c, i);
         w.swa = (i < (int)c.swa_layers.size()) ? c.swa_layers[i] : false;
+        if (c.muse_glimmer && getenv("SPARKINFER_MG_DEBUG"))
+            fprintf(stderr, "[mg-debug] layer %d: linear_attn=%d swa=%d full_attn_interval=%d hybrid=%d\n",
+                    i, (int)w.linear_attn, (int)w.swa, c.full_attn_interval, (int)c.hybrid);
         if (!expect_dims(b + "attn_norm.weight", {H})) return false;
         w.input_norm = dense(b + "attn_norm.weight", false);
         if (w.linear_attn) {
@@ -2854,6 +2991,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 if (!qd || !gd) return false;
                 void* combined = nullptr;
                 cu(cudaMalloc(&combined, (size_t)s.qdim * 2 * H * sizeof(bf16)), "qgate interleave alloc");
+                // cu() only logs CUDA errors, it never aborts -- unlike qd/gd above, nothing
+                // downstream checks `combined` before using it. On a real cudaMalloc failure
+                // (OOM; trivially reproducible by running this load under compute-sanitizer,
+                // whose shadow-memory overhead multiplies every allocation) `combined` stays
+                // null/stale and launch_interleave_qgate_rows below writes through it --
+                // out-of-bounds device writes rather than a clean load failure.
+                if (!combined) return false;
                 kernels::launch_interleave_qgate_rows(qd, gd, combined, c.n_q_heads, c.head_dim, H, s.stream);
                 cu(cudaStreamSynchronize(s.stream), "qgate interleave sync");
                 s.owned.push_back(combined);

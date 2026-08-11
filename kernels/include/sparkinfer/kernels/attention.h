@@ -45,6 +45,16 @@ void launch_rope_kv_append(
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, float theta,
     int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
 
+// Same as launch_rope_kv_append, but "normal" (consecutive-pair, LLAMA_ROPE_TYPE_NORM) rotation
+// instead of NeoX (split-half) pairing. Muse Glimmer is LLAMA_ROPE_TYPE_NORM in llama.cpp's own
+// architecture table (same bucket as LLM_ARCH_LLAMA) -- every other arch in this codebase
+// (Qwen2/3/3MoE, Gemma) is LLAMA_ROPE_TYPE_NEOX, which is what launch_rope_kv_append implements.
+void launch_rope_kv_append_normal(
+    void* q, const void* k, const void* v, void* k_pool, void* v_pool,
+    const int* block_table, const int* positions,
+    int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, float theta,
+    int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr);
+
 // Fused QK-norm + partial-RoPE + KV-append for Qwen3.6 full-attn (gated, rope_dim < head_dim).
 void launch_qknorm_rope_kv_partial(
     void* q, void* k, const void* v, const void* q_w, const void* k_w,

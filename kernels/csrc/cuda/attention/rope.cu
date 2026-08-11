@@ -120,6 +120,68 @@ __global__ void rope_kv_append_kernel(
     }
 }
 
+// Same fused RoPE + KV-append as rope_kv_append_kernel above, but "normal" (GGML_ROPE_TYPE_NORM
+// / llama.cpp's LLAMA_ROPE_TYPE_NORM) pairing: consecutive elements (2i, 2i+1) rotated together,
+// NOT the NeoX (i, i+half) split-half pairing every other kernel in this file uses.
+//
+// Muse Glimmer (see llama.cpp src/models/muse-glimmer.cpp, ggml_rope_ext with the default/NORM
+// mode) is the one architecture in this codebase that needs this: llama.cpp's own
+// llama_model_rope_type() table puts LLM_ARCH_MUSE_GLIMMER in the LLAMA_ROPE_TYPE_NORM bucket
+// (same bucket as LLM_ARCH_LLAMA itself), while every Qwen arch this codebase was built around
+// (QWEN2/QWEN3/QWEN3MOE, and GEMMA/GEMMA2/GEMMA3 for that matter) is LLAMA_ROPE_TYPE_NEOX. Every
+// existing RoPE kernel here was written for the Qwen family, so reusing rope_kv_append_kernel for
+// Muse Glimmer's SWA layers rotated the wrong pair of dimensions together for every position > 0
+// (position 0 is a no-op rotation either way, which hid this during the earliest bring-up steps).
+// The Q/K vectors stayed well-formed (no NaN, no garbage magnitude) but encoded the wrong phase,
+// so attention still produced a plausible-looking softmax over the wrong distribution -- confident
+// but wrong, exactly the "not comparable" failure mode this whole bring-up has been chasing.
+__global__ void rope_kv_append_normal_kernel(
+    __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ k_pool, __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ block_table, const int* __restrict__ positions,
+    int n_q_heads, int n_kv_heads, int head_dim, float theta,
+    int block_size, int max_blocks_per_seq
+) {
+    const int tok  = blockIdx.y;
+    const int half = head_dim >> 1;
+    const int nq = n_q_heads  * half;        // Q rotated pairs
+    const int nk = n_kv_heads * half;        // K rotated pairs
+    const int nv = n_kv_heads * head_dim;    // V elements (no rope)
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= nq + nk + nv) return;
+
+    const int pos    = positions[tok];
+    const int blk    = pos / block_size;
+    const int within = pos % block_size;
+    const int phys   = block_table[tok * max_blocks_per_seq + blk];
+    const size_t ctok = (size_t)(phys * block_size + within);   // cache token slot
+
+    if (gid < nq) {                          // Q: rope in place, pair (2i, 2i+1)
+        const int hh = gid / half, i = gid - hh * half;
+        const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const size_t base = ((size_t)(tok * n_q_heads + hh)) * head_dim + 2 * i;
+        const float x0 = __bfloat162float(q[base]), x1 = __bfloat162float(q[base + 1]);
+        q[base]     = __float2bfloat16(x0 * c - x1 * s);
+        q[base + 1] = __float2bfloat16(x0 * s + x1 * c);
+    } else if (gid < nq + nk) {              // K: rope, write straight to the cache
+        const int g = gid - nq, hh = g / half, i = g - hh * half;
+        const float freq = __powf(theta, -2.f * (float)i / (float)head_dim);
+        const float ang = (float)pos * freq, c = __cosf(ang), s = __sinf(ang);
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim + 2 * i;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim + 2 * i;
+        const float x0 = __bfloat162float(k[base]), x1 = __bfloat162float(k[base + 1]);
+        k_pool[dst]     = __float2bfloat16(x0 * c - x1 * s);
+        k_pool[dst + 1] = __float2bfloat16(x0 * s + x1 * c);
+    } else {                                 // V: copy to the cache (no rope)
+        const int g = gid - nq - nk, hh = g / head_dim, d = g - hh * head_dim;
+        const size_t base = ((size_t)(tok * n_kv_heads + hh)) * head_dim;
+        const size_t dst  = (ctok * n_kv_heads + hh) * head_dim;
+        v_pool[dst + d] = v[base + d];
+    }
+}
+
 // Fused per-head QK-norm + RoPE + KV-append: ONE kernel replacing rmsnorm_qk + rope_kv_append.
 // grid = (n_q_heads + 2*n_kv_heads, n_tokens); blockDim = head_dim (one block per head).
 //   blocks [0, n_q_heads)                 : Q head -> RMSNorm(q_w) + RoPE in place
@@ -768,6 +830,22 @@ void launch_rope_kv_append(void* q, const void* k, const void* v, void* k_pool, 
     const int total = n_q_heads * half + n_kv_heads * half + n_kv_heads * head_dim;
     dim3 grid((total + 255) / 256, n_tokens);
     rope_kv_append_kernel<<<grid, 256, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v),
+        reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
+        block_table, positions, n_q_heads, n_kv_heads, head_dim, theta, block_size, max_blocks_per_seq);
+}
+
+// "Normal" (consecutive-pair, LLAMA_ROPE_TYPE_NORM) counterpart of launch_rope_kv_append above --
+// see rope_kv_append_normal_kernel for why Muse Glimmer needs this instead of the NeoX kernel.
+void launch_rope_kv_append_normal(void* q, const void* k, const void* v, void* k_pool, void* v_pool,
+                                  const int* block_table, const int* positions,
+                                  int n_tokens, int n_q_heads, int n_kv_heads, int head_dim, float theta,
+                                  int block_size, int max_blocks_per_seq, cudaStream_t stream) {
+    const int half = head_dim >> 1;
+    const int total = n_q_heads * half + n_kv_heads * half + n_kv_heads * head_dim;
+    dim3 grid((total + 255) / 256, n_tokens);
+    rope_kv_append_normal_kernel<<<grid, 256, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
         reinterpret_cast<const __nv_bfloat16*>(v),
         reinterpret_cast<__nv_bfloat16*>(k_pool), reinterpret_cast<__nv_bfloat16*>(v_pool),
