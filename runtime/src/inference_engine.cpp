@@ -30,6 +30,11 @@ bool batched_prefill_enabled(const Qwen35Config& cfg, bool gguf, int n_tokens) {
         batched_maxctx = mc ? atoi(mc) : 131072;
     }
     const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
+    // Muse Glimmer: the batched-prefill full-attention kernels have no per-layer sliding-
+    // window/NoPE hook yet (see the matching note in Qwen35Model::batched_prefill_enabled,
+    // qwen35.cpp) -- force the token-loop path, which reuses forward_token()'s correct
+    // per-layer dispatch, until a windowed batched-prefill kernel exists.
+    if (cfg.muse_glimmer) return false;
     return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
            n_tokens <= batched_maxctx;
 }

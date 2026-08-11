@@ -1407,6 +1407,15 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
     // MoE requirements (256 experts, quantized experts + router) itself and returns -1 to
     // fall back if unsupported.
     const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
+    // Muse Glimmer: prefill_batched_run's full-attention branch (launch_prefill_qknorm_rope_
+    // kv_int8, launch_prefill_attn_int8_paged) always applies RoPE over the whole sequence
+    // with no windowing hook -- correct for Qwen3.6/Qwythos (every full-attn layer there is
+    // genuinely global), wrong for Muse Glimmer's per-layer sliding-window/NoPE pattern.
+    // Route through the token-loop prefill instead, which calls forward_token() per position
+    // and so reuses the same per-layer swa/NoPE dispatch already wired into decode. Slower
+    // (sequential, not batched GEMM) but correct; a windowed batched-prefill kernel is a
+    // valid follow-up once plain generation is validated, not a blocker for it.
+    if (cfg.muse_glimmer) return false;
     return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
            n_tokens <= batched_maxctx;
 }
