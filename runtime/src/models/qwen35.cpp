@@ -43,6 +43,15 @@ namespace {
 inline void cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) fprintf(stderr, "[qwen35] %s: %s\n", what, cudaGetErrorString(e));
 }
+// SPARKINFER_MUSE_FUSE_TAIL=0 splits Muse Glimmer's sandwich-norm tail back into the original
+// launch_norm_then_add + launch_rmsnorm pair (the two produce bit-identical output).
+inline bool muse_fuse_tail() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_MUSE_FUSE_TAIL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 using bf16 = unsigned short;
 
 // forward_token() sentinel: the decode graph was enqueued but not yet collected. Never a valid
@@ -1206,9 +1215,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // upstream's `post_norm_eps` in muse-glimmer.cpp), distinct from the model's
             // normal rms_eps (1e-5, used for attn_norm/ffn_norm/q_norm/k_norm) -- reusing
             // c.rms_eps here silently gives wrong post-attn/post-ffn norms.
+            // Both halves of the sandwich tail are single-CTA kernels over 6656 elements, so each
+            // costs ~3.2 us of launch/reduction latency for 13 KB of traffic. Fuse them.
+            if (muse_fuse_tail())
+                kernels::launch_muse_sandwich_tail(s.x, s.ao, w.post_attn_norm, w.ffn_norm,
+                                                   s.h, s.hn, 1, H, 1e-8f, c.rms_eps, st);
+            else {
             kernels::launch_norm_then_add(s.x, s.ao, w.post_attn_norm, s.h, 1, H, 1e-8f, st);
             dbg_bf16(s.h, H, 50, L);   // tag 50: h = x + sandwich_norm(ao)  (post-attn residual)
             kernels::launch_rmsnorm(s.h, w.ffn_norm, s.hn, 1, H, c.rms_eps, st);
+            }
             dbg_bf16(s.hn, H, 51, L);  // tag 51: hn = pre-FFN norm(h)
         } else if (fnq) {
             // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm). When fnq, also emit
@@ -1440,9 +1456,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             // always null here. xn = RMSNorm(x, nextnorm) is the next layer's ordinary
             // pre-attn norm (or final_norm on the last layer), unaffected by the sandwich.
             // Same 1e-8 post_norm_eps as the post-attn sandwich norm above -- see that comment.
+            if (muse_fuse_tail())
+                kernels::launch_muse_sandwich_tail(s.h, s.routed, w.post_ffn_norm, nextnorm,
+                                                   s.x, s.xn, 1, H, 1e-8f, c.rms_eps, st);
+            else {
             kernels::launch_norm_then_add(s.h, s.routed, w.post_ffn_norm, s.x, 1, H, 1e-8f, st);
             dbg_bf16(s.x, H, 70, L);   // tag 70: x = h + sandwich_norm(routed)  (layer output)
             kernels::launch_rmsnorm(s.x, nextnorm, s.xn, 1, H, c.rms_eps, st);
+            }
         } else if (shared_to_fold) {
             if (fnq)
                 kernels::launch_add_rmsnorm3_q8(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
@@ -2696,10 +2717,15 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                name.find(".attn_v.weight") != std::string::npos ||
                name.find(".attn_output.weight") != std::string::npos;
     };
-    auto dev_quant_requant_q4k = [&](const std::string& name, int& qtype, bool req) -> const void* {
+    // allow_q5k is opt-in per call site, NOT a widening of the default set: dev_quant_down() also
+    // routes through here with requant on by default, so accepting Q5_K unconditionally would
+    // silently requantize the dense-FFN down tensor of any model that ships one.
+    auto dev_quant_requant_q4k = [&](const std::string& name, int& qtype, bool req,
+                                     bool allow_q5k = false) -> const void* {
         const void* q6 = dev_quant(name, qtype);
-        if (!req || (qtype != 14 && qtype != 8) || !q6) return q6;
-        const int src_type = qtype;            // 14 (Q6_K) or 8 (Q8_0) -> Q4_K
+        const bool src_ok = (qtype == 14 || qtype == 8 || (allow_q5k && qtype == 13));
+        if (!req || !src_ok || !q6) return q6;
+        const int src_type = qtype;            // 14 (Q6_K), 8 (Q8_0) or 13 (Q5_K) -> Q4_K
         const GGUFTensor* t = g.tensor(name);
         const long nv = t->n_values;
         if (nv % 256 != 0) return q6;
@@ -2909,10 +2935,20 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
     };
+    // Muse Glimmer ships output.weight as Q5_K -- the only Q5_K tensor in the file -- and Q5_K was
+    // not on this list, so the head fell through to `dense()` and was dequantized to bf16. The
+    // decode LM head then read 2.69 GB every token (gemv_f32_sk) instead of 0.76 GB through the
+    // Q4_K MMVQ path: 1.60 ms of a 12.4 ms step. Requanting it to Q4_K at load is the same
+    // mechanism this codebase already applies to other models' heads (SPARKINFER_LMHEAD_REQUANT_Q4K).
+    static const bool mg_lm_q5k = [] {
+        const char* e = getenv("SPARKINFER_MUSE_LMHEAD_Q5K");
+        return !(e && e[0] == '0');
+    }();
     auto lm_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
-            return dev_quant_requant_q4k(name, type, req_lm_q4);
+        const bool q5k_ok = mg_lm_q5k && s.cfg.muse_glimmer && t && t->ggml_type == 13;
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8 || q5k_ok))
+            return dev_quant_requant_q4k(name, type, req_lm_q4 || q5k_ok, q5k_ok);
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {
