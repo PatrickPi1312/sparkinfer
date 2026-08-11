@@ -21,12 +21,16 @@ Scoring, same-box PR-vs-main on a single pinned GPU:
               here). A PR that fails this bar is REJECTed regardless of speed — speed is
               meaningless if a PR silently breaks a still-fragile architecture's correctness.
 
-Applies ONLY `eval-museglimmer:<TIER>` — deliberately NOT mirrored to the generic `eval:*`
-label pr_dflash_bot.py also sets (see apply_result() for why). Auto-merge is wired but inert
-unless SPARKINFER_MUSEGLIMMER_AUTOMERGE=1 is explicitly set (not in .env.eval by default).
-No Qwen3.5/Qwen3.6/Qwythos cross-model guard — that safety net is a pushed backup branch
-(backup/qwen-model-optimization-20260811 @ 6d911d4) instead of a per-PR check, per explicit
-scope decision.
+Applies `eval-museglimmer:<TIER>` AND mirrors it to the generic `eval:<TIER>` label (SN74
+scoring reads eval:* tiers) — explicit user decision, 2026-08-11; originally NOT mirrored given
+Muse Glimmer's youth at the time, see git history on apply_result() for that reasoning. Auto-
+close on none/REJECT and auto-merge on a verified speedup are both live (SPARKINFER_MUSEGLIMMER_
+AUTOMERGE=1 in .env.eval) — same policy as pr_dflash_bot.py, also an explicit user decision
+after this bot's first live run wrongly auto-closed an unrelated PR (#768, reopened +
+apologized); the user was told the risk directly and chose to accept it rather than narrow the
+evaluation scope. No Qwen3.5/Qwen3.6/Qwythos cross-model guard — that safety net is a pushed
+backup branch (backup/qwen-model-optimization-20260811 @ 6d911d4) instead of a per-PR check,
+per explicit scope decision.
 
   python eval/pr_museglimmer_bot.py --instance 46074104
   python eval/pr_museglimmer_bot.py --only-prs 636 --reeval
@@ -995,15 +999,13 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         return
     strip_museglimmer_eval_labels(repo, num)
     arb.add_label(repo, num, f"{EVAL_PREFIX}{label}")
-    # Deliberately NOT mirrored to the generic `eval:*` label (unlike pr_dflash_bot.py, which
-    # mirrors eval-dflash:* -> eval:* because SN74 scoring reads eval:* tiers). Muse Glimmer has
-    # 4 fresh correctness fixes from THIS session and zero production track record; whether its
-    # submissions should count toward that live incentive mechanism hasn't been asked of the
-    # user. Safe default until that's an explicit decision: only eval-museglimmer:* is set. To
-    # enable mirroring later, add (mirroring pr_dflash_bot.py's apply_result exactly):
-    #   for lab in {l for l in arb.labels_on(repo, num) if l.startswith("eval:")}:
-    #       arb.remove_label(repo, num, lab)
-    #   arb.add_label(repo, num, f"eval:{label}")
+    # Mirrored to the generic `eval:*` label, same as pr_dflash_bot.py -- SN74 scoring reads
+    # eval:* tiers, so this makes Muse Glimmer submissions count toward that live incentive
+    # mechanism. Explicit user decision, 2026-08-11 (originally deliberately NOT mirrored, given
+    # Muse Glimmer's youth at the time -- see git history on this line for that reasoning).
+    for lab in {l for l in arb.labels_on(repo, num) if l.startswith("eval:")}:
+        arb.remove_label(repo, num, lab)
+    arb.add_label(repo, num, f"eval:{label}")
     arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
     if res.get("ok"):
         upload_museglimmer_eval_log(repo, num, title, commit, res)
