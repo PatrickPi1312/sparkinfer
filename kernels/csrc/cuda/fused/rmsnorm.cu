@@ -359,6 +359,67 @@ __global__ void add_rmsnorm3_kernel(const __nv_bfloat16* __restrict__ x,
         out_norm[base + c] = __float2bfloat16(__bfloat162float(out_sum[base + c]) * inv_rms * __bfloat162float(weight[c]));
 }
 
+// Sandwich-norm residual add: out[i] = residual[i] + RMSNorm(block_out)[i] * weight[i].
+// Every other kernel in this file norms the SUM (x + residual) -- standard pre-norm reuse,
+// where the norm doubles as the next sub-block's input norm. This is the opposite order:
+// block_out (the attention or FFN sub-block's raw output, before any residual add) is
+// normalized ALONE first, and only the normalized result is added back into the residual
+// stream. Gemma2/Muse-Glimmer-style sandwich norm -- used for both the post-attention and
+// post-FFN norm steps (same operation, different block_out/weight).
+__global__ void norm_then_add_kernel(const __nv_bfloat16* __restrict__ residual,
+                                     const __nv_bfloat16* __restrict__ block_out,
+                                     const __nv_bfloat16* __restrict__ weight,
+                                     __nv_bfloat16* __restrict__ out,
+                                     int rows, int cols, float eps) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const size_t base = (size_t)row * cols;
+    __shared__ float s_warp[32];
+    const int npack = cols >> 3;
+    const int tail = npack << 3;
+    const uint4* b4 = reinterpret_cast<const uint4*>(block_out + base);
+
+    float ss = 0.f;
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float bv[8]; rn_unpack8(__ldg(b4 + p), bv);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ss = __fmaf_rn(bv[j], bv[j], ss);
+    }
+    for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
+        float v = __bfloat162float(block_out[base + c]);
+        ss = __fmaf_rn(v, v, ss);
+    }
+    ss = rn_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp[threadIdx.x] : 0.f;
+        v = rn_warp_sum(v);
+        if (threadIdx.x == 0) s_warp[0] = rsqrtf(v / cols + eps);
+    }
+    __syncthreads();
+    const float inv_rms = s_warp[0];
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(weight);
+    const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
+    uint4* o4 = reinterpret_cast<uint4*>(out + base);
+    for (int p = threadIdx.x; p < npack; p += blockDim.x) {
+        float bv[8]; rn_unpack8(__ldg(b4 + p), bv);
+        float rv[8]; rn_unpack8(__ldg(r4 + p), rv);
+        float wv[8]; rn_unpack8(__ldg(w4 + p), wv);
+        float ov[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) ov[j] = rv[j] + bv[j] * inv_rms * wv[j];
+        o4[p] = rn_pack8(ov);
+    }
+    for (int c = tail + threadIdx.x; c < cols; c += blockDim.x) {
+        float bv = __bfloat162float(block_out[base + c]);
+        float rv = __bfloat162float(residual[base + c]);
+        float wv = __bfloat162float(weight[c]);
+        out[base + c] = __float2bfloat16(rv + bv * inv_rms * wv);
+    }
+}
+
 // Fused per-head Q-norm + K-norm: ONE kernel over (n_q_heads + n_kv_heads) heads
 // (each block normalizes one head), vs two launch_rmsnorm calls. 1 graph node saved.
 __global__ void rmsnorm_qk_kernel(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
@@ -475,6 +536,15 @@ void launch_add_rmsnorm3_q8_rows(const void* x, const void* res1, const void* re
         reinterpret_cast<const __nv_bfloat16*>(res2), reinterpret_cast<const __nv_bfloat16*>(weight),
         reinterpret_cast<__nv_bfloat16*>(out_sum), reinterpret_cast<__nv_bfloat16*>(out_norm),
         reinterpret_cast<si_blk_q8_1*>(out_q8), cols, eps);
+}
+
+void launch_norm_then_add(const void* residual, const void* block_out, const void* weight,
+                          void* out, int rows, int cols, float eps, cudaStream_t stream) {
+    norm_then_add_kernel<<<rows, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(residual),
+        reinterpret_cast<const __nv_bfloat16*>(block_out),
+        reinterpret_cast<const __nv_bfloat16*>(weight),
+        reinterpret_cast<__nv_bfloat16*>(out), rows, cols, eps);
 }
 
 void launch_add_rmsnorm3(const void* x, const void* res1, const void* res2, const void* weight,

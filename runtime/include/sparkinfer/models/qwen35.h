@@ -26,9 +26,21 @@ struct Qwen35LayerWeights {
     const void* q_norm = nullptr;        // [head_dim]
     const void* k_norm = nullptr;        // [head_dim]
     const void* post_attn_norm = nullptr;// [hidden]
-    // Muse Glimmer sandwich norm: post_attn_norm above covers the attention side; this
-    // covers the FFN side (applied to the FFN output before the residual add, same
-    // "norm then add" shape as post_attn_norm -- see qwen35.cpp's sandwich-norm kernels).
+    // Muse Glimmer sandwich norm -- FOUR distinct norm weights per layer, vs the two
+    // (input_norm, post_attn_norm double-duty as the FFN's pre-norm) every other
+    // architecture here uses:
+    //   input_norm       existing field -- pre-attention norm ("attn_norm" tensor)
+    //   post_attn_norm   existing field, repurposed -- sandwich norm on the attention
+    //                    output ("post_attention_norm" tensor), added to the residual via
+    //                    launch_norm_then_add rather than being norm'd itself like every
+    //                    other model's post_attn_norm usage
+    //   ffn_norm         new -- genuine pre-FFN norm ("ffn_norm" tensor). Other
+    //                    architectures reuse post_attn_norm for this (one norm serves as
+    //                    both "post-attention" and "pre-FFN" since there's no sandwich
+    //                    step between them); Muse Glimmer ships both as distinct tensors.
+    //   post_ffn_norm    new -- sandwich norm on the FFN output ("post_ffw_norm" tensor),
+    //                    added to the residual the same way post_attn_norm now is.
+    const void* ffn_norm = nullptr;      // [hidden]
     const void* post_ffn_norm = nullptr; // [hidden]
     const void* router_w = nullptr;      // [hidden, n_experts]
     int router_w_type = 0;              // ggml_type when router_w is kept quantized (0 = bf16 dense)

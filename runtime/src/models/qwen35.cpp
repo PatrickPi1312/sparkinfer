@@ -1095,12 +1095,21 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
         }
 
-        // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm). When fnq, also emit Q8_1(hn) into
-        // aq81 so the MoE gate/up mmvq skips its own quantize node (the router below reads bf16 hn).
-        if (fnq)
+        if (c.muse_glimmer) {
+            // Sandwich norm: h = x + RMSNorm(ao) * post_attn_norm (norm the attention
+            // output alone, not the sum -- see launch_norm_then_add), then hn = RMSNorm(h,
+            // ffn_norm) is a genuine separate pre-FFN norm, not post_attn_norm doing double
+            // duty like every other architecture here.
+            kernels::launch_norm_then_add(s.x, s.ao, w.post_attn_norm, s.h, 1, H, c.rms_eps, st);
+            kernels::launch_rmsnorm(s.h, w.ffn_norm, s.hn, 1, H, c.rms_eps, st);
+        } else if (fnq) {
+            // fused: h = x + ao ; hn = RMSNorm(h, post_attn_norm). When fnq, also emit
+            // Q8_1(hn) into aq81 so the MoE gate/up mmvq skips its own quantize node (the
+            // router below reads bf16 hn).
             kernels::launch_add_rmsnorm2_q8(s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, H, c.rms_eps, st);
-        else
+        } else {
             kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
+        }
 
         const bool qmoe = w.shared_gate_q && w.shared_up_q && w.shared_down_q
                        && w.shared_gate_qtype == 8 && c.hidden == 2048 && c.moe_ffn == 512;
@@ -1302,7 +1311,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             else launch_residual_add(s.routed, s.shared, s.routed, H, st);
         }
         const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
-        if (shared_to_fold) {
+        if (c.muse_glimmer) {
+            // Sandwich norm: x = h + RMSNorm(routed) * post_ffn_norm (norm the FFN output
+            // alone, not the sum -- mirrors the post-attention step above). No shared
+            // expert on this architecture (dense_ffn, n_shared=0), so shared_to_fold is
+            // always null here. xn = RMSNorm(x, nextnorm) is the next layer's ordinary
+            // pre-attn norm (or final_norm on the last layer), unaffected by the sandwich.
+            kernels::launch_norm_then_add(s.h, s.routed, w.post_ffn_norm, s.x, 1, H, c.rms_eps, st);
+            kernels::launch_rmsnorm(s.x, nextnorm, s.xn, 1, H, c.rms_eps, st);
+        } else if (shared_to_fold) {
             if (fnq)
                 kernels::launch_add_rmsnorm3_q8(s.h, s.routed, shared_to_fold, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
             else
@@ -2823,10 +2840,20 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         }
         if (!expect_dims_opt(b + "attn_post_norm.weight", {H}) ||
             !expect_dims_opt(b + "post_attention_norm.weight", {H}) ||
-            !expect_dims_opt(b + "ffn_norm.weight", {H})) return false;
-        w.post_attn_norm = dense_opt(b + "attn_post_norm.weight", false);
-        if (!w.post_attn_norm) w.post_attn_norm = dense_opt(b + "post_attention_norm.weight", false);
-        if (!w.post_attn_norm) w.post_attn_norm = dense(b + "ffn_norm.weight", false);
+            !expect_dims_opt(b + "ffn_norm.weight", {H}) ||
+            !expect_dims_opt(b + "post_ffw_norm.weight", {H})) return false;
+        if (c.muse_glimmer) {
+            // Muse Glimmer ships post_attention_norm.weight AND ffn_norm.weight as distinct
+            // tensors (sandwich norm, not one norm serving double duty) -- load both,
+            // unlike the single-fallback-chain below every other architecture uses.
+            w.post_attn_norm = dense(b + "post_attention_norm.weight", false);
+            w.ffn_norm = dense(b + "ffn_norm.weight", false);
+            w.post_ffn_norm = dense(b + "post_ffw_norm.weight", false);
+        } else {
+            w.post_attn_norm = dense_opt(b + "attn_post_norm.weight", false);
+            if (!w.post_attn_norm) w.post_attn_norm = dense_opt(b + "post_attention_norm.weight", false);
+            if (!w.post_attn_norm) w.post_attn_norm = dense(b + "ffn_norm.weight", false);
+        }
         if (c.dense_ffn) {
             if (!expect_dims(b + "ffn_gate.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_up.weight", {H, c.moe_ffn}) ||
@@ -2883,6 +2910,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             ? (w.gate_q && w.up_q && w.down_q)
             : (w.router_w && w.gate_q && w.up_q && w.down_q);
         if (!have_attn || !w.input_norm || !w.post_attn_norm || !have_ffn) return false;
+        if (c.muse_glimmer && (!w.ffn_norm || !w.post_ffn_norm)) return false;
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
     }
     // ---- eager per-row int8 scales of the routed experts (fused quantized-B MoE prefill GEMM) ----

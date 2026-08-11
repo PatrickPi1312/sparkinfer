@@ -29,6 +29,14 @@ void launch_add_rmsnorm2_q8_rows(const void* x_bf16, const void* residual_bf16,
                                  void* out_norm_bf16, void* out_q8, int rows, int cols,
                                  float eps, cudaStream_t stream = nullptr);
 
+// Sandwich-norm residual add (Gemma2/Muse-Glimmer style): out = residual + RMSNorm(block_out)
+// * weight. Unlike add_rmsnorm2/3 above (which norm the SUM), this norms block_out ALONE --
+// the sub-block's raw output, before any residual add -- and only the normalized result joins
+// the residual stream. Used for both the post-attention and post-FFN sandwich-norm steps.
+void launch_norm_then_add(const void* residual_bf16, const void* block_out_bf16,
+                          const void* weight_bf16, void* out_bf16,
+                          int rows, int cols, float eps, cudaStream_t stream = nullptr);
+
 // Fold residual_add(res1,res2) into add_rmsnorm2: out_sum = x + (res1 + res2).
 void launch_add_rmsnorm3(const void* x_bf16, const void* res1_bf16, const void* res2_bf16,
                          const void* weight_bf16, void* out_sum_bf16, void* out_norm_bf16,
