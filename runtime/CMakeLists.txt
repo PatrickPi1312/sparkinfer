@@ -33,6 +33,11 @@ else()
   add_library(sparkinfer_runtime SHARED ${RUNTIME_SRC})
 endif()
 target_include_directories(sparkinfer_runtime PUBLIC include)
+# DFlashDraftModel::load_gguf (src/models/dflash_draft.cpp) derives its config from
+# examples/dflash_gguf_config.h, the same header-only convention examples/qwen3_gguf_config.h
+# already uses for the target model -- PRIVATE so it does not leak into the library's public
+# include surface.
+target_include_directories(sparkinfer_runtime PRIVATE examples)
 target_link_libraries(sparkinfer_runtime PUBLIC sparkinfer_moe sparkinfer_kernels CUDA::cudart Threads::Threads)
 
 # GPU observability (heat/power/clock) uses NVML when available; VRAM works without it. NVML ships

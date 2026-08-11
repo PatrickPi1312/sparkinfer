@@ -26,6 +26,14 @@ struct DFlashDraftConfig {
     std::vector<int> target_layer_ids = {1, 6, 11, 16, 22, 27, 32, 37};
     // Per-layer: true = sliding_attention (window), false = full_attention.
     std::vector<bool> sliding_layers;
+    // false (default) = existing Qwen3.6 draft behavior: NeoX split-half RoPE pairing
+    // (rotate h[i] with h[i+half]), via launch_rms_heads_rope. true = consecutive-pair
+    // ("normal"/LLAMA_ROPE_TYPE_NORM) pairing, via launch_rms_heads_rope_normal -- set for the
+    // Muse Glimmer draft (see museglimmer_dflash_config_from_gguf). This mirrors a fix already
+    // made and validated on the Muse Glimmer TARGET model; on the draft it is an informed but
+    // UNVERIFIED carry-over (no DFlash accuracy/SPEC_AGREE evaluation has run yet) -- if Muse
+    // Glimmer draft proposals look wrong, check this flag first.
+    bool rope_normal = false;
 };
 
 class DFlashDraftModel {
@@ -35,6 +43,12 @@ public:
 
     // Load model.safetensors (+ optional config.json) from a HF draft directory.
     bool load(const std::string& dir);
+
+    // Load a GGUF-packed draft checkpoint (e.g. Muse Glimmer's dflash-kquant.gguf). Self-contained
+    // like load(): opens the file, derives config from its metadata (see
+    // museglimmer_dflash_config_from_gguf in runtime/examples/dflash_gguf_config.h), and uploads
+    // dequantized weights. Does not touch/alter load()'s HF-safetensors path.
+    bool load_gguf(const std::string& path);
 
     const DFlashDraftConfig& config() const;
 

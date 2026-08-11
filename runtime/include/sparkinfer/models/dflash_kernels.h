@@ -125,6 +125,13 @@ void launch_rms_heads(void* x, const void* w, int seq, int n_heads, int d,
 void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
                            int pos0, float theta, cudaStream_t stream);
 
+// Same as launch_rms_heads_rope, but "normal" (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE
+// pairing instead of NeoX split-half. Needed for the Muse Glimmer DFlash draft checkpoint --
+// see k_rms_heads_rope_normal in dflash_kernels.cu for the full reasoning, and
+// DFlashDraftConfig::rope_normal for how a caller opts into this variant.
+void launch_rms_heads_rope_normal(void* x, const void* w, int seq, int n_heads, int d, float eps,
+                                  int pos0, float theta, cudaStream_t stream);
+
 // Accepted-prefix GDN commit for EVERY linear-attention layer in one launch.
 //
 // The per-layer commits (kernels::launch_dflash_gdn_{conv,scan}_commit) are independent — each

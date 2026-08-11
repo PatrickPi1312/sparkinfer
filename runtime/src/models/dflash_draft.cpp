@@ -1,10 +1,16 @@
-// DFlash draft runtime: safetensors load + block-parallel forward.
+// DFlash draft runtime: safetensors load + GGUF load + block-parallel forward.
 #include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/models/dflash_kernels.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/prefill.h"
+#include "sparkinfer/gguf.h"
+// Header-only Muse Glimmer DFlash draft config derivation (mirrors examples/qwen3_gguf_config.h's
+// museglimmer_config_from_gguf for the target model). Lives in examples/ by this codebase's
+// convention for GGUF-config-from-metadata helpers; reachable here via the runtime library's
+// PRIVATE "examples" include dir (see runtime/CMakeLists.txt).
+#include "dflash_gguf_config.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -332,6 +338,50 @@ struct DFlashDraftModel::Impl {
         return (T*)p;
     }
 
+    // Scratch/KV-cache allocation shared by load() (safetensors) and load_gguf(): identical
+    // buffers either way, sized purely from cfg (which is fully populated by the time either
+    // caller reaches this). Factored out so the two load paths cannot drift on sizing.
+    void alloc_scratch() {
+        const int H = cfg.hidden;
+        const int I = cfg.intermediate;
+        const int B = cfg.block_size;
+        const int max_ctx = cfg.max_seq;
+        const int qdim = cfg.n_q_heads * cfg.head_dim;
+        const int kvdim = cfg.n_kv_heads * cfg.head_dim;
+        noise = alloc<bf16>((size_t)B * H);
+        target_proj = alloc<bf16>((size_t)max_ctx * H);
+        x = alloc<bf16>((size_t)B * H);
+        xn = alloc<bf16>((size_t)B * H);
+        h = alloc<bf16>((size_t)B * H);
+        hn = alloc<bf16>((size_t)B * H);
+        q = alloc<bf16>((size_t)B * qdim);
+        attn = alloc<bf16>((size_t)B * qdim);
+        ao = alloc<bf16>((size_t)B * H);
+        {
+            const size_t parts = (size_t)dflash_kernels::kDFlashAttnMaxRows * cfg.n_q_heads *
+                                 dflash_kernels::kDFlashAttnMaxSplits;
+            fa_m = alloc<float>(parts);
+            fa_l = alloc<float>(parts);
+            fa_acc = alloc<float>(parts * 128);
+        }
+        gate = alloc<bf16>((size_t)B * I);
+        up = alloc<bf16>((size_t)B * I);
+        down = alloc<bf16>((size_t)B * H);
+        logits = alloc<float>((size_t)B * std::max(cfg.vocab, 1));
+        head_q8 = alloc<char>((size_t)B * kernels::llama_q8_1_bytes(H));
+        d_ids = alloc<int>(B);
+        d_out = alloc<int>(B);
+        cu(cudaHostAlloc(&h_out, B * sizeof(int), cudaHostAllocDefault), "h_out");
+
+        k_cache.resize(cfg.n_layers);
+        v_cache.resize(cfg.n_layers);
+        for (int L = 0; L < cfg.n_layers; L++) {
+            k_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
+            v_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
+        }
+        seq_len = 0;
+    }
+
     bf16* upload(const TensorView& tv) {
         bf16* d = alloc<bf16>(tv.nbytes / sizeof(bf16));
         if (tv.nbytes % sizeof(bf16) == 0) {
@@ -460,9 +510,6 @@ bool DFlashDraftModel::load(const std::string& dir) {
     const int I = s.cfg.intermediate;
     const int n_cap = (int)s.cfg.target_layer_ids.size();
     const int B = s.cfg.block_size;
-    const int max_seq = s.cfg.max_seq;
-    const int qdim = s.cfg.n_q_heads * s.cfg.head_dim;
-    const int kvdim = s.cfg.n_kv_heads * s.cfg.head_dim;
 
     auto* fc = require("fc.weight");
     auto* hn = require("hidden_norm.weight");
@@ -507,44 +554,113 @@ bool DFlashDraftModel::load(const std::string& dir) {
         }
     }
 
-    // Scratch
-    const int max_ctx = max_seq;
-    s.noise = s.alloc<bf16>((size_t)B * H);
-    s.target_proj = s.alloc<bf16>((size_t)max_ctx * H);
-    s.x = s.alloc<bf16>((size_t)B * H);
-    s.xn = s.alloc<bf16>((size_t)B * H);
-    s.h = s.alloc<bf16>((size_t)B * H);
-    s.hn = s.alloc<bf16>((size_t)B * H);
-    s.q = s.alloc<bf16>((size_t)B * qdim);
-    s.attn = s.alloc<bf16>((size_t)B * qdim);
-    s.ao = s.alloc<bf16>((size_t)B * H);
-    {
-        const size_t parts = (size_t)dflash_kernels::kDFlashAttnMaxRows * s.cfg.n_q_heads *
-                             dflash_kernels::kDFlashAttnMaxSplits;
-        s.fa_m = s.alloc<float>(parts);
-        s.fa_l = s.alloc<float>(parts);
-        s.fa_acc = s.alloc<float>(parts * 128);
-    }
-    s.gate = s.alloc<bf16>((size_t)B * I);
-    s.up = s.alloc<bf16>((size_t)B * I);
-    s.down = s.alloc<bf16>((size_t)B * H);
-    s.logits = s.alloc<float>((size_t)B * std::max(s.cfg.vocab, 1));
-    s.head_q8 = s.alloc<char>((size_t)B * kernels::llama_q8_1_bytes(H));
-    s.d_ids = s.alloc<int>(B);
-    s.d_out = s.alloc<int>(B);
-    cu(cudaHostAlloc(&s.h_out, B * sizeof(int), cudaHostAllocDefault), "h_out");
-
-    s.k_cache.resize(s.cfg.n_layers);
-    s.v_cache.resize(s.cfg.n_layers);
-    for (int L = 0; L < s.cfg.n_layers; L++) {
-        s.k_cache[L] = s.alloc<bf16>((size_t)max_seq * kvdim);
-        s.v_cache[L] = s.alloc<bf16>((size_t)max_seq * kvdim);
-    }
-
-    s.seq_len = 0;
+    // Scratch + KV cache (shared with load_gguf(), see Impl::alloc_scratch).
+    s.alloc_scratch();
     fprintf(stderr, "[dflash] loaded draft: layers=%d H=%d B=%d n_cap=%d mask=%d\n",
             s.cfg.n_layers, H, B, n_cap, s.cfg.mask_token_id);
-    (void)I; (void)n_cap;
+    return true;
+}
+
+namespace {
+// launch_gguf_dequant (kernels/quant.h) only implements F32/F16/Q8_0/Q4_K/Q5_K/Q6_K (ggml types
+// 0/1/8/12/13/14). Mirrors Qwen35Model's ggml_dequant_supported (qwen35.cpp) so an unsupported
+// (or future) quant type is rejected at load time instead of silently falling through as garbage.
+bool dflash_gguf_dequant_supported(int ggml_type) {
+    switch (ggml_type) {
+        case 0: case 1: case 8: case 12: case 13: case 14: return true;
+        default: return false;
+    }
+}
+} // namespace
+
+bool DFlashDraftModel::load_gguf(const std::string& path) {
+    Impl& s = *p_;
+    GGUF g;
+    if (!g.open(path)) {
+        fprintf(stderr, "[dflash] failed to open gguf %s\n", path.c_str());
+        return false;
+    }
+    const std::string arch = g.meta_str("general.architecture");
+    if (arch != "dflash") {
+        fprintf(stderr, "[dflash] %s: expected general.architecture=\"dflash\", got \"%s\"\n",
+                path.c_str(), arch.c_str());
+        return false;
+    }
+    museglimmer_dflash_config_from_gguf(g, s.cfg);
+
+    auto require = [&](const std::string& name) -> const GGUFTensor* {
+        const GGUFTensor* t = g.tensor(name);
+        if (!t) fprintf(stderr, "[dflash] missing tensor %s\n", name.c_str());
+        return t;
+    };
+    // Dense weight -> bf16, kept in its native GGUF [out,in] row-major layout (dims[0]=in
+    // fastest, dims[1]=out -- see runtime/examples/qwen3_gguf_config.h's header comment /
+    // Qwen35Model::load_gguf for the same convention on the target). That is exactly the layout
+    // forward_block already expects for wq/wk/wv/wo/gate/up/down/fc (the safetensors load() above
+    // uploads HF nn.Linear.weight raw for the same reason: it too is stored [out,in]), so unlike
+    // Qwen35Model::load_gguf's `dense(name, transpose)` this never needs to transpose.
+    auto dense = [&](const std::string& name) -> bf16* {
+        const GGUFTensor* t = require(name);
+        if (!t) return nullptr;
+        if (!dflash_gguf_dequant_supported(t->ggml_type)) {
+            fprintf(stderr, "[dflash] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
+            return nullptr;
+        }
+        void* raw = nullptr;
+        cu(cudaMalloc(&raw, t->n_bytes), "gguf raw malloc");
+        cu(cudaMemcpy(raw, t->data, t->n_bytes, cudaMemcpyHostToDevice), "gguf raw upload");
+        bf16* dst = s.alloc<bf16>(t->n_values);
+        kernels::launch_gguf_dequant(t->ggml_type, raw, dst, t->n_values, s.stream);
+        cu(cudaStreamSynchronize(s.stream), "gguf dequant sync");
+        cudaFree(raw);
+        return dst;
+    };
+
+    s.fc = dense("fc.weight");
+    s.hidden_norm = dense("enc.output_norm.weight");
+    s.final_norm = dense("output_norm.weight");
+    if (!s.fc || !s.hidden_norm || !s.final_norm) return false;
+
+    const int H = s.cfg.hidden;
+    const int I = s.cfg.intermediate;
+    const int n_cap = (int)s.cfg.target_layer_ids.size();
+
+    s.layers.resize(s.cfg.n_layers);
+    for (int L = 0; L < s.cfg.n_layers; L++) {
+        auto& lw = s.layers[L];
+        const std::string pfx = "blk." + std::to_string(L) + ".";
+        lw.input_norm = dense(pfx + "attn_norm.weight");
+        lw.post_norm  = dense(pfx + "ffn_norm.weight");
+        lw.wq = dense(pfx + "attn_q.weight");
+        lw.wk = dense(pfx + "attn_k.weight");
+        lw.wv = dense(pfx + "attn_v.weight");
+        lw.wo = dense(pfx + "attn_output.weight");
+        lw.q_norm = dense(pfx + "attn_q_norm.weight");
+        lw.k_norm = dense(pfx + "attn_k_norm.weight");
+        lw.gate = dense(pfx + "ffn_gate.weight");
+        lw.up   = dense(pfx + "ffn_up.weight");
+        lw.down = dense(pfx + "ffn_down.weight");
+        if (!lw.input_norm || !lw.post_norm || !lw.wq || !lw.wk || !lw.wv || !lw.wo ||
+            !lw.q_norm || !lw.k_norm || !lw.gate || !lw.up || !lw.down)
+            return false;
+        // Q8_0/int4 mirrors: same as load()'s safetensors path (see the comment there).
+        if (q8_on()) {
+            const int qd = s.cfg.n_q_heads * s.cfg.head_dim, kvd = s.cfg.n_kv_heads * s.cfg.head_dim;
+            s.pending_quant.push_back({lw.wq,   qd,  H,  &lw.q8_wq});
+            s.pending_quant.push_back({lw.wk,   kvd, H,  &lw.q8_wk});
+            s.pending_quant.push_back({lw.wv,   kvd, H,  &lw.q8_wv});
+            s.pending_quant.push_back({lw.wo,   H,   qd, &lw.q8_wo});
+            s.pending_quant.push_back({lw.gate, I,   H,  &lw.q8_gate});
+            s.pending_quant.push_back({lw.up,   I,   H,  &lw.q8_up});
+            s.pending_quant.push_back({lw.down, H,   I,  &lw.q8_down});
+        }
+    }
+
+    s.alloc_scratch();
+    fprintf(stderr,
+            "[dflash] loaded draft (gguf): layers=%d H=%d B=%d n_cap=%d mask=%d rope_normal=%d\n",
+            s.cfg.n_layers, H, s.cfg.block_size, n_cap, s.cfg.mask_token_id,
+            (int)s.cfg.rope_normal);
     return true;
 }
 
@@ -782,14 +898,27 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // q_pos0 = pos0.
         const int k_pos0 = pos0 - ctx_len;
         const int q_pos0 = pos0;
-        dflash_kernels::launch_rms_heads_rope(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
-                                             q_pos0, c.rope_theta, st);
-        // Norm+RoPE only the rows that were actually produced above; the skipped context prefix
-        // holds no K to normalise. Row i of this slice keeps its own absolute position, so the
-        // surviving rows get exactly the angles they got before.
-        dflash_kernels::launch_rms_heads_rope(kdst + (size_t)ctx_skip * kvdim, w.k_norm,
-                                             new_len - ctx_skip, c.n_kv_heads, d,
-                                             c.rms_eps, k_pos0 + ctx_skip, c.rope_theta, st);
+        // c.rope_normal selects consecutive-pair ("normal"/LLAMA_ROPE_TYPE_NORM) RoPE instead of
+        // the NeoX split-half pairing every other DFlash draft checkpoint (Qwen3.6) uses -- see
+        // DFlashDraftConfig::rope_normal and k_rms_heads_rope_normal (dflash_kernels.cu) for why
+        // Muse Glimmer's draft sets this. Default false leaves Qwen3.6 byte-for-byte unchanged.
+        if (c.rope_normal) {
+            dflash_kernels::launch_rms_heads_rope_normal(s.q, w.q_norm, BW, c.n_q_heads, d,
+                                                         c.rms_eps, q_pos0, c.rope_theta, st);
+            // Norm+RoPE only the rows that were actually produced above; the skipped context
+            // prefix holds no K to normalise. Row i of this slice keeps its own absolute
+            // position, so the surviving rows get exactly the angles they got before.
+            dflash_kernels::launch_rms_heads_rope_normal(kdst + (size_t)ctx_skip * kvdim, w.k_norm,
+                                                         new_len - ctx_skip, c.n_kv_heads, d,
+                                                         c.rms_eps, k_pos0 + ctx_skip,
+                                                         c.rope_theta, st);
+        } else {
+            dflash_kernels::launch_rms_heads_rope(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
+                                                 q_pos0, c.rope_theta, st);
+            dflash_kernels::launch_rms_heads_rope(kdst + (size_t)ctx_skip * kvdim, w.k_norm,
+                                                 new_len - ctx_skip, c.n_kv_heads, d,
+                                                 c.rms_eps, k_pos0 + ctx_skip, c.rope_theta, st);
+        }
 
         // K/V are already in the cache at offset `past` -- attend over the full past+new.
         const int kv_len = past + new_len;

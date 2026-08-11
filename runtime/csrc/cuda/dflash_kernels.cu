@@ -154,6 +154,52 @@ __global__ void k_rms_heads_rope(bf16* x, const bf16* w, int seq, int n_heads, i
     }
 }
 
+// "Normal" (consecutive-pair, GGML_ROPE_TYPE_NORM / llama.cpp LLAMA_ROPE_TYPE_NORM) counterpart
+// of k_rms_heads_rope above: rotates (2i, 2i+1) together instead of the NeoX (i, i+half)
+// split-half pairing k_rms_heads_rope implements.
+//
+// This mirrors the fix already applied on the Muse Glimmer TARGET model (see
+// rope_kv_append_normal_kernel in kernels/csrc/cuda/attention/rope.cu for the full reasoning):
+// llama.cpp's llama_model_rope_type() table places LLM_ARCH_MUSE_GLIMMER in the
+// LLAMA_ROPE_TYPE_NORM bucket, not the LLAMA_ROPE_TYPE_NEOX bucket every existing kernel in this
+// file (written for the Qwen family) assumes. The DFlash draft checkpoint shipped for Muse
+// Glimmer is the same model family (same rope_theta=500000, same tokenizer, general.name =
+// "Hf_Museglimmer" in its own GGUF metadata) and its whole mechanism depends on its hidden
+// states lining up with the target's (via the fc.weight projection from concatenated target
+// hidden states), so it is very likely -- but, as of this change, UNVERIFIED, since no
+// accuracy/SPEC_AGREE evaluation has been run against the draft yet -- that it needs the same
+// consecutive-pair convention. If DFlash draft proposals for Muse Glimmer look wrong (low
+// acceptance, garbage tokens) once evaluation runs, check this assumption FIRST: flip
+// DFlashDraftConfig::rope_normal to false and re-test before looking anywhere else.
+__global__ void k_rms_heads_rope_normal(bf16* x, const bf16* w, int seq, int n_heads, int d,
+                                        float eps, int pos0, float theta) {
+    const int idx = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (idx >= seq * n_heads) return;
+    bf16* h = x + (size_t)idx * d;
+    const int lane = threadIdx.x & 31;
+    float ss = 0.f;
+    for (int i = lane; i < d; i += 32) {
+        float v = b2f(h[i]);
+        ss += v * v;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+    const float inv = rsqrtf(ss / (float)d + eps);
+    for (int i = lane; i < d; i += 32)
+        h[i] = f2b(b2f(h[i]) * inv * b2f(w[i]));
+    __syncwarp();
+    const int pos = pos0 + (idx / n_heads);
+    const int half = d / 2;
+    for (int i = lane; i < half; i += 32) {
+        const float freq = 1.f / powf(theta, (float)(2 * i) / (float)d);
+        const float ang = (float)pos * freq;
+        const float c = cosf(ang), sn = sinf(ang);
+        const float x0 = b2f(h[2 * i]), x1 = b2f(h[2 * i + 1]);
+        h[2 * i]     = f2b(x0 * c - x1 * sn);
+        h[2 * i + 1] = f2b(x0 * sn + x1 * c);
+    }
+}
+
 __global__ void k_rope(bf16* x, int seq, int n_heads, int d, int pos0, float theta) {
     int t = blockIdx.x;
     int h = blockIdx.y;
@@ -1154,6 +1200,17 @@ void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, 
     constexpr int WPB = 4;
     const int total = seq * n_heads;
     k_rms_heads_rope<<<(total + WPB - 1) / WPB, WPB * 32, 0, stream>>>(
+        (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta);
+}
+
+// See k_rms_heads_rope_normal for why Muse Glimmer's DFlash draft needs this consecutive-pair
+// variant instead of launch_rms_heads_rope's NeoX split-half pairing.
+void launch_rms_heads_rope_normal(void* x, const void* w, int seq, int n_heads, int d, float eps,
+                                  int pos0, float theta, cudaStream_t stream) {
+    if (seq <= 0 || n_heads <= 0) return;
+    constexpr int WPB = 4;
+    const int total = seq * n_heads;
+    k_rms_heads_rope_normal<<<(total + WPB - 1) / WPB, WPB * 32, 0, stream>>>(
         (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta);
 }
 

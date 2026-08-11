@@ -11,6 +11,17 @@ add_executable(qwen36_config_cpu_test qwen36_config_cpu_test.cpp ../src/gguf.cpp
 set_target_properties(qwen36_config_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME qwen36_config_cpu_test COMMAND qwen36_config_cpu_test)
 
+# Muse Glimmer DFlash draft GGUF config parsing. Links only gguf.cpp, same as
+# qwen36_config_cpu_test above -- no kernels/moe/full runtime needed. dflash_draft.h (pulled in
+# via ../examples/dflash_gguf_config.h for DFlashDraftConfig) needs <cuda_runtime.h> for
+# cudaStream_t in DFlashDraftModel's method signatures even though this test never constructs
+# one, so link CUDA::cudart for its headers -- lighter than sparkinfer_runtime, no device
+# execution, still GPU-free in the sense that matters (no kernels, no MoE engine).
+add_executable(dflash_gguf_config_cpu_test dflash_gguf_config_cpu_test.cpp ../src/gguf.cpp)
+target_link_libraries(dflash_gguf_config_cpu_test PRIVATE CUDA::cudart)
+set_target_properties(dflash_gguf_config_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME dflash_gguf_config_cpu_test COMMAND dflash_gguf_config_cpu_test)
+
 # Thermal governor — pure tiering policy (no GPU); links the runtime for classify()/pace() symbols.
 add_executable(thermal_governor_cpu_test thermal_governor_cpu_test.cpp)
 target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)
