@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace sparkinfer {
 
@@ -15,8 +16,9 @@ struct GGUFTensor {
 };
 
 // Minimal read-only GGUF (v3) reader: mmaps the file, parses metadata + tensor
-// table, exposes scalar metadata and tensor data pointers. Arrays (e.g. the
-// tokenizer vocab) are skipped — tokenization is done in Python.
+// table, exposes scalar metadata and tensor data pointers. String arrays (e.g. the
+// tokenizer vocab) are skipped — tokenization is done in Python. Numeric arrays
+// (e.g. a per-layer attention pattern) are captured and exposed via meta_int_array.
 class GGUF {
 public:
     ~GGUF();
@@ -25,6 +27,9 @@ public:
     long        meta_int(const std::string& key, long def = 0) const;
     double      meta_float(const std::string& key, double def = 0) const;
     std::string meta_str(const std::string& key, const std::string& def = "") const;
+    // Numeric metadata array (e.g. muse-glimmer.attention.sliding_window_pattern).
+    // Empty vector if the key is absent or was a string array.
+    std::vector<long> meta_int_array(const std::string& key) const;
     const GGUFTensor* tensor(const std::string& name) const;
 
 private:
@@ -39,6 +44,7 @@ private:
     std::unordered_map<std::string, long>        ints_;
     std::unordered_map<std::string, double>      floats_;
     std::unordered_map<std::string, std::string> strs_;
+    std::unordered_map<std::string, std::vector<long>> int_arrays_;
     std::unordered_map<std::string, GGUFTensor>  tensors_;
 };
 

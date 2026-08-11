@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 namespace sparkinfer {
 
 // Qwen MoE decode configuration. Defaults match the original full-attention
@@ -35,6 +37,17 @@ struct Qwen35Config {
     // Qwythos / Qwen3.5-9B dense hybrid GGUFs use a single SwiGLU FFN per layer
     // (ffn_gate/up/down) instead of routed experts.
     bool  dense_ffn   = false;
+
+    // Muse Glimmer: dense GQA transformer, no MoE/linear-attention layers. Per-layer
+    // sliding-window (RoPE, window `sliding_window` tokens) vs full/global attention
+    // (NoPE -- no RoPE at all), sandwich norm (post_attn_norm already existed; ffn also
+    // gets a post-norm), a sigmoid gate on the attention output (reuses the existing
+    // q_has_gate path -- see Qwen35LayerWeights::q_has_gate), and tanh logit softcapping.
+    bool  muse_glimmer = false;
+    std::vector<bool> swa_layers;      // per-layer: true = sliding-window, false = global/NoPE
+    int   sliding_window = 0;          // token window for swa_layers entries (0 = disabled)
+    float final_logit_softcapping = 0.f;  // 0 = disabled
+    float logit_scale = 1.f;              // 1 = no-op
 };
 
 } // namespace sparkinfer

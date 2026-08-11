@@ -22,6 +22,10 @@ struct Qwen35LayerWeights {
     const void* q_norm = nullptr;        // [head_dim]
     const void* k_norm = nullptr;        // [head_dim]
     const void* post_attn_norm = nullptr;// [hidden]
+    // Muse Glimmer sandwich norm: post_attn_norm above covers the attention side; this
+    // covers the FFN side (applied to the FFN output before the residual add, same
+    // "norm then add" shape as post_attn_norm -- see qwen35.cpp's sandwich-norm kernels).
+    const void* post_ffn_norm = nullptr; // [hidden]
     const void* router_w = nullptr;      // [hidden, n_experts]
     int router_w_type = 0;              // ggml_type when router_w is kept quantized (0 = bf16 dense)
     const void* gate = nullptr;          // [n_experts, hidden, moe_ffn]

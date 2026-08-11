@@ -46,7 +46,62 @@ static bool qwen3_is_hybrid_35b(const sparkinfer::GGUF& g) {
            g.tensor("blk.3.attn_q.weight") != nullptr;
 }
 
+// Muse Glimmer (Meta, 2026-08): dense GQA-16 causal transformer, no MoE/linear-attention
+// layers. Single namespace, so no fallback-prefix chain like qwen3_meta_int needs.
+static long museglimmer_meta_int(const sparkinfer::GGUF& g, const std::string& key, long def) {
+    return g.meta_int("muse-glimmer." + key, def);
+}
+static double museglimmer_meta_float(const sparkinfer::GGUF& g, const std::string& key, double def) {
+    return g.meta_float("muse-glimmer." + key, def);
+}
+
+static void museglimmer_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35Config& cfg) {
+    cfg.muse_glimmer = true;
+    cfg.n_layers   = (int)museglimmer_meta_int(g, "block_count", 52);
+    cfg.hidden     = (int)museglimmer_meta_int(g, "embedding_length", 6656);
+    cfg.n_q_heads  = (int)museglimmer_meta_int(g, "attention.head_count", 32);
+    cfg.n_kv_heads = (int)museglimmer_meta_int(g, "attention.head_count_kv", 2);
+    cfg.head_dim   = (int)museglimmer_meta_int(g, "attention.key_length", 128);
+    cfg.rope_theta = (float)museglimmer_meta_float(g, "rope.freq_base", 500000.f);
+    cfg.rms_eps    = (float)museglimmer_meta_float(g, "attention.layer_norm_rms_epsilon", 1e-5f);
+    cfg.eos_id     = (int)g.meta_int("tokenizer.ggml.eos_token_id", 200001);
+    cfg.vocab      = (int)museglimmer_meta_int(g, "vocab_size", 202048);
+    const sparkinfer::GGUFTensor* emb = g.tensor("token_embd.weight");
+    if (emb && emb->n_dims >= 2) cfg.vocab = (int)emb->dims[1];
+
+    cfg.sliding_window = (int)museglimmer_meta_int(g, "attention.sliding_window", 2048);
+    cfg.final_logit_softcapping = (float)museglimmer_meta_float(g, "final_logit_softcapping", 0.f);
+    cfg.logit_scale = (float)museglimmer_meta_float(g, "logit_scale", 1.f);
+
+    // Dense SwiGLU FFN, same tensor names/kernels as the Qwythos dense_ffn path.
+    cfg.dense_ffn = true;
+    cfg.n_experts = 1; cfg.top_k = 1; cfg.n_shared = 0;
+    cfg.moe_ffn = (int)museglimmer_meta_int(g, "feed_forward_length", 19968);
+
+    // cfg.hybrid=true unlocks batched prefill (qwen35.cpp:1364) and the attention-gate
+    // path (w.q_has_gate = c.hybrid, qwen35.cpp:2753) that this architecture's attn_gate
+    // tensor needs -- both apply per-model here, not conditioned on any per-layer linear-
+    // attention state. full_attn_interval=0 makes is_linear_layer() unconditionally false
+    // for every layer (the formula requires full_attn_interval > 0): Muse Glimmer has no
+    // Gated-DeltaNet/SSM layers at all, only regular softmax attention (windowed or
+    // global), so nothing should ever take the linear-attention code path.
+    cfg.hybrid = true;
+    cfg.full_attn_interval = 0;
+
+    // Per-layer sliding-window (true) vs global/NoPE (false), read directly from the GGUF
+    // array rather than assumed as a fixed period -- faithful to whatever this file ships,
+    // not just the pattern seen in the first release.
+    std::vector<long> pattern = g.meta_int_array("muse-glimmer.attention.sliding_window_pattern");
+    cfg.swa_layers.assign(cfg.n_layers, true);
+    for (int i = 0; i < cfg.n_layers && i < (int)pattern.size(); i++)
+        cfg.swa_layers[i] = pattern[i] != 0;
+}
+
 static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35Config& cfg) {
+    if (g.meta_str("general.architecture") == "muse-glimmer") {
+        museglimmer_config_from_gguf(g, cfg);
+        return;
+    }
     cfg.n_layers   = (int)qwen3_meta_int(g, "block_count", cfg.n_layers);
     cfg.hidden     = (int)qwen3_meta_int(g, "embedding_length", cfg.hidden);
     cfg.n_q_heads  = (int)qwen3_meta_int(g, "attention.head_count", cfg.n_q_heads);
@@ -109,6 +164,7 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
 }
 
 static const char* qwen3_model_label(const sparkinfer::Qwen35Config& cfg) {
+    if (cfg.muse_glimmer) return "Muse Glimmer 30B";
     if (cfg.dense_ffn) return "Qwen3.5-9B dense hybrid";
     return cfg.hybrid ? "Qwen3.5/Qwen3.6-35B-A3B hybrid" : "Qwen3-MoE";
 }

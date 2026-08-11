@@ -173,16 +173,37 @@ bool GGUF::open(const std::string& path) {
             uint32_t et = c.rd<uint32_t>(); uint64_t n = c.rd<uint64_t>();
             if (et == VT_STR) { for (uint64_t k = 0; k < n && c.ok; k++) c.rd_str(); }
             else {
-                // Skip the scalar payload, but fail loudly on an unsupported element
-                // type (scalar_size==0 -> a 0-byte skip would desync the cursor) or a
-                // declared span that overflows / runs past the file.
+                // Fail loudly on an unsupported element type (scalar_size==0 -> a 0-byte
+                // skip would desync the cursor) or a declared span that overflows / runs
+                // past the file.
                 int es = scalar_size(et);
                 if (es == 0 || n > (c.size - c.off) / (size_t)es) {
                     fprintf(stderr, "[gguf] bad metadata array (elem type %u, n=%llu) for %s\n",
                             et, (unsigned long long)n, key.c_str());
                     return false;
                 }
-                c.skip((size_t)n * es);
+                // Capture integer-typed arrays (e.g. a per-layer attention pattern);
+                // float arrays are skipped as before -- nothing currently needs them.
+                if (et == VT_F32 || et == VT_F64) {
+                    c.skip((size_t)n * es);
+                } else {
+                    std::vector<long> arr;
+                    arr.reserve(n);
+                    for (uint64_t k = 0; k < n && c.ok; k++) {
+                        switch (et) {
+                            case VT_U8: case VT_BOOL: arr.push_back(c.rd<uint8_t>()); break;
+                            case VT_I8:  arr.push_back(c.rd<int8_t>()); break;
+                            case VT_U16: arr.push_back(c.rd<uint16_t>()); break;
+                            case VT_I16: arr.push_back(c.rd<int16_t>()); break;
+                            case VT_U32: arr.push_back(c.rd<uint32_t>()); break;
+                            case VT_I32: arr.push_back(c.rd<int32_t>()); break;
+                            case VT_U64: arr.push_back((long)c.rd<uint64_t>()); break;
+                            case VT_I64: arr.push_back(c.rd<int64_t>()); break;
+                            default: c.skip(es); break;
+                        }
+                    }
+                    if (c.ok) int_arrays_[key] = std::move(arr);
+                }
             }
         } else { fprintf(stderr, "[gguf] unknown vt %u for %s\n", vt, key.c_str()); return false; }
     }
@@ -241,6 +262,10 @@ bool GGUF::open(const std::string& path) {
 long GGUF::meta_int(const std::string& k, long d) const { auto it=ints_.find(k); return it==ints_.end()?d:it->second; }
 double GGUF::meta_float(const std::string& k, double d) const { auto it=floats_.find(k); return it==floats_.end()?d:it->second; }
 std::string GGUF::meta_str(const std::string& k, const std::string& d) const { auto it=strs_.find(k); return it==strs_.end()?d:it->second; }
+std::vector<long> GGUF::meta_int_array(const std::string& k) const {
+    auto it = int_arrays_.find(k);
+    return it == int_arrays_.end() ? std::vector<long>{} : it->second;
+}
 const GGUFTensor* GGUF::tensor(const std::string& n) const { auto it=tensors_.find(n); return it==tensors_.end()?nullptr:&it->second; }
 
 } // namespace sparkinfer
