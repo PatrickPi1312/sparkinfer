@@ -193,6 +193,13 @@ struct Qwen35Model::Impl {
     int*   sparse_vtbl = nullptr;  // compact view block table [sparse_budget]
     int*   sparse_vlen = nullptr;  // compact view seq_len (device scalar)
     int    sparse_vsplits = 128;   // KV splits over the view (sized so MMA chunks >= 2 blocks)
+    // Muse Glimmer: pure sliding-window compact view for swa-flagged layers (no sink,
+    // mandatory every step -- see fa_kv_compact_view_pure). Built once per decode step,
+    // shared by every swa layer that step; global (non-swa) layers use the full btable.
+    int*   swa_vtbl = nullptr;     // compact view block table [swa_budget]
+    int*   swa_vlen = nullptr;     // compact view seq_len (device scalar)
+    int    swa_budget = 0;         // sliding_window tokens / block_size, rounded up
+    int    swa_vsplits = 32;       // KV splits over the (small, fixed-size) swa view
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
     bool use_pq = true;   // SPARKINFER_PQ=0 disables the pre-quantized GEMV path
@@ -373,6 +380,19 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
                 sparse_gqa8 ? 8 : 4, p_->sparse_window, p_->sparse_window * kv->block_size(),
                 p_->sparse_min_ctx, sparse_gqa8 ? " (compact-view, decode-only)" : "");
     }
+    // Muse Glimmer: mandatory pure sliding-window view for swa-flagged layers, every step,
+    // regardless of context length (architectural, not a long-context approximation).
+    if (cfg.muse_glimmer && cfg.sliding_window > 0) {
+        p_->swa_budget = (cfg.sliding_window + kv->block_size() - 1) / kv->block_size();
+        p_->swa_vtbl = p_->alloc<int>(p_->swa_budget);
+        p_->swa_vlen = p_->alloc<int>(1);
+        int vs = (p_->swa_budget * kv->block_size()) / 32;
+        if (vs > Impl::MAX_NSPLITS) vs = Impl::MAX_NSPLITS;
+        if (vs < 1) vs = 1;
+        p_->swa_vsplits = vs;
+        fprintf(stderr, "[muse-glimmer] sliding-window: %d tokens (%d blocks), every-4th-layer global/NoPE\n",
+                cfg.sliding_window, p_->swa_budget);
+    }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
     p_->aq8_d = p_->alloc<float>(kmax >> 5);
@@ -422,6 +442,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     cudaFree(p_->sparse_sel);
     cudaFree(p_->sparse_vtbl); cudaFree(p_->sparse_vlen);
+    cudaFree(p_->swa_vtbl); cudaFree(p_->swa_vlen);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
     // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
@@ -702,6 +723,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     if (sparse_on && s.sparse_vtbl)
         kernels::launch_fa_kv_compact_view(s.d_seqlen, btable, s.sparse_vtbl, s.sparse_vlen,
                                            s.kv->block_size(), s.sparse_window, s.sparse_budget, st);
+    // Muse Glimmer: pure sliding-window view for swa-flagged layers, every step (mandatory,
+    // not gated by context length like the sparse-kv approximation above).
+    if (c.muse_glimmer && s.swa_vtbl)
+        kernels::launch_fa_kv_compact_view_pure(s.d_seqlen, btable, s.swa_vtbl, s.swa_vlen,
+                                                s.kv->block_size(), s.swa_budget, s.swa_budget, st);
     // Prime: xn = RMSNorm(x, layer0.input_norm). Each layer's tail then fuses the
     // post-MoE residual with the NEXT layer's input norm (or final_norm), so the
     // per-layer input RMSNorm + two residual-adds collapse into two fused kernels.
@@ -968,7 +994,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                         kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
                         kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
                     }
-                    if (partial_rope) {
+                    if (c.muse_glimmer && !w.swa) {
+                        // Global/NoPE layer: no rotation at all (Q/K are already QK-normed
+                        // above) -- append K/V as-is. Every 4th layer per sliding_window_pattern.
+                        launch_kv_append((bf16*)kpool, (bf16*)vpool, s.k, s.v, btable, s.d_writepos, 1,
+                                         c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                    } else if (partial_rope) {
                         kernels::launch_rope_kv_append_partial(s.q, s.k, s.v, (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1,
                                                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim,
                                                                c.rope_theta, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
@@ -991,7 +1022,22 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                                       && (H == 2048 || H == 4096)
                                       && (w.wo_type == 12 || w.wo_type == 8) && (s.qdim % 32 == 0);
             const bool emit_attn_q8 = !w.q_has_gate && s.use_attnin && s.gguf && s.use_pq && s.use_llama && w.wo_type == 12;
-            if (sparse_on && s.sparse_vtbl) {
+            if (c.muse_glimmer && w.swa && s.swa_vtbl) {
+                // Sliding-window layer: same dense flash-decode entry point, pointed at the
+                // per-step pure sliding-window compact view (no sink, unlike the sparse-kv
+                // path above) instead of the full KV. Mandatory every step at this context
+                // regardless of length -- not gated on sparse_on/context-length like the
+                // Qwythos/Qwen3.6 approximation.
+                kernels::launch_flash_decode_split(s.q, kpool, vpool, s.swa_vtbl, s.swa_vlen,
+                                                   s.attn, s.fa_m, s.fa_l, s.fa_acc, 1,
+                                                   c.n_q_heads, c.n_kv_heads, c.head_dim,
+                                                   s.kv->block_size(), s.swa_budget, s.swa_vsplits,
+                                                   1.f / sqrtf((float)c.head_dim), st,
+                                                   (emit_attn_q8 || attn_gate_q8) ? s.aq81 : nullptr,
+                                                   s.swa_budget * s.kv->block_size(),
+                                                   kscale, vscale, kv8 ? 1 : 0,
+                                                   attn_gate_q8 ? s.qgate : nullptr);
+            } else if (sparse_on && s.sparse_vtbl) {
                 // GQA-8 (Qwen3.6): the same dense flash-decode entry point, pointed at the
                 // per-step compact view — sink + last-window blocks, view seq_len carrying
                 // the partial tail. The tuned int8-MMA kernel and fused combine run
@@ -2728,6 +2774,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         std::string b = "blk." + std::to_string(i) + ".";
         Qwen35LayerWeights& w = s.w.layers[i];
         w.linear_attn = is_linear_layer(c, i);
+        w.swa = (i < (int)c.swa_layers.size()) ? c.swa_layers[i] : false;
         if (!expect_dims(b + "attn_norm.weight", {H})) return false;
         w.input_norm = dense(b + "attn_norm.weight", false);
         if (w.linear_attn) {

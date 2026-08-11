@@ -183,6 +183,42 @@ void launch_fa_kv_compact_view(
         seq_lens, block_table, view_table, view_len, block_size, window_w, n_view);
 }
 
+// Pure sliding window (no attention sink): the last `window_w` logical blocks only. Unlike
+// fa_kv_compact_view above (an optional long-context approximation that always retains
+// block 0 as a StreamingLLM-style sink), this is for an architecture whose sliding-window
+// layers are defined as a plain rolling window with no special retention of early tokens
+// (e.g. Gemma2/Mistral-style SWA) -- mandatory every step for those layers, not gated by
+// context length. Block-granularity like the kernel above: the window boundary can fall up
+// to block_size-1 tokens earlier than the exact token-level window when seq_len isn't
+// block-aligned (extra old tokens included, never fewer than requested).
+__global__ void fa_kv_compact_view_pure(
+    const int* __restrict__ seq_lens, const int* __restrict__ block_table,
+    int* __restrict__ view_table, int* __restrict__ view_len,
+    int block_size, int window_w, int n_view
+) {
+    const int sl = seq_lens[0];
+    const int n_blk = (sl + block_size - 1) / block_size;
+    if (window_w >= n_blk) {
+        // Window already covers the whole sequence: identity prefix.
+        for (int b = threadIdx.x; b < n_blk && b < n_view; b += blockDim.x)
+            view_table[b] = block_table[b];
+        if (threadIdx.x == 0) *view_len = sl;
+        return;
+    }
+    const int recent_start = n_blk - window_w;
+    if (threadIdx.x == 0) *view_len = sl - recent_start * block_size;
+    for (int i = threadIdx.x; i < window_w && i < n_view; i += blockDim.x)
+        view_table[i] = block_table[recent_start + i];
+}
+
+void launch_fa_kv_compact_view_pure(
+    const int* seq_lens, const int* block_table, int* view_table, int* view_len,
+    int block_size, int window_w, int n_view, cudaStream_t stream
+) {
+    fa_kv_compact_view_pure<<<1, 256, 0, stream>>>(
+        seq_lens, block_table, view_table, view_len, block_size, window_w, n_view);
+}
+
 void launch_flash_decode_split_sparse(
     const void* q, const void* k_pool_layer, const void* v_pool_layer,
     const int* block_table, const int* seq_lens, const int* sel_blk,

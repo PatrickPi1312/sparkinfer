@@ -14,6 +14,10 @@ class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governo
 struct Qwen35LayerWeights {
     bool linear_attn = false;
     bool q_has_gate = false;
+    // Muse Glimmer: true = sliding-window attention (RoPE, windowed KV), false = global
+    // attention (NoPE -- no RoPE at all, full KV). Mirrors Qwen35Config::swa_layers[i];
+    // copied per-layer at weight-load time so the decode loop doesn't need the config.
+    bool swa = false;
     const void* input_norm   = nullptr;  // [hidden]
     const void* wq = nullptr;            // [hidden, n_q_heads*head_dim]
     const void* wk = nullptr;            // [hidden, n_kv_heads*head_dim]
