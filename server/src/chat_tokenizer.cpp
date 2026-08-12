@@ -166,6 +166,13 @@ std::string filter_answer_chunk(std::string& carry, const std::string& piece) {
 struct ChatTokenizer::Impl {
     std::unique_ptr<tokenizers::Tokenizer> tok;
     bool museglimmer = false;
+    // Muse Glimmer harmony-format marker token ids, resolved once in set_museglimmer() (single
+    // -threaded server startup, after `tok` is loaded) -- see decode()'s comment for why these
+    // need special handling. Deliberately NOT lazily resolved on first decode(): decode() runs
+    // on the shared g_tokenizer from every /v1/chat/completions request, and cpp-httplib
+    // dispatches those across a real thread pool by default -- a lazy first-call init here
+    // would race across concurrently-arriving requests.
+    int32_t mg_start_id = -1, mg_message_id = -1, mg_eom_id = -1, mg_eot_id = -1;
 };
 
 ChatTokenizer::ChatTokenizer() : impl_(std::make_unique<Impl>()) {}
@@ -192,7 +199,20 @@ bool ChatTokenizer::load(const std::string& tokenizer_json_path, std::string& er
     return true;
 }
 
-void ChatTokenizer::set_museglimmer(bool on) { impl_->museglimmer = on; }
+void ChatTokenizer::set_museglimmer(bool on) {
+    impl_->museglimmer = on;
+    // Resolve the harmony-format marker ids here (single-threaded startup, `tok` already
+    // loaded by this point) rather than lazily in decode() -- see the Impl::mg_start_id
+    // comment for why. TokenToId returns -1 for an unknown token, which decode()'s
+    // marker_str() already treats as "never matches", so a missing marker degrades
+    // gracefully instead of crashing.
+    if (on && impl_->tok) {
+        impl_->mg_start_id = impl_->tok->TokenToId(kMgStart);
+        impl_->mg_message_id = impl_->tok->TokenToId(kMgMessage);
+        impl_->mg_eom_id = impl_->tok->TokenToId(kMgEom);
+        impl_->mg_eot_id = impl_->tok->TokenToId(kMgEot);
+    }
+}
 
 bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessage>& messages, std::string& err) {
     messages.clear();
@@ -608,6 +628,52 @@ bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::ve
 std::string ChatTokenizer::decode(const std::vector<int>& ids) const {
     if (!impl_->tok || ids.empty()) return {};
     std::vector<int32_t> v(ids.begin(), ids.end());
+
+    if (impl_->museglimmer) {
+        // Muse Glimmer's harmony-format structural tokens (<|start|>, <|message|>, <|eom|>,
+        // <|eot|>) are registered as special tokens in its tokenizer.json, so the underlying
+        // tokenizers-cpp Decode() silently drops them from the output text (standard
+        // skip-special-tokens decode behavior, confirmed empirically: decoding any of these
+        // four ids alone returns ""). But parse_museglimmer_output/ThinkingStreamSplitter
+        // both scan the DECODED TEXT for those literal marker strings to find segment
+        // boundaries -- with them stripped, the scan never finds a match and both content
+        // and reasoning_content come back empty regardless of what the model generated.
+        //
+        // Fix: decode body/header text in non-marker runs (so BPE merging/spacing across
+        // ordinary tokens stays correct -- ordinary Decode() semantics, unchanged) and
+        // splice the literal marker string back in at each split point using the same
+        // kMgStart/kMgMessage/kMgEom/kMgEot constants the parser already searches for,
+        // rather than relying on the library's special-token handling. Non-museglimmer
+        // models (Qwen3.6 et al, whose <think> tags are ordinary text tokens, not special
+        // ones) are unaffected -- this whole branch is gated on impl_->museglimmer. Marker
+        // ids are resolved once in set_museglimmer(), not lazily here -- see Impl::mg_start_id.
+        auto marker_str = [&](int32_t id) -> const char* {
+            if (id == impl_->mg_start_id) return kMgStart;
+            if (id == impl_->mg_message_id) return kMgMessage;
+            if (id == impl_->mg_eom_id) return kMgEom;
+            if (id == impl_->mg_eot_id) return kMgEot;
+            return nullptr;
+        };
+        std::string out;
+        std::vector<int32_t> run;
+        auto flush_run = [&]() {
+            if (!run.empty()) {
+                out += impl_->tok->Decode(run);
+                run.clear();
+            }
+        };
+        for (int32_t id : v) {
+            if (const char* m = marker_str(id)) {
+                flush_run();
+                out += m;
+            } else {
+                run.push_back(id);
+            }
+        }
+        flush_run();
+        return out;
+    }
+
     return impl_->tok->Decode(v);
 }
 
