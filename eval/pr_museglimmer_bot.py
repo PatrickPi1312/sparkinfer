@@ -530,11 +530,29 @@ test -x build/runtime/qwen3_gguf_score
 # 128-ctx prefill throughput, from ONE Muse Glimmer model load via the same JSON-sweep mechanism
 # the Qwen3.6 guard below already uses — sourced here (not just before the guard) so both share
 # it instead of reloading the ~17GB GGUF twice for two separate single-context bench calls.
+#
+# reps=5 (median), not 1: found 2026-08-13 after PR #785 scored a bogus eval-museglimmer:XL
+# (207% "prefill improvement" it never touched — its own diff never goes near a prefill kernel).
+# Two things were true at once, confirmed live on the eval box with a per-rep debug build:
+#   1. reps=1 (no averaging) is fragile now that prefill@128 is fast: qwen3_gguf_bench's sweep
+#      mode medians over `reps` internally (one shared SPARKINFER_BENCH_SWEEP_REPS across every
+#      ctx point, see run_sweep() in qwen3_gguf_bench.cpp), but this call passed reps=1, i.e. a
+#      single uncorroborated sample. That was fine while Muse Glimmer's prefill@128 ran the slow
+#      token-loop path (~1.1s — dispatch jitter is noise-floor); #787's batched-GEMM prefill (the
+#      same round) cut that to ~0.1s, where the same jitter is a much larger fraction of a shorter
+#      measurement.
+#   2. PR #785 itself was NOT just an unlucky single sample: on current main (#785 reverted) all
+#      5/5 reps land in a tight 1105-1115 pp tok/s band, but on #785's own branch every rep was
+#      wildly inflated (reps=1 -> 3395, reps=5 median -> 84723, i.e. taking more samples made it
+#      WORSE, not better). #785's Q3A weight requantization runs once at load, before any prefill
+#      code, yet destabilized every subsequent prefill measurement on that binary -- a real bug in
+#      that PR, not benchmark noise. Left as a mystery for whoever resubmits it; reps=5 defends
+#      this bot against a repeat regardless of root cause on the PR side.
 source bench/scripts/_common.sh
 source bench/scripts/_eval_speed.sh
 SI_BIN="$PWD/build/runtime"; SI_LD=""
 wait_gpu_clear
-if bench_sweep_run "$GGUF" "$NTOK" 0 1 128 1; then
+if bench_sweep_run "$GGUF" "$NTOK" 0 5 128 5; then
   DECODE_TPS=$(_bench_sweep_get 0 decode_tps)
   PREFILL128_PP=$(_bench_sweep_get 128 prefill_pp)
 else
