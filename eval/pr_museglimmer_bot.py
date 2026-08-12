@@ -369,14 +369,36 @@ def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
     )
 
 
+_EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED")
+
+
 def _crash_reason(*outputs: str) -> str | None:
-    """Same ERR-trap diagnostic extraction as pr_dflash_bot.py."""
+    """Same ERR-trap diagnostic extraction as pr_dflash_bot.py, PLUS the remote script's own
+    explicit *_FAILED markers (BUILD_FAILED, LLAMACPP_CONFIGURE_FAILED, LLAMACPP_BUILD_FAILED).
+    Those markers are `exit 1` inside an `|| { ...; exit 1; }` handler, not a bare failing
+    command under `set -e` -- bash's ERR trap does NOT fire for an explicit `exit`, so a
+    perfectly-diagnosed compile error (e.g. #777's `launch_muse_sandwich_tail_q8` undefined)
+    was falling through to `_looks_like_hard_kill`'s "no diagnostic captured" bucket, getting
+    misreported as an ambiguous hard kill AND triggering a pointless retry of a build that will
+    deterministically fail again. Found by hand-running _remote_script directly against #777
+    after the bot mislabeled it twice."""
     combined = "\n".join(o or "" for o in outputs)
     lines = combined.splitlines()
     for i, line in enumerate(lines):
         if line.startswith("REMOTE_SCRIPT_FAILED "):
             extra = lines[i + 1].strip() if i + 1 < len(lines) else ""
             return line.strip() + (f" | gpu: {extra}" if extra else "")
+    for i, line in enumerate(lines):
+        marker = next((m for m in _EXPLICIT_FAIL_MARKERS if line.startswith(m)), None)
+        if not marker:
+            continue
+        # The single most actionable line is usually the compiler/linker's own "error:" —
+        # prefer that over the marker's generic "tail of build.log:" header.
+        for follow in lines[i + 1:i + 60]:
+            if "error:" in follow or "Error " in follow:
+                return f"{marker}: {follow.strip()}"
+        tail = " | ".join(l.strip() for l in lines[i + 1:i + 3] if l.strip())
+        return marker + (f": {tail}" if tail else "")
     return None
 
 
@@ -795,8 +817,29 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
         return {"attestation": attestation}
 
 
-def eval_museglimmer_on_box(host, port, pr_ref: str):
-    """Run the PR ref's speed+accuracy script, then main's, on the same box. Returns result."""
+def measure_main_baseline(host, port):
+    """Measure main's decode+accuracy+Qwen3.6-guard baseline ONCE per round, not once per PR —
+    main's code can't change mid-round (the only merge in this bot's own flow is
+    try_auto_merge_museglimmer, called from reconcile_museglimmer_merge_labels AFTER every
+    pending PR has already been individually evaluated in main()'s loop, see call ordering
+    there), so every PR in the round comparing against a freshly-remeasured main was pure
+    redundant GPU/build time. Returns {"ok": True, **parsed} or {"ok": False, "reason", "log"}."""
+    r = _ssh_run_resilient(host, port, _remote_script("main"), "main run")
+    if r.returncode != 0:
+        tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
+        crash = _crash_reason(r.stdout, r.stderr)
+        reason = "main run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
+        return {"ok": False, "reason": reason, "log": tail}
+    main = _parse_remote(r.stdout or "")
+    if "decode_tps" not in main:
+        return {"ok": False, "reason": "main bench missing decode tok/s", "log": (r.stdout or "")[-1500:]}
+    main["ok"] = True
+    return main
+
+
+def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
+    """Run the PR ref's speed+accuracy script on the same box and compare against `main`, an
+    already-measured baseline shared across every PR in the round (see measure_main_baseline)."""
     print(f">> Muse Glimmer eval on box: PR ref={pr_ref}")
     r = _ssh_run_resilient(host, port, _remote_script(pr_ref), "PR run")
     if r.returncode != 0:
@@ -809,18 +852,7 @@ def eval_museglimmer_on_box(host, port, pr_ref: str):
         return {"ok": False, "reason": "PR bench missing decode tok/s", "log": (r.stdout or "")[-1500:]}
     if "top1" not in pr or "kl" not in pr:
         return {"ok": False, "reason": "PR run missing accuracy METRIC line", "log": (r.stdout or "")[-1500:]}
-    print(f">> PR decode={pr['decode_tps']:.2f} top1={pr.get('top1', 0):.3f} kl={pr.get('kl', 99):.4f} "
-          f"— measuring main …")
-
-    r2 = _ssh_run_resilient(host, port, _remote_script("main"), "main run")
-    if r2.returncode != 0:
-        tail = ((r2.stdout or "") + "\n" + (r2.stderr or ""))[-2000:]
-        crash = _crash_reason(r2.stdout, r2.stderr)
-        reason = "main run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
-        return {"ok": False, "reason": reason, "log": tail, "pr": pr}
-    main = _parse_remote(r2.stdout or "")
-    if "decode_tps" not in main:
-        return {"ok": False, "reason": "main bench missing decode tok/s", "log": (r2.stdout or "")[-1500:], "pr": pr}
+    print(f">> PR decode={pr['decode_tps']:.2f} top1={pr.get('top1', 0):.3f} kl={pr.get('kl', 99):.4f}")
 
     label, delta_pct, passed, speed_reason = tier_from_gain(pr["decode_tps"], main["decode_tps"])
 
@@ -1284,10 +1316,24 @@ def main():
     _ssh_user = ssh_box_user() if ssh_box_enabled() else "root"
     print(f">> SSH {_ssh_user}@{host}:{port}")
 
+    print(">> measuring main baseline (once for this round, shared across all pending PRs) …")
+    main_result = measure_main_baseline(host, port)
+    if not main_result.get("ok"):
+        # No usable baseline -> nothing in this round can be scored. Bail out here rather than
+        # burning GPU time building N different PR branches against a baseline we already know
+        # is broken, and rather than posting a misleading per-PR "main run failed" on every
+        # pending PR for what is really one shared infra problem.
+        print(f">> main baseline measurement failed: {main_result.get('reason')} — skipping round")
+        reconcile_museglimmer_merge_labels(args.repo, dry_run=False)
+        print("done — museglimmer round skipped (main baseline unusable).")
+        return
+    print(f">> main baseline: decode={main_result['decode_tps']:.2f} "
+          f"top1={main_result.get('top1', 0):.3f} kl={main_result.get('kl', 99):.4f}")
+
     for num, head, short, ref, title in pending:
         print(f"PR #{num} @ {short}: evaluating Muse Glimmer '{ref}' …")
         try:
-            res = eval_museglimmer_on_box(host, port, ref)
+            res = eval_museglimmer_on_box(host, port, ref, main_result)
         except Exception as e:
             res = {"ok": False, "reason": f"exception: {e}"}
         apply_result(args.repo, num, head or short, res, title=title, dry_run=False)
