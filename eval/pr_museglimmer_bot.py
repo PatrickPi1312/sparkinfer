@@ -649,6 +649,18 @@ echo "RESULT_PPL_LLAMA ${{PPLL:-0}}"
 # entirely, as it did for the LMCache integration (PR #775) until checked by hand.
 # _common.sh/_eval_speed.sh/SI_BIN already sourced above for the decode+prefill128 sweep — reused
 # here, not re-sourced.
+#
+# reps=5 (median) per context, not 1: found 2026-08-13 investigating PR #790, which the guard
+# REJECTed on a single-sample "qwen3.6 prefill@512: 6501.2 < 98% of main 8431.0" reading. Two
+# independent re-runs of this exact sweep shape on the SAME PR #790 binary both landed at
+# 8475-8479 -- matching main's own baseline, not remotely close to 6501. The 6501 reading was
+# itself the noise, not a real regression (pin_clocks() is unavailable on this box -- "current
+# user does not have permission to change clocks", a container/virtualization restriction, so
+# there's no way to remove the underlying GPU clock variance at the source; median-of-N over
+# independent samples is the only mitigation available here). Same root cause and same fix as the
+# reps=1->5 change above for Muse Glimmer's own prefill128 -- this sweep just hadn't been touched
+# yet. Costs a few more seconds per context but a guard that can hard-REJECT a real PR on a single
+# unaveraged sample is worse than the extra runtime.
 export MODELS_DIR="$Q36_GUARD_MODELS_DIR" MODEL_REPO="$Q36_GUARD_MODEL_REPO" \\
        MODEL_FILE="$Q36_GUARD_MODEL_FILE" TOK_REPO="$Q36_GUARD_TOK_REPO"
 export MODEL_SHA256="${{QWEN36_MODEL_SHA256:-}}"
@@ -657,7 +669,7 @@ Q36_GGUF="$Q36_GUARD_MODELS_DIR/$Q36_GUARD_MODEL_FILE"
 
 echo "GUARD_START"
 wait_gpu_clear
-if bench_sweep_run "$Q36_GGUF" 128 0 1 512 1 4096 1 16384 1 32768 1; then
+if bench_sweep_run "$Q36_GGUF" 128 0 5 512 5 4096 5 16384 5 32768 5; then
   for ctx in 0 512 4096 16384 32768; do
     echo "GUARD36 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
   done
