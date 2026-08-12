@@ -9,6 +9,7 @@
 namespace sparkinfer {
 
 class ThermalGovernor;   // optional decode-time thermal pacing (thermal_governor.h)
+class BridgeClient;      // optional external KV cache tier (lmcache_bridge_client.h)
 
 // Device (bf16) weight pointers for one layer.
 struct Qwen35LayerWeights {
@@ -184,11 +185,35 @@ public:
     // unsupported for this model/config. Implemented in qwen35_prefill.cpp.
     int prefill_batched(const int* prompt_ids, int n);
 
+    // Prefill prompt tokens [start, end) with the batched path when start==0 and eligible, else
+    // the token loop. chunk_limit > 0 caps the token-loop path to at most chunk_limit tokens per
+    // call (the batched path never chunks — it always covers the full range in one pass, so a
+    // chunk_limit smaller than end-start forces the token-loop fallback); pass 0 for unlimited
+    // (single call covers the whole range). out_pos, if non-null, receives the position reached
+    // (== end once the whole range is consumed, < end if chunk_limit stopped it early). Returns
+    // the argmax seed for decode once out_pos == end, or -1 while there is remaining work (or on
+    // failure). The single funnel both cache_prefix()'s exclusive-session path and
+    // ContinuousBatchEngine::step_job()'s continuous-batch path dispatch prefill through, so
+    // batched-vs-token-loop routing and external KV cache lookup/store (when a bridge is
+    // attached via set_lmcache_bridge()) only need to be implemented once.
+    int ingest_prompt_range(const int* ids, int start, int end, int chunk_limit = 0,
+                            int* out_pos = nullptr);
+
+    // Attaches an optional external KV cache tier (docs/lmcache_bridge_protocol.md). Null (the
+    // default) leaves every lookup/store call site a no-op -- existing behavior is unchanged
+    // unless a caller explicitly opts in. Does not take ownership; the caller (ModelEngine) is
+    // responsible for the BridgeClient's lifetime, which must outlive this model.
+    void set_lmcache_bridge(BridgeClient* bridge);
+
     // Per-request session lifecycle for continuous batching / serving.
     // open_session() allocates right-sized KV blocks (+ hybrid recurrent state when needed).
     // activate_session() binds forward_token / prefill to that seq_id. Returns 0 on OOM.
     uint64_t open_session(int num_tokens);
-    void close_session(uint64_t seq_id);
+    // store_tokens, when non-null and an LMCache bridge is attached, stores this session's KV
+    // for [0, store_tokens->size()) to the bridge (chunk-aligned, see lmcache_maybe_store in
+    // qwen35.cpp) before freeing it -- the "session close" eviction point. Most callers don't
+    // have the original prompt at this call site and pass nullptr, which is a pure no-op.
+    void close_session(uint64_t seq_id, const std::vector<int>* store_tokens = nullptr);
     void activate_session(uint64_t seq_id);
     uint64_t active_session() const;
 
@@ -234,9 +259,6 @@ public:
 
 private:
     void invalidate_decode_graph();
-    // Prefill prompt tokens [start, end) with batched path when start==0, else token loop.
-    // Returns argmax seed at end-1 for decode, or -1 on failure.
-    int ingest_prompt_range(const int* ids, int start, int end);
     void dflash_maybe_capture_layer(int layer);
     // Depth-adaptive KV-split count for a given seqlen (32/128/160/256 tiers, GQA-8/hd256
     // occupancy correction). Shared by forward_token()'s normal per-token adaptation and

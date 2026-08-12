@@ -33,9 +33,28 @@ target_link_libraries(scheduler_cpu_test PRIVATE sparkinfer_runtime)
 set_target_properties(scheduler_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME scheduler_cpu_test COMMAND scheduler_cpu_test)
 
+# BridgeClient (docs/lmcache_bridge_protocol.md) against a from-scratch fake AF_UNIX peer --
+# no GPU, no real lmcache/Python, no shm KV staging (that's bridge/tests/test_bridge_e2e.py's
+# job). Only needs lmcache_bridge_client.cpp, not the full sparkinfer_runtime -- it has zero CUDA
+# dependencies (confirmed: compiles standalone with plain g++, no CUDA headers needed).
+add_executable(lmcache_bridge_client_cpu_test lmcache_bridge_client_cpu_test.cpp
+               ../src/lmcache_bridge_client.cpp)
+target_link_libraries(lmcache_bridge_client_cpu_test PRIVATE Threads::Threads)
+set_target_properties(lmcache_bridge_client_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME lmcache_bridge_client_cpu_test COMMAND lmcache_bridge_client_cpu_test)
+
 add_executable(batch_engine_gpu_test batch_engine_gpu_test.cpp)
 target_link_libraries(batch_engine_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME batch_engine_gpu_test COMMAND batch_engine_gpu_test)
+
+# Real sidecar subprocess + real KV cache + a small synthetic model on real hardware -- the one
+# place both halves of the LMCache bridge run together against the real model code path. Skips
+# (not fails) unless SPARKINFER_LMCACHE_PYTHON/_BRIDGE_SCRIPT point at a real lmcache+torch venv
+# (see bridge/README.md) -- most environments running the rest of this suite won't have that
+# ~1.5GB, CPU-only-torch-is-enough dependency installed.
+add_executable(lmcache_e2e_gpu_test lmcache_e2e_gpu_test.cpp)
+target_link_libraries(lmcache_e2e_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME lmcache_e2e_gpu_test COMMAND lmcache_e2e_gpu_test)
 
 # GPU integration tests — run the real device path; skip without a device.
 add_executable(decode_runner_gpu_test decode_runner_gpu_test.cpp)
