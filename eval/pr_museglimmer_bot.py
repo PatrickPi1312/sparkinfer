@@ -12,13 +12,14 @@ Scoring, same-box PR-vs-main on a single pinned GPU:
   1. Speed  — decode (ctx=0) AND prefill@128 (ctx=128), one Muse Glimmer model load via
               bench_sweep_run, PR vs a freshly-measured origin/main, same box, same run. Same
               tier buckets as the AR and DFlash bots (BUCKETS/SIG/REGRESS_TOL below — copied,
-              not reinvented). The two dimensions are combined **weakest-link**: a PR must clear
-              REGRESS_TOL on both, and the reported tier is whichever of the two is weaker — an
-              XL decode win paired with a flat prefill reports as `none`, not XL. Added
-              2026-08-12 (pt. 4 below) because Muse Glimmer's `batched_prefill_enabled()` always
-              returns false (its SWA/NoPE per-layer pattern has no batched kernel yet), so it
-              *always* pays the slow token-loop prefill path — a decode-only gate could never see
-              a prefill-specific regression.
+              not reinvented). The two dimensions share a regression floor — REGRESS_TOL failing
+              on EITHER is a hard REJECT — but otherwise take the BETTER of the two tiers: a PR
+              that improves one dimension with the other merely flat (not regressed) still earns
+              credit for the real improvement it made, e.g. an XL decode win paired with a flat
+              prefill still reports XL. Added 2026-08-12 (pt. 4 below) because Muse Glimmer's
+              `batched_prefill_enabled()` always returns false (its SWA/NoPE per-layer pattern
+              has no batched kernel yet), so it *always* pays the slow token-loop prefill path —
+              a decode-only gate could never see a prefill-specific regression.
   2. Accuracy gate — teacher-forced qwen3_gguf_score vs a live llama-server reference on the
               SAME GGUF, exactly the methodology validated by hand this session (commit
               6d911d4's message): qwen3_gguf_score dumps sparkinfer's per-position distribution,
@@ -51,8 +52,9 @@ evaluation scope.
               per explicit instruction, 2026-08-12 — narrower than the DFlash bot's guard, in
               keeping with this bot's own "stay small and strict" design goal above.
 
-  4. 128-ctx prefill scoring — see pt. 1's weakest-link description. Reverses the earlier
-              "not prefill" scope decision at the top of this docstring; unlike the Qwen3.6 guard
+  4. 128-ctx prefill scoring — see pt. 1's shared-floor/best-of-the-rest description. Reverses
+              the earlier "not prefill" scope decision at the top of this docstring; unlike the
+              Qwen3.6 guard
               (pt. 3, a pass/fail gate on a DIFFERENT model), this is Muse Glimmer's own second
               first-class scored dimension. EVAL_SCHEMA_VERSION bumped to v3-prefill128 — a PR
               evaluated before this existed must not keep a decode-only-scored label forever.
@@ -896,10 +898,13 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
     prefill_label, prefill_delta_pct, prefill_passed, prefill_reason = tier_from_gain(
         pr["prefill128_pp"], main["prefill128_pp"], metric="prefill@128")
 
-    # Weakest-link: a PR must earn its tier on BOTH decode and prefill@128, not just whichever
-    # metric happened to look best — same conservative, fail-closed philosophy as the accuracy
-    # gate and Q36 guard below (module docstring pt. 4). Either dimension regressing is a hard
-    # REJECT regardless of the other.
+    # Shared regression floor, best-of-the-rest: either dimension regressing is a hard REJECT
+    # regardless of the other (same conservative, fail-closed philosophy as the accuracy gate and
+    # Q36 guard below, module docstring pt. 4) — but a PR that improves ONE dimension with the
+    # OTHER merely flat (not regressed) still earns credit for the real improvement it made. A
+    # pure prefill@128 optimization with unchanged decode should score on its own merits, not get
+    # dragged down to "none" just because decode wasn't also touched — no different from how a
+    # decode-only PR was never expected to also move prefill.
     if decode_label == "REJECT" and prefill_label == "REJECT":
         label, delta_pct, passed = "REJECT", min(decode_delta_pct, prefill_delta_pct), False
         speed_reason = f"{decode_reason} | {prefill_reason}"
@@ -907,7 +912,7 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         label, delta_pct, passed, speed_reason = "REJECT", decode_delta_pct, False, decode_reason
     elif prefill_label == "REJECT":
         label, delta_pct, passed, speed_reason = "REJECT", prefill_delta_pct, False, prefill_reason
-    elif _TIER_RANK[decode_label] <= _TIER_RANK[prefill_label]:
+    elif _TIER_RANK[decode_label] >= _TIER_RANK[prefill_label]:
         label, delta_pct, passed, speed_reason = decode_label, decode_delta_pct, decode_passed, decode_reason
     else:
         label, delta_pct, passed, speed_reason = prefill_label, prefill_delta_pct, prefill_passed, prefill_reason
@@ -1027,7 +1032,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer museglimmer auto-eval — `eval-museglimmer:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-museglimmer:{lab}` |\n"
-        f"| scored at | 128-token decode (ctx=0) + 128-ctx prefill — weakest-link of both |\n"
+        f"| scored at | 128-token decode (ctx=0) + 128-ctx prefill — shared regression floor, best of the two |\n"
         f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
         f"| main decode tok/s | {res['main_decode_tps']:.2f} |\n"
         f"| decode speedup vs main | **{res.get('speedup_vs_main', 0):.2f}×** ({res.get('decode_delta_pct', 0):+.1f}%) |\n"
@@ -1042,12 +1047,13 @@ def format_comment(commit: str, res: dict) -> str:
         f"| commit | `{commit[:9]}` |\n\n"
         f"{res.get('reason') or ''}\n\n"
         "<sub>Scored on the pinned eval box vs same-box `origin/main` — 128-token AR decode "
-        "(ctx=0) AND 128-ctx prefill throughput, from one model load; the reported label is the "
-        "**weaker** of the two tiers, so a PR must earn it on both dimensions, not just whichever "
-        "looked best (no DFlash, no long-context beyond 128) — Muse Glimmer's narrow, deliberately "
+        "(ctx=0) AND 128-ctx prefill throughput, from one model load; either dimension regressing "
+        "is a hard REJECT, but otherwise the reported label is the **better** of the two tiers — "
+        "a PR that improves just one, with the other flat, still earns credit for that "
+        "(no DFlash, no long-context beyond 128) — Muse Glimmer's narrow, deliberately "
         "strict eval scope. This is informational, not a judgment on your PR: a `none` label just "
-        "means no measurable Muse Glimmer speedup was verified on both metrics, which is expected "
-        "and fine if that isn't what your change is about — this bot never closes PRs. "
+        "means no measurable Muse Glimmer speedup was verified on either metric, which is expected "
+        "and fine if that isn't what your change is about. "
         "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on a "
         "Qwen3.6 no-regression guard (decode+prefill, ctx 0/512/4k/16k/32k, same box vs main) — "
         "Muse Glimmer PRs can touch code shared with other models. "
@@ -1290,7 +1296,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 "<!-- sparkinfer-museglimmer-auto-close -->\n"
                 f"## Closed: sparkinfer museglimmer auto-eval — `eval-museglimmer:{label}`\n\n"
                 f"This PR's Muse Glimmer 128-decode/prefill speed measured **{res.get('delta_pct')}%** "
-                f"(weaker of the two dimensions) vs main, {fail_clause} "
+                f"vs main, {fail_clause} "
                 "— closing automatically. This bot evaluates every eligible PR in the repo "
                 "against Muse Glimmer's decode AND prefill@128 speed specifically, regardless of "
                 "what the PR is actually about — a close here isn't a judgment on the PR's purpose, "
