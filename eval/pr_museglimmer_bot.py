@@ -28,9 +28,21 @@ close on none/REJECT and auto-merge on a verified speedup are both live (SPARKIN
 AUTOMERGE=1 in .env.eval) — same policy as pr_dflash_bot.py, also an explicit user decision
 after this bot's first live run wrongly auto-closed an unrelated PR (#768, reopened +
 apologized); the user was told the risk directly and chose to accept it rather than narrow the
-evaluation scope. No Qwen3.5/Qwen3.6/Qwythos cross-model guard — that safety net is a pushed
-backup branch (backup/qwen-model-optimization-20260811 @ 6d911d4) instead of a per-PR check,
-per explicit scope decision.
+evaluation scope.
+
+  3. Qwen3.6 no-regression guard — decode + prefill at ctx 0/512/4k/16k/32k, same box, same PR
+              build, vs a freshly-measured origin/main. Reuses pr_dflash_bot.py's GUARD36 sweep
+              mechanism (bench_sweep_run, REGRESS_TOL=0.98) verbatim rather than reinventing it.
+              A regression here is a hard REJECT regardless of Muse Glimmer's own speed/accuracy
+              result — same discipline as the accuracy gate above. This reverses an earlier,
+              explicit scope decision to leave cross-model guarding to a separate pushed backup
+              branch (backup/qwen-model-optimization-20260811 @ 6d911d4) instead of a per-PR
+              check; the LMCache integration (PR #775) touched shared code
+              (qwen35.cpp/inference_engine.cpp) used by both Muse Glimmer and Qwen3.6, making the
+              backup-branch safety net insufficient on its own — a per-PR guard catches this class
+              of regression before merge, not after. Scoped to Qwen3.6 only (not Qwythos/Qwen3.5)
+              per explicit instruction, 2026-08-12 — narrower than the DFlash bot's guard, in
+              keeping with this bot's own "stay small and strict" design goal above.
 
   python eval/pr_museglimmer_bot.py --instance 46074104
   python eval/pr_museglimmer_bot.py --only-prs 636 --reeval
@@ -78,7 +90,10 @@ ACC_KL_BAR = float(os.environ.get("MUSEGLIMMER_ACC_KL_BAR", "0.10"))
 EVAL_PREFIX = "eval-museglimmer:"
 MUSEGLIMMER_MERGE_FIRST = "museglimmer-merge-first"
 MUSEGLIMMER_NEEDS_REBASE = "museglimmer-needs-rebase"
-EVAL_SCHEMA_VERSION = "v1"
+# Bumped for the Qwen3.6 no-regression guard (see module docstring, pt. 3) — same reasoning as
+# pr_dflash_bot.py's own v2-qwenguard bump: a PR evaluated before the guard existed must not keep
+# an unguarded label/score forever, so its stale marker deliberately stops matching.
+EVAL_SCHEMA_VERSION = "v2-q36guard"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-museglimmer-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -105,6 +120,16 @@ ACC_TOPK = int(os.environ.get("MUSEGLIMMER_ACC_TOPK", "128"))
 # from overlapping with each other).
 LLAMA_SERVER_PORT = int(os.environ.get("MUSEGLIMMER_LLAMA_PORT", "8097"))
 EVAL_TEXT = "bench/scripts/eval_text.txt"  # the exact known-good corpus from this session's fixes
+
+# Qwen3.6 no-regression guard (module docstring, pt. 3) — same env var names as pr_dflash_bot.py's
+# Q36_GUARD_* (PRIMARY36_MODEL_REPO/PRIMARY36_TOK_REPO) so one .env.eval entry covers both bots.
+# Defaults point at this box's actual layout (confirmed 2026-08-12: /root/workspace/models36),
+# distinct from the DFlash bot's vast.ai-box convention (/workspace/models36).
+Q36_GUARD_MODELS_DIR = os.environ.get("Q36_GUARD_MODELS_DIR", "/root/workspace/models36")
+Q36_GUARD_MODEL_FILE = os.environ.get("Q36_GUARD_MODEL_FILE", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+Q36_GUARD_MODEL_REPO = os.environ.get("PRIMARY36_MODEL_REPO", "unsloth/Qwen3.6-35B-A3B-GGUF")
+Q36_GUARD_TOK_REPO = os.environ.get("PRIMARY36_TOK_REPO", "Qwen/Qwen3.6-35B-A3B")
+GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
 # shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
@@ -175,6 +200,41 @@ def tier_from_gain(pr_tps: float, main_tps: float):
         if g >= thr:
             return name, pct, True, "ok"
     return "none", pct, True, "ok"
+
+
+def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """No-regression check: PR vs same-box main, Qwen3.6 only, decode + prefill, every measured
+    context. Adapted from pr_dflash_bot.py's check_qwen_guard (its qwen3.5/Qwythos half dropped —
+    scoped to qwen3.6 only per explicit instruction, module docstring pt. 3). Returns
+    (ok, [human-readable regression/failure strings])."""
+    problems = []
+    if pr.get("guard36_failed") or main.get("guard36_failed") or not pr.get("guard36") or not main.get("guard36"):
+        problems.append("qwen3.6 guard measurement unavailable")
+    pr_ctxs, main_ctxs = pr.get("guard36") or {}, main.get("guard36") or {}
+    # Iterate over MAIN's contexts (the reference set) — a PR build that crashes partway through
+    # its own sweep must not make that context silently uncheckable. Fail closed: a real main
+    # baseline (base > 0) with a missing/zero PR measurement (cur <= 0) is a regression, not a skip.
+    for ctx, main_vals in main_ctxs.items():
+        label = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        pr_vals = pr_ctxs.get(ctx) or {}
+        for metric in ("decode", "prefill"):
+            base = main_vals.get(metric, 0)
+            if base <= 0:
+                continue  # main itself has no baseline for this metric/ctx — not comparable
+            cur = pr_vals.get(metric, 0)
+            if cur <= 0:
+                problems.append(
+                    f"qwen3.6 {metric}@{label}: PR measurement missing/zero "
+                    f"(main {base:.1f}) — treated as regression"
+                )
+                continue
+            if cur < base * tol:
+                pct = 100.0 * (cur - base) / base
+                problems.append(
+                    f"qwen3.6 {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
+                    f"{base:.1f} ({pct:+.1f}%)"
+                )
+    return (len(problems) == 0, problems)
 
 
 def museglimmer_evaluated_commits(repo, num):
@@ -351,6 +411,10 @@ def _remote_script(ref: str) -> str:
     topk = ACC_TOPK
     port = LLAMA_SERVER_PORT
     eval_text = shlex.quote(EVAL_TEXT)
+    q36_dir = shlex.quote(Q36_GUARD_MODELS_DIR)
+    q36_file = shlex.quote(Q36_GUARD_MODEL_FILE)
+    q36_repo = shlex.quote(Q36_GUARD_MODEL_REPO)
+    q36_tok = shlex.quote(Q36_GUARD_TOK_REPO)
     return f"""
 set -euo pipefail
 # Surface *why* a crash happened instead of dying silently — same diagnostic trap as
@@ -388,6 +452,10 @@ NTOK={ntok}
 TOPK={topk}
 PORT={port}
 EVAL_TEXT={eval_text}
+Q36_GUARD_MODELS_DIR={q36_dir}
+Q36_GUARD_MODEL_FILE={q36_file}
+Q36_GUARD_MODEL_REPO={q36_repo}
+Q36_GUARD_TOK_REPO={q36_tok}
 
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
@@ -501,11 +569,39 @@ echo "RESULT_TOP1 ${{TOP1:-0}}"
 echo "RESULT_KL ${{KL:-99}}"
 echo "RESULT_PPL_SPARK ${{PPLS:-0}}"
 echo "RESULT_PPL_LLAMA ${{PPLL:-0}}"
+
+# --- Qwen3.6 no-regression guard (decode + prefill, ctx 0/512/4k/16k/32k) — same qwen3_gguf_bench
+# binary already built above, same bench_sweep_run mechanism pr_dflash_bot.py's GUARD36 uses
+# (module docstring, pt. 3). A separate GGUF/model load from Muse Glimmer's own — a shared-code
+# regression that only shows up on Qwen3.6's architecture would otherwise slip past this bot
+# entirely, as it did for the LMCache integration (PR #775) until checked by hand.
+# _eval_speed.sh's si_run/bench_sweep_run assume _common.sh's ensure_model/ensure_tokenizer/si_run
+# are already sourced (same load order as pr_dflash_bot.py's GUARD36 block) — not implicit.
+source bench/scripts/_common.sh
+source bench/scripts/_eval_speed.sh
+export MODELS_DIR="$Q36_GUARD_MODELS_DIR" MODEL_REPO="$Q36_GUARD_MODEL_REPO" \\
+       MODEL_FILE="$Q36_GUARD_MODEL_FILE" TOK_REPO="$Q36_GUARD_TOK_REPO"
+export MODEL_SHA256="${{QWEN36_MODEL_SHA256:-}}"
+( ensure_model && ensure_tokenizer ) || echo "WARN: qwen3.6 guard model setup failed" >&2
+Q36_GGUF="$Q36_GUARD_MODELS_DIR/$Q36_GUARD_MODEL_FILE"
+SI_BIN="$PWD/build/runtime"; SI_LD=""
+
+echo "GUARD_START"
+wait_gpu_clear
+if bench_sweep_run "$Q36_GGUF" 128 0 1 512 1 4096 1 16384 1 32768 1; then
+  for ctx in 0 512 4096 16384 32768; do
+    echo "GUARD36 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+  done
+else
+  echo "GUARD36_FAILED"
+fi
+echo "GUARD_END"
 """
 
 
 def _parse_remote(stdout: str) -> dict:
     out = {}
+    guard36 = {}
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
@@ -539,6 +635,16 @@ def _parse_remote(stdout: str) -> dict:
                 out["token_count"] = int(line.split()[1])
             except ValueError:
                 pass
+        elif line.startswith("GUARD36 "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guard36[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.strip() == "GUARD36_FAILED":
+            out["guard36_failed"] = True
+    out["guard36"] = guard36
     return out
 
 
@@ -732,6 +838,16 @@ def eval_museglimmer_on_box(host, port, pr_ref: str):
         label = "REJECT"
         passed = False
 
+    q36_ok, q36_problems = check_q36_guard(pr, main)
+    if not q36_ok:
+        # Same hard-REJECT discipline as the accuracy gate: a Muse Glimmer PR that silently
+        # regresses Qwen3.6 via shared code (qwen35.cpp/inference_engine.cpp) is unmergeable
+        # regardless of its own speed/accuracy result — see module docstring pt. 3.
+        q36_reason = "qwen3.6 no-regression guard failed: " + "; ".join(q36_problems[:6])
+        reason = f"{q36_reason} | {reason}"
+        label = "REJECT"
+        passed = False
+
     res = {
         "ok": True,
         "label": label,
@@ -748,6 +864,10 @@ def eval_museglimmer_on_box(host, port, pr_ref: str):
         "main_top1": main.get("top1"),
         "main_kl": main.get("kl"),
         "accuracy_ok": accuracy_ok,
+        "q36_guard_ok": q36_ok,
+        "q36_guard_problems": q36_problems,
+        "q36_guard": pr.get("guard36"),
+        "q36_guard_main": main.get("guard36"),
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
     }
@@ -765,6 +885,7 @@ def format_comment(commit: str, res: dict) -> str:
         "main_decode_tps": res.get("main_decode_tps"),
         "pass": res.get("pass"),
         "accuracy_ok": res.get("accuracy_ok"),
+        "q36_guard_ok": res.get("q36_guard_ok"),
     }
     marker = (
         f"<!-- sparkinfer-museglimmer-eval:{EVAL_SCHEMA_VERSION}:{commit} "
@@ -789,6 +910,12 @@ def format_comment(commit: str, res: dict) -> str:
         main_acc_note = (f"| ⚠️ same-box main accuracy | top1={res.get('main_top1'):.3f} "
                           f"kl={res.get('main_kl'):.4f} — main ALSO misses the bar (informational; "
                           "not gated on main, but check the box/corpus if this persists) |\n")
+    if res.get("q36_guard_ok"):
+        q36_row = "| qwen3.6 guard | ✅ no regression (decode+prefill, ctx 0/512/4k/16k/32k) |\n"
+    else:
+        problems = "; ".join((res.get("q36_guard_problems") or [])[:4])
+        q36_row = (f"| qwen3.6 guard | ❌ **FAILED** — {problems} — "
+                    "**verdict forced to REJECT regardless of speed/accuracy** |\n")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -809,6 +936,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"| speedup vs main | **{res.get('speedup_vs_main', 0):.2f}×** ({res.get('delta_pct', 0):+.1f}%) |\n"
         f"{acc_row}"
         f"{main_acc_note}"
+        f"{q36_row}"
         f"| PPL sparkinfer / llama.cpp | {res.get('pr_ppl_spark') or '?'} / {res.get('pr_ppl_llama') or '?'} |\n"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
@@ -818,7 +946,9 @@ def format_comment(commit: str, res: dict) -> str:
         "eval scope. This is informational, not a judgment on your PR: a `none` label just means "
         "no measurable Muse Glimmer 128-decode speedup was found, which is expected and fine if "
         "that isn't what your change is about — this bot never closes PRs. "
-        "Correctness gated against a live llama.cpp reference on the same GGUF. "
+        "Correctness gated against a live llama.cpp reference on the same GGUF. Also gated on a "
+        "Qwen3.6 no-regression guard (decode+prefill, ctx 0/512/4k/16k/32k, same box vs main) — "
+        "Muse Glimmer PRs can touch code shared with other models. "
         "Automated — **not merged**; merge manually after review.</sub>\n"
     )
 
@@ -945,6 +1075,7 @@ def upload_museglimmer_eval_log(repo, num, title, oid, res):
             "speedup_vs_main": res.get("speedup_vs_main"),
             "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
             "accuracy_ok": res.get("accuracy_ok"),
+            "q36_guard_ok": res.get("q36_guard_ok"), "q36_guard_problems": res.get("q36_guard_problems"),
             "gpu": "pinned eval box", "date": arb.datetime.date.today().isoformat(),
         }
         if receipt:
@@ -993,7 +1124,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         label = "REJECT"
     print(f"PR #{num}: eval-museglimmer:{label}  "
           f"PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')} "
-          f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}")
+          f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
+          f"q36_guard_ok={res.get('q36_guard_ok')}")
     if dry_run:
         print(body[:500])
         return
@@ -1019,6 +1151,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "main_decode_tps": res.get("main_decode_tps"),
             "pass": res.get("pass"),
             "accuracy_ok": res.get("accuracy_ok"),
+            "q36_guard_ok": res.get("q36_guard_ok"),
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
@@ -1034,11 +1167,19 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         # Muse-Glimmer-relevant PRs. If this causes another wrongful close, reopen + apologize the
         # same way, and reconsider the scope-narrowing alternative that was declined here.
         if label in ("none", "REJECT"):
+            if not res.get("q36_guard_ok", True):
+                fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
+            elif not res.get("accuracy_ok"):
+                fail_clause = "and failed the accuracy gate"
+            elif label == "none":
+                fail_clause = "with no verified improvement"
+            else:
+                fail_clause = "(regression)"
             close_body = (
                 "<!-- sparkinfer-museglimmer-auto-close -->\n"
                 f"## Closed: sparkinfer museglimmer auto-eval — `eval-museglimmer:{label}`\n\n"
                 f"This PR's Muse Glimmer 128-decode speed measured **{res.get('delta_pct')}%** vs "
-                f"main, {'and failed the accuracy gate' if not res.get('accuracy_ok') else 'with no verified improvement' if label == 'none' else '(regression)'} "
+                f"main, {fail_clause} "
                 "— closing automatically. This bot evaluates every eligible PR in the repo "
                 "against Muse Glimmer's decode speed specifically, regardless of what the PR is "
                 "actually about — a close here isn't a judgment on the PR's purpose, just that it "
