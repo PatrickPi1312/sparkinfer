@@ -63,69 +63,35 @@ bool set_error(std::string& err, const std::string& message) {
     return false;
 }
 
-// nlohmann's ordinary DOM parser accepts duplicate object keys (last value wins). That is
-// dangerous for tool requests: an auditor, prompt renderer, and executor could otherwise see
-// different meanings for the same schema or argument object. Forward SAX events to its DOM
-// builder while rejecting a repeated key at every nesting level.
-class StrictJsonSax final : public json::json_sax_t {
-public:
-    explicit StrictJsonSax(json& result) : dom_(result, false) {}
-
-    bool null() override { return dom_.null(); }
-    bool boolean(bool value) override { return dom_.boolean(value); }
-    bool number_integer(number_integer_t value) override { return dom_.number_integer(value); }
-    bool number_unsigned(number_unsigned_t value) override { return dom_.number_unsigned(value); }
-    bool number_float(number_float_t value, const string_t& token) override {
-        return dom_.number_float(value, token);
-    }
-    bool string(string_t& value) override { return dom_.string(value); }
-    bool binary(binary_t& value) override { return dom_.binary(value); }
-    bool start_object(std::size_t count) override {
-        object_keys_.emplace_back();
-        return dom_.start_object(count);
-    }
-    bool key(string_t& value) override {
-        if (object_keys_.empty()) {
-            error_ = "JSON parser received an object key outside an object";
-            return false;
-        }
-        if (!object_keys_.back().insert(value).second) {
-            error_ = "duplicate JSON object key " + value;
-            return false;
-        }
-        return dom_.key(value);
-    }
-    bool end_object() override {
-        if (object_keys_.empty()) {
-            error_ = "JSON parser received an unmatched object close";
-            return false;
-        }
-        const bool ok = dom_.end_object();
-        object_keys_.pop_back();
-        return ok;
-    }
-    bool start_array(std::size_t count) override { return dom_.start_array(count); }
-    bool end_array() override { return dom_.end_array(); }
-    bool parse_error(std::size_t, const std::string&, const nlohmann::detail::exception& ex) override {
-        error_ = ex.what();
-        return false;
-    }
-
-    const std::string& error() const { return error_; }
-
-private:
-    nlohmann::detail::json_sax_dom_parser<json> dom_;
-    std::vector<std::set<std::string>> object_keys_;
-    std::string error_;
-};
-
 bool parse_strict_json(const std::string& text, json& value, std::string& err,
                        const std::string& where) {
-    value = json();
-    StrictJsonSax sax(value);
-    if (!json::sax_parse(text, &sax, json::input_format_t::json, true)) {
-        return set_error(err, where + ": " + (sax.error().empty() ? "invalid JSON" : sax.error()));
+    // nlohmann's ordinary DOM parser accepts duplicate object keys (last value wins). That is
+    // dangerous for tool requests: an auditor, prompt renderer, and executor could otherwise
+    // see different meanings. Its public parser callback reports every object/key boundary,
+    // which lets us reject duplicates without depending on version-specific detail classes.
+    std::vector<std::set<std::string>> object_keys;
+    std::string duplicate_key;
+    const json::parser_callback_t callback =
+        [&](int, json::parse_event_t event, json& parsed) -> bool {
+            if (event == json::parse_event_t::object_start) {
+                object_keys.emplace_back();
+            } else if (event == json::parse_event_t::key) {
+                const std::string key = parsed.get<std::string>();
+                if (object_keys.empty() || !object_keys.back().insert(key).second) {
+                    if (duplicate_key.empty()) duplicate_key = key;
+                }
+            } else if (event == json::parse_event_t::object_end && !object_keys.empty()) {
+                object_keys.pop_back();
+            }
+            return true;
+        };
+    try {
+        value = json::parse(text, callback, true, false);
+    } catch (const json::exception& ex) {
+        return set_error(err, where + ": " + ex.what());
     }
+    if (!duplicate_key.empty())
+        return set_error(err, where + ": duplicate JSON object key " + duplicate_key);
     return true;
 }
 
