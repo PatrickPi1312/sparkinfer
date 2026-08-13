@@ -110,6 +110,7 @@ struct RequestControls {
     bool stream = false;
     bool include_usage = false;
     int max_tokens = 256;
+    std::vector<std::string> stop;
 };
 
 bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err) {
@@ -144,6 +145,35 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
             return false;
         }
     }
+    if (root.contains("stop") && !root["stop"].is_null()) {
+        const auto& value = root["stop"];
+        std::vector<std::string> stops;
+        if (value.is_string()) {
+            stops.push_back(value.get<std::string>());
+        } else if (value.is_array()) {
+            for (const auto& item : value) {
+                if (!item.is_string()) {
+                    err = "stop entries must be strings";
+                    return false;
+                }
+                stops.push_back(item.get<std::string>());
+            }
+        } else {
+            err = "stop must be a string or an array of strings";
+            return false;
+        }
+        if (stops.size() > 4) {
+            err = "stop supports at most 4 strings";
+            return false;
+        }
+        for (const auto& s : stops) {
+            if (s.empty()) {
+                err = "stop entries must be non-empty strings";
+                return false;
+            }
+        }
+        out.stop = std::move(stops);
+    }
     if (root.contains("stream_options")) {
         if (!root["stream_options"].is_object()) {
             err = "stream_options must be an object";
@@ -159,6 +189,21 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
         }
     }
     return true;
+}
+
+// One-shot scan over a complete decoded string: is there a stop match anywhere, and where.
+// Unlike StopSequenceFilter, this needs no holdback machinery -- it's only ever called once
+// generation has already stopped and the full text is available in hand.
+bool find_stop_match(const std::string& text, const std::vector<std::string>& stops, size_t& pos) {
+    bool found = false;
+    for (const auto& s : stops) {
+        const size_t p = text.find(s);
+        if (p != std::string::npos && (!found || p < pos)) {
+            pos = p;
+            found = true;
+        }
+    }
+    return found;
 }
 
 nlohmann::json stream_chunk_base(const std::string& cid, long long created) {
@@ -525,7 +570,8 @@ int main(int argc, char** argv) {
                      res.set_chunked_content_provider(
                          "text/event-stream",
                          [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
-                          chat_request, tool_protocol, include_usage = controls.include_usage]
+                          chat_request, tool_protocol, include_usage = controls.include_usage,
+                          stop = controls.stop]
                          (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
                                  sink.done();
@@ -539,6 +585,13 @@ int main(int argc, char** argv) {
                              std::vector<int> stream_ids;
                              stream_ids.reserve((size_t)max_tokens);
                              sparkinfer_server::ThinkingStreamSplitter splitter(enable_thinking, engine.is_museglimmer());
+                             sparkinfer_server::StopSequenceFilter stop_filter(stop);
+                             std::string tool_stop_text;  // raw accumulator, tool_protocol branch only
+                             // Set by either on_tok branch right before it returns false to signal a
+                             // matched `stop` sequence -- checked ahead of outcome.cancelled below,
+                             // since both now collapse to the same engine-level cancelled flag, but
+                             // only a real disconnect means "the client is gone, send nothing".
+                             bool stopped_by_sequence = false;
                              // Returning false cancels generation -- the client is gone, so there
                              // is no point spending GPU time finishing the response.
                              auto on_tok = [&](int tid) -> bool {
@@ -547,11 +600,36 @@ int main(int argc, char** argv) {
                                  // valid atomic OpenAI SSE deltas, and guarantees malformed or
                                  // partial markup can never leak as executable client content.
                                  if (tool_protocol) {
-                                     stream_ids.push_back(tid);
+                                     if (stop.empty()) {
+                                         stream_ids.push_back(tid);
+                                         return sink.is_writable();
+                                     }
+                                     // Only pay for incremental decode here when the client
+                                     // actually set `stop` -- a scoped opt-in, not a blanket cost
+                                     // increase for every tool-calling request.
+                                     tool_stop_text += g_tokenizer.decode_delta(stream_ids, tid);
+                                     size_t pos;
+                                     if (find_stop_match(tool_stop_text, stop, pos)) {
+                                         stopped_by_sequence = true;
+                                         return false;
+                                     }
                                      return sink.is_writable();
                                  }
                                  std::string piece = g_tokenizer.decode_delta(stream_ids, tid);
-                                 const auto delta = splitter.feed(piece);
+                                 std::string safe = stop_filter.feed(piece);
+                                 if (stop_filter.matched()) {
+                                     if (!safe.empty()) {
+                                         const auto delta = splitter.feed(safe);
+                                         if (!delta.reasoning_content.empty())
+                                             write_stream_delta(sink, cid, created, "reasoning_content",
+                                                                delta.reasoning_content);
+                                         if (!delta.content.empty())
+                                             write_stream_delta(sink, cid, created, "content", delta.content);
+                                     }
+                                     stopped_by_sequence = true;
+                                     return false;
+                                 }
+                                 const auto delta = splitter.feed(safe);
                                  bool ok = true;
                                  if (!delta.reasoning_content.empty())
                                      ok = write_stream_delta(sink, cid, created, "reasoning_content",
@@ -565,7 +643,7 @@ int main(int argc, char** argv) {
                              const int completion_tokens = (int)stream_ids.size();
                              g_prompt_tokens_total += (uint64_t)prompt_tokens;
                              g_completion_tokens_total += (uint64_t)completion_tokens;
-                             if (outcome.cancelled) {
+                             if (outcome.cancelled && !stopped_by_sequence) {
                                  // Client is already gone -- nothing left to write to, just record it.
                                  g_requests_cancelled++;
                                  sink.done();
@@ -604,13 +682,18 @@ int main(int argc, char** argv) {
                                      sink.done();
                                      return true;
                                  }
+                                 if (stopped_by_sequence) {
+                                     size_t pos;
+                                     if (find_stop_match(text, stop, pos)) text.resize(pos);
+                                 }
                                  auto parsed = sparkinfer_server::parse_assistant_output(
                                      text, enable_thinking, engine.is_museglimmer(), &chat_request);
                                  if (!parsed.error.empty()) {
-                                     if (outcome.reached_token_limit) {
+                                     if (outcome.reached_token_limit || stopped_by_sequence) {
                                          // A truncated native call is not an executable result,
-                                         // but token exhaustion is still a normal completion.
-                                         // Emit no buffered markup and finish with "length".
+                                         // but token exhaustion (or a stop sequence landing mid
+                                         // tool-call XML) is still a normal completion.
+                                         // Emit no buffered markup and finish with "length"/"stop".
                                          parsed = {};
                                      } else {
                                          g_requests_invalid_tool_output++;
@@ -635,7 +718,12 @@ int main(int argc, char** argv) {
                                      write_stream_tool_call(sink, cid, created, i, parsed.tool_calls[i]);
                                  }
                                  if (!parsed.tool_calls.empty()) finish_reason = "tool_calls";
-                             } else {
+                             } else if (!stopped_by_sequence) {
+                                 // On a stop-match exit, on_tok already wrote whatever safe text
+                                 // stop_filter cleared before returning false. Deliberately skip
+                                 // finish() here: it exists to flush the splitter's OWN unrelated
+                                 // holdback on a legitimate end of generation, not bytes stop_filter
+                                 // never vetted -- generation ends at the match point regardless.
                                  sparkinfer_server::ThinkingStreamSplitter::Delta flush;
                                  splitter.finish(flush);
                                  write_stream_delta(sink, cid, created, "reasoning_content",
@@ -656,7 +744,27 @@ int main(int argc, char** argv) {
                      return;
                  }
 
-                 const auto outcome = engine.complete(prompt_ids, max_tokens);
+                 // engine.complete() is complete_streaming(..., nullptr); pass a real callback
+                 // whenever stop was requested so non-streaming requests can halt early too --
+                 // previously stop-checking (and the compute savings of stopping early) were
+                 // unavailable here entirely.
+                 std::vector<int> nonstream_ids;
+                 std::string nonstream_stop_text;
+                 bool stopped_by_sequence = false;
+                 auto nonstream_on_tok = [&](int tid) -> bool {
+                     if (controls.stop.empty()) {
+                         nonstream_ids.push_back(tid);
+                         return true;
+                     }
+                     nonstream_stop_text += g_tokenizer.decode_delta(nonstream_ids, tid);
+                     size_t pos;
+                     if (find_stop_match(nonstream_stop_text, controls.stop, pos)) {
+                         stopped_by_sequence = true;
+                         return false;
+                     }
+                     return true;
+                 };
+                 const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok);
                  std::string text;
                  if (!outcome.error.empty()) {
                      res.status = record_and_status(outcome);
@@ -673,13 +781,17 @@ int main(int argc, char** argv) {
                  }
                  g_prompt_tokens_total += (uint64_t)prompt_ids.size();
                  g_completion_tokens_total += (uint64_t)outcome.tokens.size();
+                 if (stopped_by_sequence) {
+                     size_t pos;
+                     if (find_stop_match(text, controls.stop, pos)) text.resize(pos);
+                 }
 
                  auto parsed = sparkinfer_server::parse_assistant_output(
                      text, enable_thinking, engine.is_museglimmer(),
                      tool_protocol ? &chat_request : nullptr);
                  if (!parsed.error.empty()) {
-                     if (outcome.reached_token_limit) {
-                         // Never expose a truncated native tag sequence. A length stop is a
+                     if (outcome.reached_token_limit || stopped_by_sequence) {
+                         // Never expose a truncated native tag sequence. A length/stop end is a
                          // valid completion, so return an empty assistant result instead of 5xx.
                          parsed = {};
                      } else {

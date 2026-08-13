@@ -108,6 +108,75 @@ bool test_nonthinking_stream_hides_terminal_marker() {
     return true;
 }
 
+bool test_stop_filter_full_match_single_chunk() {
+    sparkinfer_server::StopSequenceFilter filter({"STOP"});
+    const std::string safe = filter.feed("hello STOP world");
+    CHECK(filter.matched());
+    CHECK(safe == "hello ");
+    return true;
+}
+
+bool test_stop_filter_match_split_across_chunks() {
+    sparkinfer_server::StopSequenceFilter filter({"STOP"});
+    std::string safe = filter.feed("hello ST");
+    CHECK(!filter.matched());
+    CHECK(safe == "hello ");  // "ST" held back as a possible partial prefix of "STOP"
+    safe += filter.feed("OP more");
+    CHECK(filter.matched());
+    CHECK(safe == "hello ");
+    return true;
+}
+
+bool test_stop_filter_multiple_stops_earliest_wins() {
+    sparkinfer_server::StopSequenceFilter filter({"world", "STOP"});
+    const std::string safe = filter.feed("hello STOP world");
+    CHECK(filter.matched());
+    CHECK(safe == "hello ");  // "STOP" occurs first even though it's second in the list
+    return true;
+}
+
+bool test_stop_filter_prefix_of_another_stop() {
+    // Shorter stop fires as soon as it completes, regardless of list order -- matches real
+    // OpenAI/vLLM/llama.cpp behavior, not a bug.
+    sparkinfer_server::StopSequenceFilter filter({"a", "ab"});
+    const std::string safe = filter.feed("xy a z");
+    CHECK(filter.matched());
+    CHECK(safe == "xy ");
+    return true;
+}
+
+bool test_stop_filter_no_match_never_swallows_permanently() {
+    sparkinfer_server::StopSequenceFilter filter({"NEVER_APPEARS"});
+    std::string safe;
+    for (const char* piece : {"hello ", "there ", "world"}) safe += filter.feed(piece);
+    CHECK(!filter.matched());
+    CHECK(safe == "hello there world");
+    return true;
+}
+
+bool test_stop_filter_empty_stop_list_is_passthrough() {
+    sparkinfer_server::StopSequenceFilter filter({});
+    const std::string safe = filter.feed("anything at all");
+    CHECK(!filter.matched());
+    CHECK(safe == "anything at all");
+    return true;
+}
+
+bool test_stop_filter_marker_with_embedded_nul() {
+    // A JSON string can encode an embedded NUL byte; std::string preserves it but strlen()
+    // would silently truncate there. Indirectly exercises the marker_prefix_len(std::string)
+    // overload StopSequenceFilter relies on for holdback -- if it truncated at the NUL, this
+    // stop string would falsely match on "A" alone instead of requiring the full "A\0B".
+    const std::string stop_with_nul = std::string("A\0B", 3);
+    sparkinfer_server::StopSequenceFilter filter({stop_with_nul});
+    std::string safe = filter.feed(std::string("xA", 2));
+    CHECK(!filter.matched());  // "A" alone must not be treated as a full match
+    safe += filter.feed(std::string("\0By", 3));
+    CHECK(filter.matched());
+    CHECK(safe == "x");
+    return true;
+}
+
 bool test_muse_rejects_all_tool_protocol_history() {
     sparkinfer_server::ChatRequest parsed;
     std::string error;
@@ -168,6 +237,13 @@ int main() {
     if (!test_thinking_stream_boundaries()) return 1;
     if (!test_thinking_stream_repeated_opening_marker()) return 1;
     if (!test_nonthinking_stream_hides_terminal_marker()) return 1;
+    if (!test_stop_filter_full_match_single_chunk()) return 1;
+    if (!test_stop_filter_match_split_across_chunks()) return 1;
+    if (!test_stop_filter_multiple_stops_earliest_wins()) return 1;
+    if (!test_stop_filter_prefix_of_another_stop()) return 1;
+    if (!test_stop_filter_no_match_never_swallows_permanently()) return 1;
+    if (!test_stop_filter_empty_stop_list_is_passthrough()) return 1;
+    if (!test_stop_filter_marker_with_embedded_nul()) return 1;
     if (!test_muse_rejects_all_tool_protocol_history()) return 1;
     if (!test_tool_choice_none_still_uses_strict_output_parser()) return 1;
     std::printf("chat_tokenizer_test: OK\n");

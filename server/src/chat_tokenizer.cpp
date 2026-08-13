@@ -43,6 +43,18 @@ size_t marker_prefix_len(const std::string& data, const char* marker) {
     return 0;
 }
 
+// Same algorithm, but for a caller-supplied string whose length may include an embedded NUL
+// byte (client input via JSON can encode one) -- strlen() would silently truncate at it, unlike
+// the compile-time literal markers above where that can't happen.
+size_t marker_prefix_len(const std::string& data, const std::string& marker) {
+    const size_t n = marker.size();
+    const size_t max = std::min(data.size(), n > 0 ? n - 1 : 0);
+    for (size_t len = max; len > 0; len--) {
+        if (data.compare(data.size() - len, len, marker, 0, len) == 0) return len;
+    }
+    return 0;
+}
+
 void trim_leading_ws(std::string& s) {
     while (!s.empty() && (s[0] == '\n' || s[0] == '\r' || s[0] == ' ' || s[0] == '\t')) s.erase(0, 1);
 }
@@ -514,6 +526,35 @@ void ThinkingStreamSplitter::finish(Delta& tail) {
     tail.content = strip_think_markers(std::move(tail.content));
     strip_trailing_im_end(tail.content);
     trim_leading_ws(tail.content);
+}
+
+StopSequenceFilter::StopSequenceFilter(std::vector<std::string> stops) : stops_(std::move(stops)) {}
+
+std::string StopSequenceFilter::feed(const std::string& piece) {
+    std::string data = carry_ + piece;
+    carry_.clear();
+    if (stops_.empty()) return data;
+
+    // Full-match scan: earliest position across all stops wins (ties are inconsequential -- the
+    // trim point is identical either way, since a tie only happens when one stop is a prefix of
+    // another and both start at the same position).
+    size_t match_pos = std::string::npos;
+    for (const auto& stop : stops_) {
+        const size_t pos = data.find(stop);
+        if (pos != std::string::npos && pos < match_pos) match_pos = pos;
+    }
+    if (match_pos != std::string::npos) {
+        matched_ = true;
+        return data.substr(0, match_pos);  // text after this point is permanently dropped
+    }
+
+    // No full match yet: hold back the longest suffix that could still be an in-progress
+    // partial prefix of any stop string.
+    size_t keep = 0;
+    for (const auto& stop : stops_) keep = std::max(keep, marker_prefix_len(data, stop));
+    const size_t emit_len = data.size() - keep;
+    if (keep > 0) carry_ = data.substr(emit_len);
+    return data.substr(0, emit_len);
 }
 
 bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::vector<int>& ids,

@@ -76,6 +76,31 @@ private:
     bool mg_done_ = false;
 };
 
+// Detects OpenAI-style client-supplied `stop` sequences in a live, incrementally-decoded token
+// stream. Generalizes the single-compile-time-marker holdback pattern ThinkingStreamSplitter
+// uses for <|im_end|>/<think> to an arbitrary list of up to 4 dynamic strings: text that could
+// still be an in-progress prefix of any stop string is buffered (never returned) until a later
+// feed() either completes it into a full match (matched() becomes true; the held-back bytes and
+// the matched text itself are permanently dropped, never returned) or disproves it (the
+// held-back bytes are released as ordinary text). An empty stop list makes feed() a cheap
+// passthrough, so it's safe to always construct one per request.
+class StopSequenceFilter {
+public:
+    explicit StopSequenceFilter(std::vector<std::string> stops);
+
+    // Feeds the next raw decoded delta. Returns the subset of text now known not to be part of
+    // a stop match, safe to forward downstream immediately. Once matched() is true, feed() must
+    // not be called again.
+    std::string feed(const std::string& piece);
+
+    bool matched() const { return matched_; }
+
+private:
+    std::vector<std::string> stops_;
+    std::string carry_;
+    bool matched_ = false;
+};
+
 bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessage>& messages, std::string& err);
 bool parse_enable_thinking(const std::string& request_json, bool default_value = false);
 bool validate_chat_request_model_support(const ChatRequest& request, bool museglimmer,
