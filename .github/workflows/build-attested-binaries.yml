@@ -91,7 +91,15 @@ jobs:
             > "${BUNDLE}/BUILD_MANIFEST.json"
           (cd "${BUNDLE}" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
           (cd "${BUNDLE}" && sha256sum -c SHA256SUMS)
-          LD_LIBRARY_PATH="${BUNDLE}/lib:${LD_LIBRARY_PATH:-}" "${BUNDLE}/bin/sparkinfer_server" --help
+          # Hosted runners have the toolkit's official NVML link stub but no NVIDIA
+          # driver, so provide the runtime SONAME only for this --help relocation smoke.
+          NVML_STUB="$(find "${CUDA_PATH}" -path '*/stubs/libnvidia-ml.so' -print -quit)"
+          test -n "${NVML_STUB}"
+          NVML_SMOKE_DIR="${RUNNER_TEMP}/sparkinfer-nvml-stub"
+          mkdir -p "${NVML_SMOKE_DIR}"
+          ln -s "${NVML_STUB}" "${NVML_SMOKE_DIR}/libnvidia-ml.so.1"
+          LD_LIBRARY_PATH="${BUNDLE}/lib:${NVML_SMOKE_DIR}:${LD_LIBRARY_PATH:-}" \
+            "${BUNDLE}/bin/sparkinfer_server" --help
           ls -laR "${BUNDLE}"
 
       - name: Generate artifact attestation
