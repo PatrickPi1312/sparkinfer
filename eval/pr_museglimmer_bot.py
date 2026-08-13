@@ -1271,6 +1271,18 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         print(body[:500])
         return
     strip_museglimmer_eval_labels(repo, num)
+    if label in SPEEDUP_LABELS:
+        # A fresh, valid speedup score for the CURRENT head commit means this PR is caught up
+        # with main and deserves a fair shot at winning the next merge-first reconciliation --
+        # clear any stale needs-rebase from a round it lost (or an old conflict that's since been
+        # resolved). Found 2026-08-13: reconcile_museglimmer_merge_labels() filters candidates on
+        # `MUSEGLIMMER_NEEDS_REBASE not in labs` (this bot's own "who's eligible to win" gate) but
+        # the ONLY place that ever removed the label was the winner-selection branch itself --
+        # a PR that lost one round, or ever hit a transient merge conflict, could never be
+        # reconsidered again even after a completely clean re-evaluation confirmed its score,
+        # since it was filtered out of candidacy before scoring was ever compared. Hit #790 and
+        # #791 both losing merge-first to a strictly worse score for exactly this reason.
+        arb.remove_label(repo, num, MUSEGLIMMER_NEEDS_REBASE)
     arb.add_label(repo, num, f"{EVAL_PREFIX}{label}")
     # Mirrored to the generic `eval:*` label, same as pr_dflash_bot.py -- SN74 scoring reads
     # eval:* tiers, so this makes Muse Glimmer submissions count toward that live incentive
