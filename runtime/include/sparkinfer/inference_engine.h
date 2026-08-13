@@ -49,6 +49,10 @@ public:
         bool timed_out = false;
         // true => on_token returned false (client went away mid-stream); not an error.
         bool cancelled = false;
+        // true => generation exhausted max_new_tokens instead of reaching an EOS token.
+        // HTTP callers surface this as finish_reason="length"; in particular, a truncated
+        // tool-call payload must never be reported as a successful "stop".
+        bool reached_token_limit = false;
         // GPU-side timings (exclude SSE/on_token backpressure).
         double ttft_ms = -1.0;
         double generation_ms = -1.0;

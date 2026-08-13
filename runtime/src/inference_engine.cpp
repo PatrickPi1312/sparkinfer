@@ -60,6 +60,7 @@ struct ContinuousBatchEngine::Job {
     bool overloaded = false;
     bool timed_out = false;
     bool cancelled = false;
+    bool reached_token_limit = false;
 
     std::chrono::steady_clock::time_point t_submit{};
     std::chrono::steady_clock::time_point t_first{};
@@ -193,6 +194,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     out.overloaded = it->second->overloaded;
     out.timed_out = it->second->timed_out;
     out.cancelled = it->second->cancelled;
+    out.reached_token_limit = it->second->reached_token_limit;
     out.ttft_ms = it->second->ttft_ms;
     out.generation_ms = it->second->generation_ms;
     out.decode_tps = it->second->decode_tps;
@@ -360,8 +362,11 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         return true;
     }
 
-    if (job.next_token == cfg.eos_id || (cfg.eos_id2 >= 0 && job.next_token == cfg.eos_id2) ||
-        job.decode_emitted >= job.req.max_new_tokens) {
+    const bool hit_eos = job.next_token == cfg.eos_id ||
+                         (cfg.eos_id2 >= 0 && job.next_token == cfg.eos_id2);
+    const bool hit_token_limit = job.decode_emitted >= job.req.max_new_tokens;
+    if (hit_eos || hit_token_limit) {
+        job.reached_token_limit = hit_token_limit && !hit_eos;
         const auto t_end = std::chrono::steady_clock::now();
         job.generation_ms = std::chrono::duration<double, std::milli>(t_end - job.t_submit).count();
         if (job.saw_first_tok && job.generation_ms > job.ttft_ms && job.decode_emitted > 0) {

@@ -110,6 +110,10 @@ int main() {
         printf("[FAIL] request A: expected 4 tokens, got %zu\n", ra.tokens.size());
         return 1;
     }
+    if (!ra.reached_token_limit) {
+        printf("[FAIL] request A: expected max_new_tokens termination\n");
+        return 1;
+    }
 
     sparkinfer::ContinuousBatchEngine::Request b;
     b.prompt = {2, 6, 10, 14};
@@ -122,6 +126,29 @@ int main() {
     }
     if ((int)rb.tokens.size() != 6) {
         printf("[FAIL] request B: expected 6 tokens, got %zu\n", rb.tokens.size());
+        return 1;
+    }
+    if (!rb.reached_token_limit) {
+        printf("[FAIL] request B: expected max_new_tokens termination\n");
+        return 1;
+    }
+
+    // The termination cause must survive the batch-engine boundary: HTTP maps this flag to
+    // finish_reason="stop" rather than "length". Reuse request A's deterministic first token
+    // as EOS so this synthetic model stops on its first emission.
+    cfg.eos_id = ra.tokens.front();
+    sparkinfer::Qwen35Model eos_model(cfg, &kv, engine.get());
+    eos_model.set_weights(w);
+    sparkinfer::ContinuousBatchEngine eos_batch(&eos_model, &kv, 8);
+    sparkinfer::ContinuousBatchEngine::Request eos_request;
+    eos_request.prompt = a.prompt;
+    eos_request.max_new_tokens = 4;
+    const auto eos_result = eos_batch.complete(eos_request);
+    if (!eos_result.error.empty() || eos_result.tokens.size() != 1 ||
+        eos_result.reached_token_limit) {
+        printf("[FAIL] EOS termination: error=%s tokens=%zu limit=%d\n",
+               eos_result.error.c_str(), eos_result.tokens.size(),
+               eos_result.reached_token_limit ? 1 : 0);
         return 1;
     }
 
