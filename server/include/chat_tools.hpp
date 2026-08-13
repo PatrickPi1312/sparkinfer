@@ -35,11 +35,27 @@ struct ChatMessage {
     std::vector<ToolCall> tool_calls;
 };
 
+enum class ResponseFormatType {
+    kText,
+    kJsonObject,
+    kJsonSchema,
+};
+
+struct ResponseFormat {
+    ResponseFormatType type = ResponseFormatType::kText;
+    std::string schema_name;   // json_schema.name -- steering text / logging only
+    nlohmann::json schema;     // json_schema.schema -- empty/ignored unless type == kJsonSchema
+    // json_schema.strict -- parsed and stored, but a documented v1 no-op: this backend has no
+    // constrained-decoding mechanism, so it cannot honor a real conformance guarantee either way.
+    bool strict = false;
+};
+
 struct ChatRequest {
     std::vector<ChatMessage> messages;
     std::vector<ToolDefinition> tools;
     ToolChoiceMode tool_choice = ToolChoiceMode::kAuto;
     bool parallel_tool_calls = true;
+    ResponseFormat response_format;
 };
 
 struct ParsedToolOutput {
@@ -50,6 +66,12 @@ struct ParsedToolOutput {
 };
 
 bool parse_chat_request_json(const std::string& body, ChatRequest& request, std::string& err);
+
+// Best-effort validation only -- there is no constrained decoding in this backend, so this
+// cannot guarantee the model's output actually conforms; it just checks after the fact.
+// format.type == kText always returns true (no-op).
+bool validate_response_format(const std::string& content, const ResponseFormat& format,
+                              std::string& err);
 
 std::string apply_qwen36_tools_template(const ChatRequest& request,
                                         bool enable_thinking = false);

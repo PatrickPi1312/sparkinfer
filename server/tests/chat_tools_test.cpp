@@ -14,11 +14,14 @@ namespace {
 using nlohmann::json;
 using sparkinfer_server::ChatRequest;
 using sparkinfer_server::ParsedToolOutput;
+using sparkinfer_server::ResponseFormat;
+using sparkinfer_server::ResponseFormatType;
 using sparkinfer_server::ToolChoiceMode;
 using sparkinfer_server::ToolCall;
 using sparkinfer_server::apply_qwen36_tools_template;
 using sparkinfer_server::parse_chat_request_json;
 using sparkinfer_server::parse_qwen36_tool_output;
+using sparkinfer_server::validate_response_format;
 
 #define CHECK(expr)                                                                            \
     do {                                                                                       \
@@ -742,6 +745,186 @@ bool test_developer_role_is_accepted_as_system_alias() {
     return true;
 }
 
+bool test_response_format_type_validation() {
+    ChatRequest request;
+    std::string error;
+    CHECK(!parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],"response_format":"json_object"})",
+        request, error));
+    CHECK(!parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"bogus"}})",
+        request, error));
+    CHECK(!parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema"}})",
+        request, error));  // missing json_schema object entirely
+
+    json body = {{"messages", json::array({json::object({{"role", "user"}, {"content", "hi"}})})},
+                 {"response_format", json::object({{"type", "text"}})}};
+    CHECK(parse_request(body.dump(), request));
+    CHECK(request.response_format.type == ResponseFormatType::kText);
+    return true;
+}
+
+bool test_response_format_json_object_parses() {
+    json body = {{"messages", json::array({json::object({{"role", "user"}, {"content", "hi"}})})},
+                 {"response_format", json::object({{"type", "json_object"}})}};
+    ChatRequest request;
+    CHECK(parse_request(body.dump(), request));
+    CHECK(request.response_format.type == ResponseFormatType::kJsonObject);
+    return true;
+}
+
+bool test_response_format_json_schema_validation() {
+    ChatRequest request;
+    std::string error;
+    // Missing "name"
+    CHECK(!parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}})",
+        request, error));
+    // Malformed schema at request time: minimum > maximum -- reused valid_schema check.
+    CHECK(!parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "response_format":{"type":"json_schema","json_schema":{"name":"n",
+            "schema":{"type":"integer","minimum":10,"maximum":5}}}})",
+        request, error));
+
+    json body = {
+        {"messages", json::array({json::object({{"role", "user"}, {"content", "hi"}})})},
+        {"response_format", json::object({
+             {"type", "json_schema"},
+             {"json_schema", json::object({
+                  {"name", "Answer"},
+                  {"strict", true},
+                  {"schema", json::object({
+                       {"type", "object"},
+                       {"properties", json::object({{"value", json::object({{"type", "integer"}})}})},
+                       {"required", json::array({"value"})},
+                       {"additionalProperties", false},
+                   })},
+              })},
+         })},
+    };
+    CHECK(parse_request(body.dump(), request));
+    CHECK(request.response_format.type == ResponseFormatType::kJsonSchema);
+    CHECK(request.response_format.schema_name == "Answer");
+    CHECK(request.response_format.strict == true);
+    CHECK(request.response_format.schema["type"] == "object");
+    return true;
+}
+
+bool test_response_format_strict_does_not_change_parse_outcome() {
+    auto make_body = [](bool strict_value, bool include_strict) {
+        json rf = json::object({{"type", "json_schema"},
+                                {"json_schema", json::object({
+                                     {"name", "N"},
+                                     {"schema", json::object({{"type", "object"}})},
+                                 })}});
+        if (include_strict) rf["json_schema"]["strict"] = strict_value;
+        json body = {{"messages", json::array({json::object({{"role", "user"}, {"content", "hi"}})})},
+                     {"response_format", rf}};
+        return body.dump();
+    };
+    ChatRequest a, b, c;
+    CHECK(parse_request(make_body(true, true), a));
+    CHECK(parse_request(make_body(false, true), b));
+    CHECK(parse_request(make_body(false, false), c));
+    CHECK(a.response_format.type == b.response_format.type);
+    CHECK(b.response_format.type == c.response_format.type);
+    CHECK(a.response_format.schema == b.response_format.schema);
+    return true;
+}
+
+bool test_tools_and_response_format_rejected_together() {
+    json body = {
+        {"messages", json::array({json::object({{"role", "user"}, {"content", "hi"}})})},
+        {"tools", json::array({json::object({
+             {"type", "function"},
+             {"function", json::object({{"name", "f"}, {"parameters", json::object({{"type", "object"}})}})},
+         })})},
+        {"response_format", json::object({{"type", "json_object"}})},
+    };
+    ChatRequest request;
+    std::string error;
+    CHECK(!parse_chat_request_json(body.dump(), request, error));
+    return true;
+}
+
+bool test_response_format_steers_prompt_json_object() {
+    ChatRequest request;
+    request.messages.push_back({});
+    request.messages.back().role = "user";
+    request.messages.back().content = "give me data";
+    request.response_format.type = ResponseFormatType::kJsonObject;
+    const std::string prompt = apply_qwen36_tools_template(request, false);
+    CHECK(contains(prompt, "# Response Format"));
+    CHECK(contains(prompt, "single valid JSON value"));
+    return true;
+}
+
+bool test_response_format_steers_prompt_json_schema_escaped() {
+    ChatRequest request;
+    request.messages.push_back({});
+    request.messages.back().role = "user";
+    request.messages.back().content = "give me data";
+    request.response_format.type = ResponseFormatType::kJsonSchema;
+    request.response_format.schema_name = "Answer";
+    request.response_format.schema = json::object({
+        {"type", "object"},
+        {"properties", json::object({
+             {"note", json::object({{"type", "string"}, {"description", "<script>alert(1)</script>"}})},
+         })},
+    });
+    const std::string prompt = apply_qwen36_tools_template(request, false);
+    CHECK(contains(prompt, "Answer"));
+    CHECK(contains(prompt, "<response_schema>"));
+    CHECK(contains(prompt, "</response_schema>"));
+    // The htmlsafe renderer must escape a literal <script> tag inside a schema description --
+    // same template-injection-safety property tool schemas already get.
+    CHECK(!contains(prompt, "<script>alert(1)</script>"));
+    return true;
+}
+
+bool test_response_format_text_is_a_prompt_noop() {
+    ChatRequest with_default, without_field;
+    with_default.messages.push_back({});
+    with_default.messages.back().role = "user";
+    with_default.messages.back().content = "hi";
+    without_field = with_default;
+    with_default.response_format.type = ResponseFormatType::kText;
+    CHECK(apply_qwen36_tools_template(with_default, false) ==
+          apply_qwen36_tools_template(without_field, false));
+    return true;
+}
+
+bool test_validate_response_format_json_object() {
+    ResponseFormat format;
+    format.type = ResponseFormatType::kJsonObject;
+    std::string err;
+    CHECK(validate_response_format(R"({"a":1})", format, err));
+    CHECK(!validate_response_format("not json", format, err));
+    CHECK(!validate_response_format(R"({"a":1,"a":2})", format, err));  // duplicate key
+    return true;
+}
+
+bool test_validate_response_format_json_schema() {
+    ResponseFormat format;
+    format.type = ResponseFormatType::kJsonSchema;
+    format.schema = json::object({
+        {"type", "object"},
+        {"properties", json::object({{"n", json::object({{"type", "integer"}, {"minimum", 0}})}})},
+        {"required", json::array({"n"})},
+        {"additionalProperties", false},
+    });
+    std::string err;
+    CHECK(validate_response_format(R"({"n":5})", format, err));
+    CHECK(!validate_response_format(R"({"n":"not a number"})", format, err));
+    CHECK(!validate_response_format(R"({"n":-1})", format, err));
+    CHECK(!validate_response_format(R"({})", format, err));           // missing required
+    CHECK(!validate_response_format(R"({"n":1,"extra":true})", format, err));  // additionalProperties
+    return true;
+}
+
 bool test_plain_answer() {
     ChatRequest request;
     CHECK(parse_request(hermes_request(), request));
@@ -945,6 +1128,16 @@ int main() {
     if (!test_trailing_whitespace_after_tool_call_is_not_malformed()) return 1;
     if (!test_nontext_content_parts_are_ignored_not_rejected()) return 1;
     if (!test_developer_role_is_accepted_as_system_alias()) return 1;
+    if (!test_response_format_type_validation()) return 1;
+    if (!test_response_format_json_object_parses()) return 1;
+    if (!test_response_format_json_schema_validation()) return 1;
+    if (!test_response_format_strict_does_not_change_parse_outcome()) return 1;
+    if (!test_tools_and_response_format_rejected_together()) return 1;
+    if (!test_response_format_steers_prompt_json_object()) return 1;
+    if (!test_response_format_steers_prompt_json_schema_escaped()) return 1;
+    if (!test_response_format_text_is_a_prompt_noop()) return 1;
+    if (!test_validate_response_format_json_object()) return 1;
+    if (!test_validate_response_format_json_schema()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
     if (!test_unsafe_protocol_names()) return 1;

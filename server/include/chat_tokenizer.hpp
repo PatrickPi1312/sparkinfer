@@ -23,6 +23,11 @@ public:
 
     bool encode_chat_request(const std::string& request_json, std::vector<int>& ids, bool enable_thinking,
                              std::string& err, ChatRequest* parsed_request = nullptr) const;
+    // Directly renders + tokenizes an already-parsed/validated ChatRequest, skipping the JSON
+    // body parse step encode_chat_request does. Used to build a retry prompt (e.g. a
+    // response_format correction turn appended to the original request) without round-tripping
+    // through a serialized JSON body. Returns an empty vector if the tokenizer isn't loaded.
+    std::vector<int> encode_augmented(const ChatRequest& request, bool enable_thinking) const;
     std::string decode(const std::vector<int>& ids) const;
     std::string decode_delta(std::vector<int>& acc, int new_id) const;
 

@@ -191,6 +191,10 @@ bool validate_chat_request_model_support(const ChatRequest& request, bool musegl
         err = "tool calling is currently supported only for Qwen3.6 models";
         return false;
     }
+    if (request.response_format.type != ResponseFormatType::kText) {
+        err = "structured response_format is currently supported only for Qwen3.6 models";
+        return false;
+    }
     return true;
 }
 
@@ -569,17 +573,22 @@ bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::ve
     if (!parse_chat_request_json(request_json, request, err)) return false;
     if (!validate_chat_request_model_support(request, impl_->museglimmer, err)) return false;
 
-    const std::string prompt = impl_->museglimmer
-        ? apply_museglimmer_chat_template(request.messages, enable_thinking ? "high" : "low")
-        : apply_qwen36_tools_template(request, enable_thinking);
-    const std::vector<int32_t> enc = impl_->tok->Encode(prompt);
-    ids.assign(enc.begin(), enc.end());
+    ids = encode_augmented(request, enable_thinking);
     if (ids.empty()) {
         err = "tokenize returned no ids";
         return false;
     }
     if (parsed_request) *parsed_request = std::move(request);
     return true;
+}
+
+std::vector<int> ChatTokenizer::encode_augmented(const ChatRequest& request, bool enable_thinking) const {
+    if (!impl_->tok) return {};
+    const std::string prompt = impl_->museglimmer
+        ? apply_museglimmer_chat_template(request.messages, enable_thinking ? "high" : "low")
+        : apply_qwen36_tools_template(request, enable_thinking);
+    const std::vector<int32_t> enc = impl_->tok->Encode(prompt);
+    return std::vector<int>(enc.begin(), enc.end());
 }
 
 std::string ChatTokenizer::decode(const std::vector<int>& ids) const {

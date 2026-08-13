@@ -54,6 +54,10 @@ std::atomic<uint64_t> g_requests_server_error{0};   // 5xx
 // quality variance with a real infrastructure fault -- the exact conflation #779 already
 // documented once for overloaded (429) vs alloc_failed (503).
 std::atomic<uint64_t> g_requests_invalid_tool_output{0};
+// 502 -- same rationale as g_requests_invalid_tool_output above, for response_format: the model
+// produced output that failed JSON/schema validation on both the original and the corrective
+// retry attempt. Not a server_error -- this is a model-output-quality signal, not an infra fault.
+std::atomic<uint64_t> g_requests_invalid_json_output{0};
 std::atomic<uint64_t> g_prompt_tokens_total{0};
 std::atomic<uint64_t> g_completion_tokens_total{0};
 
@@ -286,6 +290,30 @@ bool decode_ids(const std::vector<int>& ids, std::string& text, std::string& err
     return true;
 }
 
+// Builds the attempt-2 prompt for a response_format validation failure: original conversation +
+// the model's own (invalid) attempt-1 output as an assistant turn, followed by a corrective user
+// turn describing what was wrong. This runtime's decode is fully deterministic greedy argmax
+// with no RNG anywhere -- resubmitting attempt 1's identical prompt_ids would just reproduce the
+// exact same invalid output. The retry only has a chance of succeeding with a materially
+// different prompt.
+sparkinfer_server::ChatRequest build_retry_request(const sparkinfer_server::ChatRequest& original,
+                                                    const std::string& failed_content,
+                                                    const std::string& validation_error) {
+    sparkinfer_server::ChatRequest retry = original;
+    sparkinfer_server::ChatMessage assistant_turn;
+    assistant_turn.role = "assistant";
+    assistant_turn.content = failed_content.empty() ? "(no output)" : failed_content;
+    retry.messages.push_back(std::move(assistant_turn));
+    sparkinfer_server::ChatMessage correction;
+    correction.role = "user";
+    correction.content = "Your previous reply did not satisfy the required response_format: " +
+                         validation_error +
+                         "\nRespond again with ONLY the corrected JSON, matching the required "
+                         "format exactly.";
+    retry.messages.push_back(std::move(correction));
+    return retry;
+}
+
 std::vector<int> load_prefix_token_ids() {
     std::vector<int> out;
     if (const char* csv = getenv("SPARKINFER_SERVER_PREFIX_TOKEN_IDS")) {
@@ -437,6 +465,8 @@ int main(int argc, char** argv) {
              << g_requests_server_error.load() << "\n"
              << "sparkinfer_requests_by_outcome_total{outcome=\"invalid_tool_output\"} "
              << g_requests_invalid_tool_output.load() << "\n"
+             << "sparkinfer_requests_by_outcome_total{outcome=\"invalid_json_output\"} "
+             << g_requests_invalid_json_output.load() << "\n"
                 "# HELP sparkinfer_tokens_total Tokens processed\n"
                 "# TYPE sparkinfer_tokens_total counter\n"
              << "sparkinfer_tokens_total{kind=\"prompt\"} " << g_prompt_tokens_total.load() << "\n"
@@ -535,6 +565,10 @@ int main(int argc, char** argv) {
                  // tool_choice=none. The latter disables execution, not output validation:
                  // native tool markup must never leak through as ordinary assistant content.
                  const bool tool_protocol = !chat_request.tools.empty();
+                 // Mutually exclusive with tool_protocol by construction -- parse_chat_request_json
+                 // rejects tools + response_format together at request time.
+                 const bool json_mode_active =
+                     chat_request.response_format.type != sparkinfer_server::ResponseFormatType::kText;
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
@@ -570,8 +604,8 @@ int main(int argc, char** argv) {
                      res.set_chunked_content_provider(
                          "text/event-stream",
                          [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
-                          chat_request, tool_protocol, include_usage = controls.include_usage,
-                          stop = controls.stop]
+                          chat_request, tool_protocol, json_mode_active,
+                          include_usage = controls.include_usage, stop = controls.stop]
                          (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
                                  sink.done();
@@ -582,6 +616,118 @@ int main(int argc, char** argv) {
                                  sink.done();
                                  return true;
                              }
+
+                             if (json_mode_active) {
+                                 // response_format needs the complete, validated output before
+                                 // anything is emitted -- a client can't un-receive already-
+                                 // streamed bytes if a retry becomes necessary. Buffer fully
+                                 // internally (like tool_protocol below), then emit a single
+                                 // content delta once a valid attempt is confirmed.
+                                 std::vector<int> cur_prompt_ids = prompt_ids;
+                                 sparkinfer_server::ChatRequest cur_request = chat_request;
+                                 long long total_prompt_tokens = 0, total_completion_tokens = 0;
+                                 sparkinfer_server::CompletionResult outcome;
+                                 sparkinfer_server::ParsedAssistantOutput parsed;
+                                 bool ok = false;
+                                 std::string validation_err;
+                                 for (int attempt = 1; attempt <= 2; ++attempt) {
+                                     if ((int)cur_prompt_ids.size() + max_tokens > engine.max_seq()) {
+                                         validation_err = "retry prompt exceeds server context";
+                                         break;
+                                     }
+                                     std::vector<int> ids;
+                                     std::string stop_text;
+                                     bool stopped_by_sequence = false;
+                                     auto on_tok = [&](int tid) -> bool {
+                                         if (stop.empty()) {
+                                             ids.push_back(tid);
+                                             return sink.is_writable();
+                                         }
+                                         stop_text += g_tokenizer.decode_delta(ids, tid);
+                                         size_t pos;
+                                         if (find_stop_match(stop_text, stop, pos)) {
+                                             stopped_by_sequence = true;
+                                             return false;
+                                         }
+                                         return sink.is_writable();
+                                     };
+                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok);
+                                     total_prompt_tokens += (long long)cur_prompt_ids.size();
+                                     total_completion_tokens += (long long)ids.size();
+                                     if (outcome.cancelled && !stopped_by_sequence) {
+                                         g_requests_cancelled++;
+                                         sink.done();
+                                         return true;
+                                     }
+                                     if (!outcome.error.empty()) {
+                                         if (outcome.overloaded) g_requests_overloaded++;
+                                         else if (outcome.alloc_failed) g_requests_alloc_failed++;
+                                         else if (outcome.timed_out) g_requests_timeout++;
+                                         else g_requests_server_error++;
+                                         const nlohmann::json error = {{"error", {{"message", outcome.error}}}};
+                                         write_sse_json(sink, error);
+                                         write_stream_done(sink);
+                                         sink.done();
+                                         return true;
+                                     }
+                                     std::string text;
+                                     std::string decode_err;
+                                     if (!decode_ids(ids, text, decode_err)) {
+                                         g_requests_server_error++;
+                                         const nlohmann::json error = {{"error", {{"message", decode_err}}}};
+                                         write_sse_json(sink, error);
+                                         write_stream_done(sink);
+                                         sink.done();
+                                         return true;
+                                     }
+                                     if (stopped_by_sequence) {
+                                         size_t pos;
+                                         if (find_stop_match(text, stop, pos)) text.resize(pos);
+                                     }
+                                     parsed = sparkinfer_server::parse_assistant_output(
+                                         text, enable_thinking, engine.is_museglimmer(), nullptr);
+                                     const bool truncated = outcome.reached_token_limit || stopped_by_sequence;
+                                     if (truncated) {
+                                         validation_err = outcome.reached_token_limit
+                                             ? "truncated: hit max_tokens before producing valid output"
+                                             : "truncated: hit a stop sequence before producing valid output";
+                                     } else if (!sparkinfer_server::validate_response_format(
+                                                    parsed.content, cur_request.response_format, validation_err)) {
+                                         // validation_err already set
+                                     } else {
+                                         ok = true;
+                                         break;
+                                     }
+                                     if (attempt == 1) {
+                                         cur_request = build_retry_request(chat_request, parsed.content, validation_err);
+                                         cur_prompt_ids = g_tokenizer.encode_augmented(cur_request, enable_thinking);
+                                     }
+                                 }
+                                 g_prompt_tokens_total += (uint64_t)total_prompt_tokens;
+                                 g_completion_tokens_total += (uint64_t)total_completion_tokens;
+                                 if (!ok) {
+                                     g_requests_invalid_json_output++;
+                                     const nlohmann::json error = {
+                                         {"error", {{"message", "model output did not satisfy response_format "
+                                                                 "after retry: " + validation_err}}}};
+                                     write_sse_json(sink, error);
+                                     write_stream_done(sink);
+                                     sink.done();
+                                     return true;
+                                 }
+                                 write_stream_delta(sink, cid, created, "reasoning_content", parsed.reasoning_content);
+                                 write_stream_delta(sink, cid, created, "content", parsed.content);
+                                 g_requests_ok++;
+                                 write_stream_finish(sink, cid, created, "stop");
+                                 if (include_usage)
+                                     write_stream_usage(sink, cid, created, (int)total_prompt_tokens,
+                                                        (int)total_completion_tokens, outcome.ttft_ms,
+                                                        outcome.generation_ms, outcome.decode_tps);
+                                 write_stream_done(sink);
+                                 sink.done();
+                                 return true;
+                             }
+
                              std::vector<int> stream_ids;
                              stream_ids.reserve((size_t)max_tokens);
                              sparkinfer_server::ThinkingStreamSplitter splitter(enable_thinking, engine.is_museglimmer());
@@ -748,66 +894,163 @@ int main(int argc, char** argv) {
                  // whenever stop was requested so non-streaming requests can halt early too --
                  // previously stop-checking (and the compute savings of stopping early) were
                  // unavailable here entirely.
-                 std::vector<int> nonstream_ids;
-                 std::string nonstream_stop_text;
-                 bool stopped_by_sequence = false;
-                 auto nonstream_on_tok = [&](int tid) -> bool {
-                     if (controls.stop.empty()) {
-                         nonstream_ids.push_back(tid);
-                         return true;
-                     }
-                     nonstream_stop_text += g_tokenizer.decode_delta(nonstream_ids, tid);
-                     size_t pos;
-                     if (find_stop_match(nonstream_stop_text, controls.stop, pos)) {
-                         stopped_by_sequence = true;
-                         return false;
-                     }
-                     return true;
-                 };
-                 const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok);
-                 std::string text;
-                 if (!outcome.error.empty()) {
-                     res.status = record_and_status(outcome);
-                     res.set_content("{\"error\":{\"message\":\"" + json_escape(outcome.error) + "\"}}",
-                                     "application/json");
-                     return;
-                 }
-                 if (!decode_ids(outcome.tokens, text, err)) {
-                     g_requests_server_error++;
-                     res.status = 500;
-                     res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
-                                     "application/json");
-                     return;
-                 }
-                 g_prompt_tokens_total += (uint64_t)prompt_ids.size();
-                 g_completion_tokens_total += (uint64_t)outcome.tokens.size();
-                 if (stopped_by_sequence) {
-                     size_t pos;
-                     if (find_stop_match(text, controls.stop, pos)) text.resize(pos);
-                 }
+                 long long total_prompt_tokens = 0, total_completion_tokens = 0;
+                 sparkinfer_server::CompletionResult outcome;
+                 sparkinfer_server::ParsedAssistantOutput parsed;
+                 std::string finish_reason;
 
-                 auto parsed = sparkinfer_server::parse_assistant_output(
-                     text, enable_thinking, engine.is_museglimmer(),
-                     tool_protocol ? &chat_request : nullptr);
-                 if (!parsed.error.empty()) {
-                     if (outcome.reached_token_limit || stopped_by_sequence) {
-                         // Never expose a truncated native tag sequence. A length/stop end is a
-                         // valid completion, so return an empty assistant result instead of 5xx.
-                         parsed = {};
-                     } else {
-                         g_requests_invalid_tool_output++;
+                 if (json_mode_active) {
+                     // response_format validation needs the complete output; a truncated or
+                     // schema-violating attempt is retried once with a corrective follow-up
+                     // prompt (this runtime's decode is deterministic greedy argmax with no RNG
+                     // anywhere -- resubmitting the identical prompt would just reproduce the
+                     // same invalid output) before giving up.
+                     std::vector<int> cur_prompt_ids = prompt_ids;
+                     sparkinfer_server::ChatRequest cur_request = chat_request;
+                     bool ok = false;
+                     std::string validation_err;
+                     for (int attempt = 1; attempt <= 2; ++attempt) {
+                         if ((int)cur_prompt_ids.size() + max_tokens > engine.max_seq()) {
+                             validation_err = "retry prompt exceeds server context";
+                             break;
+                         }
+                         std::vector<int> ids;
+                         std::string stop_text;
+                         bool stopped_by_sequence = false;
+                         auto on_tok = [&](int tid) -> bool {
+                             if (controls.stop.empty()) {
+                                 ids.push_back(tid);
+                                 return true;
+                             }
+                             stop_text += g_tokenizer.decode_delta(ids, tid);
+                             size_t pos;
+                             if (find_stop_match(stop_text, controls.stop, pos)) {
+                                 stopped_by_sequence = true;
+                                 return false;
+                             }
+                             return true;
+                         };
+                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok);
+                         total_prompt_tokens += (long long)cur_prompt_ids.size();
+                         total_completion_tokens += (long long)ids.size();
+                         if (!outcome.error.empty()) {
+                             // A hard engine fault (overloaded/alloc_failed/timed_out) is not a
+                             // validation failure -- never retry it, propagate immediately.
+                             res.status = record_and_status(outcome);
+                             res.set_content("{\"error\":{\"message\":\"" + json_escape(outcome.error) + "\"}}",
+                                             "application/json");
+                             return;
+                         }
+                         std::string text;
+                         if (!decode_ids(ids, text, err)) {
+                             g_requests_server_error++;
+                             res.status = 500;
+                             res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
+                                             "application/json");
+                             return;
+                         }
+                         if (stopped_by_sequence) {
+                             size_t pos;
+                             if (find_stop_match(text, controls.stop, pos)) text.resize(pos);
+                         }
+                         parsed = sparkinfer_server::parse_assistant_output(
+                             text, enable_thinking, engine.is_museglimmer(), nullptr);
+                         // Unlike tool_protocol, truncation is NOT a free pass here -- a
+                         // stop/length-truncated response is essentially always invalid JSON, so
+                         // it's a normal validation failure subject to the same retry policy.
+                         const bool truncated = outcome.reached_token_limit || stopped_by_sequence;
+                         if (truncated) {
+                             validation_err = outcome.reached_token_limit
+                                 ? "truncated: hit max_tokens before producing valid output"
+                                 : "truncated: hit a stop sequence before producing valid output";
+                         } else if (!sparkinfer_server::validate_response_format(
+                                        parsed.content, cur_request.response_format, validation_err)) {
+                             // validation_err already set by validate_response_format
+                         } else {
+                             ok = true;
+                             break;
+                         }
+                         if (attempt == 1) {
+                             cur_request = build_retry_request(chat_request, parsed.content, validation_err);
+                             cur_prompt_ids = g_tokenizer.encode_augmented(cur_request, enable_thinking);
+                         }
+                     }
+                     g_prompt_tokens_total += (uint64_t)total_prompt_tokens;
+                     g_completion_tokens_total += (uint64_t)total_completion_tokens;
+                     if (!ok) {
+                         g_requests_invalid_json_output++;
                          res.status = 502;
                          const nlohmann::json error = {
-                             {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
+                             {"error", {{"message", "model output did not satisfy response_format after "
+                                                     "retry: " + validation_err}}}};
                          res.set_content(error.dump(), "application/json");
                          return;
                      }
+                     finish_reason = "stop";  // ok only true on a non-truncated, valid attempt
+                 } else {
+                     std::vector<int> nonstream_ids;
+                     std::string nonstream_stop_text;
+                     bool stopped_by_sequence = false;
+                     auto nonstream_on_tok = [&](int tid) -> bool {
+                         if (controls.stop.empty()) {
+                             nonstream_ids.push_back(tid);
+                             return true;
+                         }
+                         nonstream_stop_text += g_tokenizer.decode_delta(nonstream_ids, tid);
+                         size_t pos;
+                         if (find_stop_match(nonstream_stop_text, controls.stop, pos)) {
+                             stopped_by_sequence = true;
+                             return false;
+                         }
+                         return true;
+                     };
+                     outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok);
+                     std::string text;
+                     if (!outcome.error.empty()) {
+                         res.status = record_and_status(outcome);
+                         res.set_content("{\"error\":{\"message\":\"" + json_escape(outcome.error) + "\"}}",
+                                         "application/json");
+                         return;
+                     }
+                     if (!decode_ids(outcome.tokens, text, err)) {
+                         g_requests_server_error++;
+                         res.status = 500;
+                         res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
+                                         "application/json");
+                         return;
+                     }
+                     total_prompt_tokens = (long long)prompt_ids.size();
+                     total_completion_tokens = (long long)outcome.tokens.size();
+                     g_prompt_tokens_total += (uint64_t)prompt_ids.size();
+                     g_completion_tokens_total += (uint64_t)outcome.tokens.size();
+                     if (stopped_by_sequence) {
+                         size_t pos;
+                         if (find_stop_match(text, controls.stop, pos)) text.resize(pos);
+                     }
+
+                     parsed = sparkinfer_server::parse_assistant_output(
+                         text, enable_thinking, engine.is_museglimmer(),
+                         tool_protocol ? &chat_request : nullptr);
+                     if (!parsed.error.empty()) {
+                         if (outcome.reached_token_limit || stopped_by_sequence) {
+                             // Never expose a truncated native tag sequence. A length/stop end is a
+                             // valid completion, so return an empty assistant result instead of 5xx.
+                             parsed = {};
+                         } else {
+                             g_requests_invalid_tool_output++;
+                             res.status = 502;
+                             const nlohmann::json error = {
+                                 {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
+                             res.set_content(error.dump(), "application/json");
+                             return;
+                         }
+                     }
+                     finish_reason = outcome.reached_token_limit ? "length" : "stop";
                  }
 
                  nlohmann::json message = {{"role", "assistant"}};
                  if (!parsed.reasoning_content.empty())
                      message["reasoning_content"] = parsed.reasoning_content;
-                 std::string finish_reason = outcome.reached_token_limit ? "length" : "stop";
                  // See the streaming path's identical comment: parsed.tool_calls is only
                  // non-empty here for a complete, successfully-parsed call.
                  if (!parsed.tool_calls.empty()) {
@@ -826,9 +1069,9 @@ int main(int argc, char** argv) {
                  }
 
                  nlohmann::json usage = {
-                     {"prompt_tokens", (int)prompt_ids.size()},
-                     {"completion_tokens", (int)outcome.tokens.size()},
-                     {"total_tokens", (int)(prompt_ids.size() + outcome.tokens.size())}};
+                     {"prompt_tokens", (int)total_prompt_tokens},
+                     {"completion_tokens", (int)total_completion_tokens},
+                     {"total_tokens", (int)(total_prompt_tokens + total_completion_tokens)}};
                  if (outcome.ttft_ms >= 0.0) usage["ttft_ms"] = outcome.ttft_ms;
                  if (outcome.generation_ms >= 0.0) usage["generation_ms"] = outcome.generation_ms;
                  if (outcome.decode_tps >= 0.0) usage["decode_tps"] = outcome.decode_tps;

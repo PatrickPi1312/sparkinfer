@@ -60,6 +60,23 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>)";
 
+const char* kJsonObjectInstructions = R"(# Response Format
+
+Your entire reply MUST be a single valid JSON value and NOTHING else -- no prose before or
+after, no markdown code fences, no explanations. Output only the raw JSON.)";
+
+const char* kJsonSchemaInstructionsHead = R"(# Response Format
+
+Your entire reply MUST be a single valid JSON object that conforms EXACTLY to the JSON Schema
+below (named ")";
+const char* kJsonSchemaInstructionsMid = R"("). Output ONLY the raw JSON object -- no prose
+before or after, no markdown code fences, no explanations, no additional keys unless the
+schema allows them.
+
+<response_schema>
+)";
+const char* kJsonSchemaInstructionsTail = "\n</response_schema>";
+
 bool set_error(std::string& err, const std::string& message) {
     err = message;
     return false;
@@ -945,6 +962,44 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
         if (!parsed.parallel_tool_calls)
             return set_error(err, "parallel_tool_calls=false is not supported");
     }
+    if (root.contains("response_format")) {
+        const json& rf = root["response_format"];
+        if (!rf.is_object()) return set_error(err, "response_format must be an object");
+        if (!is_allowed_key(rf, {"type", "json_schema"}, "response_format", err)) return false;
+        if (!rf.contains("type") || !rf["type"].is_string())
+            return set_error(err, "response_format.type must be a string");
+        const std::string type = rf["type"].get<std::string>();
+        if (type == "text") {
+            parsed.response_format.type = ResponseFormatType::kText;
+        } else if (type == "json_object") {
+            parsed.response_format.type = ResponseFormatType::kJsonObject;
+        } else if (type == "json_schema") {
+            parsed.response_format.type = ResponseFormatType::kJsonSchema;
+            if (!rf.contains("json_schema") || !rf["json_schema"].is_object())
+                return set_error(err, "response_format.json_schema is required for type json_schema");
+            const json& js = rf["json_schema"];
+            if (!is_allowed_key(js, {"name", "schema", "strict", "description"},
+                                "response_format.json_schema", err)) return false;
+            if (!js.contains("name") || !js["name"].is_string() ||
+                js["name"].get_ref<const std::string&>().empty())
+                return set_error(err, "response_format.json_schema.name must be a non-empty string");
+            if (!js.contains("schema") || !js["schema"].is_object())
+                return set_error(err, "response_format.json_schema.schema is required and must be an object");
+            // Reject a malformed schema at request time, before ever calling the model -- the
+            // same sanity check tool `parameters` schemas already get.
+            if (!valid_schema(js["schema"], "response_format.json_schema.schema", err)) return false;
+            if (js.contains("strict") && !js["strict"].is_boolean())
+                return set_error(err, "response_format.json_schema.strict must be boolean");
+            parsed.response_format.schema_name = js["name"].get<std::string>();
+            parsed.response_format.schema = js["schema"];
+            parsed.response_format.strict = js.value("strict", false);
+        } else {
+            return set_error(err, "unsupported response_format.type " + type);
+        }
+    }
+    if (!parsed.tools.empty() &&
+        parsed.response_format.type != ResponseFormatType::kText)
+        return set_error(err, "response_format is not supported together with tools");
     if (parsed.tools.empty() && parsed.tool_choice != ToolChoiceMode::kNone)
         parsed.tool_choice = ToolChoiceMode::kNone;
     std::set<std::string> offered;
@@ -972,14 +1027,41 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
     return true;
 }
 
+bool validate_response_format(const std::string& content, const ResponseFormat& format,
+                              std::string& err) {
+    if (format.type == ResponseFormatType::kText) return true;
+    json parsed;
+    if (!parse_strict_json(content, parsed, err, "response")) return false;
+    if (format.type == ResponseFormatType::kJsonObject) return true;
+    return validate_value(parsed, format.schema, "response", err);
+}
+
 std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking) {
     std::ostringstream out;
     size_t first_message = 0;
-    if (!request.tools.empty() && request.tool_choice == ToolChoiceMode::kAuto) {
-        out << kImStart << "system\n" << kToolInstructions;
-        for (const ToolDefinition& tool : request.tools)
-            out << '\n' << qwen_template_json(tool.spec);
-        out << kToolInstructionsTail;
+    const bool tools_active = !request.tools.empty() && request.tool_choice == ToolChoiceMode::kAuto;
+    const bool json_mode = request.response_format.type != ResponseFormatType::kText;
+    // Request-time validation (parse_chat_request_json) rejects tools + response_format
+    // together, so tools_active and json_mode are never both true -- written as two independent
+    // segments anyway to keep this function's shape uniform rather than forking it in two.
+    if (tools_active || json_mode) {
+        out << kImStart << "system\n";
+        if (tools_active) {
+            out << kToolInstructions;
+            for (const ToolDefinition& tool : request.tools)
+                out << '\n' << qwen_template_json(tool.spec);
+            out << kToolInstructionsTail;
+        }
+        if (json_mode) {
+            if (tools_active) out << "\n\n";
+            if (request.response_format.type == ResponseFormatType::kJsonObject) {
+                out << kJsonObjectInstructions;
+            } else {
+                out << kJsonSchemaInstructionsHead << request.response_format.schema_name
+                    << kJsonSchemaInstructionsMid << qwen_template_json(request.response_format.schema)
+                    << kJsonSchemaInstructionsTail;
+            }
+        }
         if (!request.messages.empty() && request.messages[0].role == "system") {
             const std::string system_content = trim_copy(request.messages[0].content);
             if (!system_content.empty()) out << "\n\n" << system_content;
