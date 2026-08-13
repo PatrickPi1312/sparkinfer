@@ -1562,6 +1562,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         a8.free_all();
         am.free_all();
         aw.free_all();
+        // Any captured graph (g_pfb_exec) has these just-freed arena addresses baked into its
+        // kernel launch params -- replaying it via the fast path at the top of this function
+        // (cudaGraphLaunch against a stale g_pfb_n match) would touch freed device memory and
+        // segfault (#809: reproduced when a prefill N large enough to blow the keep-resident
+        // budget was captured, then replayed 1+ more times after this cleanup ran). Tear the
+        // graph down here too and reset g_pfb_warm_n so the next call redoes the warm-then-
+        // capture cycle against fresh (post-free) addresses rather than capturing over a cold
+        // allocation.
+        if (g_pfb_exec)  { cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr; }
+        if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
+        g_pfb_n = -1;
+        g_pfb_warm_n = -1;
     }
     return seed;
 }
