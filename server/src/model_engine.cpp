@@ -365,13 +365,16 @@ ModelEngine::LMCacheStats ModelEngine::lmcache_stats() const {
 CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_ids,
                                                  int max_new_tokens,
                                                  const std::function<bool(int)>& on_token,
-                                                 float temperature, uint64_t seed) {
+                                                 float temperature, uint64_t seed,
+                                                 int top_k, float top_p) {
     CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
     req.max_new_tokens = max_new_tokens;
     req.temperature = temperature;
     req.seed = seed;
+    req.top_k = top_k;
+    req.top_p = top_p;
 
     {
         std::lock_guard<std::mutex> lock(mu_);

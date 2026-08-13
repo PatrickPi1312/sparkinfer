@@ -57,10 +57,13 @@ public:
     //
     // temperature <= 0 (default) is plain greedy argmax. > 0 samples via Gumbel-max -- see
     // ContinuousBatchEngine::Request's doc comment for the reproducibility contract and the
-    // known "first token is always greedy" v1 scope limitation.
+    // known "first token is always greedy" v1 scope limitation. top_k/top_p truncate the
+    // candidate set before the Gumbel draw; neither requires temperature > 0 (see
+    // ContinuousBatchEngine::Request's doc comment for the inertness proof).
     CompletionResult complete_streaming(const std::vector<int>& prompt_ids, int max_new_tokens,
                                         const std::function<bool(int)>& on_token,
-                                        float temperature = 0.f, uint64_t seed = 0);
+                                        float temperature = 0.f, uint64_t seed = 0,
+                                        int top_k = 0, float top_p = 1.0f);
 
     // Live occupancy, for capacity-reporting endpoints. 0/0 if the model isn't loaded yet.
     int active_requests() const;

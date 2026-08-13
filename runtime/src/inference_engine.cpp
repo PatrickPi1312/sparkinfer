@@ -388,7 +388,8 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     const int prompt_len = (int)job.req.prompt.size();
     job.next_token = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true,
                                            job.req.temperature, job.req.seed,
-                                           (uint64_t)job.decode_emitted);
+                                           (uint64_t)job.decode_emitted,
+                                           job.req.top_k, job.req.top_p);
     return false;
 }
 

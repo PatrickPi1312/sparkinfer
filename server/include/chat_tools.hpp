@@ -80,6 +80,11 @@ struct RequestControls {
     float temperature = 0.f;
     uint64_t seed = 0;       // only meaningful when seed_set
     bool seed_set = false;   // client explicitly supplied `seed`; false => caller should generate one
+    // top_k <= 0 disables top_k (0 = no limit, matching llama.cpp/vLLM). top_p >= 1.0 disables
+    // top_p (1.0 is OpenAI's own "disabled" default). Neither requires temperature > 0 -- see
+    // ContinuousBatchEngine::Request's doc comment for the inertness proof.
+    int top_k = 0;
+    float top_p = 1.0f;
 };
 
 bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err);

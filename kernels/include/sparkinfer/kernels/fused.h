@@ -102,6 +102,53 @@ void launch_temperature_sample(float* logits, int n_rows, int vocab,
                                const float* temp_f32, const unsigned long long* seed_u64,
                                const unsigned long long* step_u64, cudaStream_t stream = nullptr);
 
+// top_k / top_p (nucleus) truncation, applied in place BEFORE launch_temperature_sample: masks
+// logits outside the surviving set to -infinity via a full descending sort + cumulative-softmax
+// cutoff (n_rows == 1 only -- decode-time truncation, not a batched prefill/verify operation).
+// top_k hard-truncates to the k highest-logit entries first, then top_p narrows further within
+// that set (cumulative probability renormalized against the top_k survivors' own mass, matching
+// HuggingFace/vLLM's mask-then-renormalize convention) -- entry rank 0 (the eventual greedy
+// winner) is unconditionally kept by both checks, so at least one surviving entry always exists
+// and launch_argmax can never see an all -inf row.
+//
+// *top_k_i32 <= 0 or >= vocab disables top_k (no truncation). *top_p_f32 <= 0 or >= 1.0 disables
+// top_p. Both are read from device memory on EVERY launch, same graph-replay-across-requests
+// rationale as launch_temperature_sample's temp/seed/step -- ALWAYS launch this unconditionally
+// on a CUDA-graph-captured decode path, never host-gate on top_k/top_p being set.
+//
+// scratch (vocab_iota/sorted_logits/sorted_idx/topk_exp/topk_cumsum, all length `vocab`; sort_temp/
+// scan_temp sized via topk_sort_temp_storage_bytes()/topk_scan_temp_storage_bytes()) must be
+// allocated ONCE at load time with a fixed address -- CUB's num_items argument is a host constant
+// (here, `vocab`) that cannot vary per call, so this always processes the full vocab regardless of
+// top_k/top_p, unlike launch_temperature_sample's near-free no-op when disabled. vocab_iota must be
+// filled once via launch_vocab_iota_init() before the first call and never mutated afterward.
+void launch_topk_topp_mask(float* logits, int vocab,
+                           const int* vocab_iota, float* sorted_logits, int* sorted_idx,
+                           float* topk_exp, float* topk_cumsum,
+                           void* sort_temp, size_t sort_temp_bytes,
+                           void* scan_temp, size_t scan_temp_bytes,
+                           const int* top_k_i32, const float* top_p_f32,
+                           cudaStream_t stream = nullptr);
+
+// Load-time-only helpers (no kernel launch involved beyond a one-time iota fill) -- call once per
+// model load, never on the decode hot path.
+size_t topk_sort_temp_storage_bytes(int vocab);
+size_t topk_scan_temp_storage_bytes(int vocab);
+void launch_vocab_iota_init(int* vocab_iota, int vocab, cudaStream_t stream = nullptr);
+
+// A CUDA 12.4+ conditional-graph-node variant of launch_topk_topp_mask (skip the sort/scan
+// pipeline entirely on replay whenever top_k/top_p are disabled, recovering near-zero cost for
+// the common case) was prototyped and spiked in isolation successfully, but live-verified to
+// corrupt determinism when embedded in the real decode graph: requests with identical
+// (seed,step,temperature,top_k,top_p) produced different output when interleaved with other
+// differently-configured requests on the same reused (use_prefix_session) graph -- reproducible,
+// but did NOT reproduce in an isolated minimal repro (same CUB-in-conditional-body pattern,
+// alternating active/inactive replays, passed cleanly). Root cause is presumably an interaction
+// between the conditional node and the surrounding ~hundreds of other nodes in the full decode
+// graph, not the conditional-node mechanism itself -- not safely resolvable without a deeper CUDA
+// graph engine investigation. Reverted; launch_topk_topp_mask (always-runs) is the shipped path.
+// Left as a documented dead end so a future attempt doesn't have to rediscover this.
+
 // Benchmark-only decode feedback: tok = out_id; pos/writepos/seqlen += 1.
 // Capturable, so a decode CUDA graph can self-feed during throughput timing.
 void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream = nullptr);

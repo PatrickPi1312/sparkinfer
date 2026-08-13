@@ -469,6 +469,12 @@ int main(int argc, char** argv) {
                  // a process-wide, env-var-gated toggle (not per-request), so this is checked
                  // once per request against the process env, at validation time, before any
                  // generation is attempted.
+                 //
+                 // top_k/top_p deliberately have no analogous check here: they can only ever
+                 // change output in combination with an actual Gumbel draw, which only happens
+                 // at temperature > 0 -- already rejected below regardless of top_k/top_p. A
+                 // top_k=5, temperature=0 request under DFlash is safe (masking is provably
+                 // inert at temperature<=0 -- see ContinuousBatchEngine::Request's doc comment).
                  if (sparkinfer_server::should_reject_dflash_temperature(
                          [] { const char* e = getenv("SPARKINFER_DFLASH"); return e && e[0] == '1'; }(),
                          controls.temperature)) {
@@ -544,7 +550,8 @@ int main(int argc, char** argv) {
                          [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
                           chat_request, tool_protocol, json_mode_active,
                           include_usage = controls.include_usage, stop = controls.stop,
-                          temperature = controls.temperature, seed = controls.seed]
+                          temperature = controls.temperature, seed = controls.seed,
+                          top_k = controls.top_k, top_p = controls.top_p]
                          (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
                                  sink.done();
@@ -590,7 +597,7 @@ int main(int argc, char** argv) {
                                          }
                                          return sink.is_writable();
                                      };
-                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, temperature, seed);
+                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, temperature, seed, top_k, top_p);
                                      total_prompt_tokens += (long long)cur_prompt_ids.size();
                                      total_completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
@@ -723,7 +730,7 @@ int main(int argc, char** argv) {
                                      ok = write_stream_delta(sink, cid, created, "content", delta.content) && ok;
                                  return ok && sink.is_writable();
                              };
-                             const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok, temperature, seed);
+                             const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok, temperature, seed, top_k, top_p);
                              const int prompt_tokens = (int)prompt_ids.size();
                              const int completion_tokens = (int)stream_ids.size();
                              g_prompt_tokens_total += (uint64_t)prompt_tokens;
@@ -869,7 +876,7 @@ int main(int argc, char** argv) {
                              }
                              return true;
                          };
-                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, controls.temperature, controls.seed);
+                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, controls.temperature, controls.seed, controls.top_k, controls.top_p);
                          total_prompt_tokens += (long long)cur_prompt_ids.size();
                          total_completion_tokens += (long long)ids.size();
                          if (!outcome.error.empty()) {
@@ -943,7 +950,7 @@ int main(int argc, char** argv) {
                          }
                          return true;
                      };
-                     outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok, controls.temperature, controls.seed);
+                     outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok, controls.temperature, controls.seed, controls.top_k, controls.top_p);
                      std::string text;
                      if (!outcome.error.empty()) {
                          res.status = record_and_status(outcome);

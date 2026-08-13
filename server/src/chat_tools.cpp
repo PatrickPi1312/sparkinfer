@@ -1144,6 +1144,32 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
             return false;
         }
     }
+    if (root.contains("top_p") && !root["top_p"].is_null()) {
+        const auto& value = root["top_p"];
+        if (!value.is_number()) {
+            err = "top_p must be a number";
+            return false;
+        }
+        const double p = value.get<double>();
+        if (!(p > 0.0) || !(p <= 1.0)) {  // NaN-safe: comparisons against NaN are false either way
+            err = "top_p must be between 0.0 (exclusive) and 1.0 (inclusive)";
+            return false;
+        }
+        out.top_p = static_cast<float>(p);
+    }
+    if (root.contains("top_k") && !root["top_k"].is_null()) {
+        const auto& value = root["top_k"];
+        if (!value.is_number_integer()) {
+            err = "top_k must be an integer";
+            return false;
+        }
+        const long long k = value.get<long long>();
+        if (k < 0) {
+            err = "top_k must be non-negative";
+            return false;
+        }
+        out.top_k = static_cast<int>(std::min<long long>(k, std::numeric_limits<int>::max()));
+    }
     return true;
 }
 

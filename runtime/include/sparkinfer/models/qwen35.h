@@ -188,8 +188,17 @@ public:
     // request-scoped, 0-based decode-step counter (ContinuousBatchEngine::Job::decode_emitted is
     // the intended source) so the SAME captured decode graph can be replayed across separate
     // requests/sessions with different temperature/seed without invalidating reproducibility.
+    //
+    // top_k (<=0 or >=vocab disables) and top_p (<=0 or >=1.0 disables) truncate the candidate
+    // set BEFORE the Gumbel draw above -- top_k first, then top_p narrows within it (see
+    // kernels::launch_topk_topp_mask). Provably inert whenever temperature<=0: the greedy winner
+    // (highest logit) is always in both the top_k and top_p surviving set by construction, so
+    // masking never changes a greedy result -- neither param needs temperature>0 to be accepted,
+    // and neither needs its own DFlash-incompatibility check (temperature>0 is already rejected
+    // under DFlash independent of top_k/top_p).
     int forward_token(int token_id, int position, bool sample = true, float temperature = 0.f,
-                      unsigned long long seed = 0, unsigned long long sample_step = 0);
+                      unsigned long long seed = 0, unsigned long long sample_step = 0,
+                      int top_k = 0, float top_p = 1.f);
 
     // Copy the most recent step's logits (vocab floats) to host. Valid after a
     // forward_token() call. Used for teacher-forced scoring (perplexity / KL).

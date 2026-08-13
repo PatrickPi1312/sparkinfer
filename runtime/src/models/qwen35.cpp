@@ -185,6 +185,24 @@ struct Qwen35Model::Impl {
     unsigned long long *h_sample_seed = nullptr, *h_sample_step = nullptr;
     float* d_sample_temp = nullptr;
     unsigned long long *d_sample_seed = nullptr, *d_sample_step = nullptr;
+    // top_k/top_p params, same refresh-before-every-call discipline as the sample params above.
+    int* h_sample_top_k = nullptr;
+    float* h_sample_top_p = nullptr;
+    int* d_sample_top_k = nullptr;
+    float* d_sample_top_p = nullptr;
+    // top_k/top_p truncation scratch: allocated ONCE at load time (vocab-sized), fixed address,
+    // never reallocated per-call -- see kernels::launch_topk_topp_mask's doc comment for why this
+    // must always process the full vocab regardless of top_k/top_p (CUB's num_items is a host
+    // constant, not a per-call device value).
+    int* d_vocab_iota = nullptr;
+    float* d_sorted_logits = nullptr;
+    int* d_sorted_idx = nullptr;
+    float* d_topk_exp = nullptr;
+    float* d_topk_cumsum = nullptr;
+    void* d_sort_temp = nullptr;
+    size_t sort_temp_bytes = 0;
+    void* d_scan_temp = nullptr;
+    size_t scan_temp_bytes = 0;
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
     // GGUF fused-expert decode scratch (allocated by load_gguf)
@@ -357,6 +375,25 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     cu(cudaHostAlloc(&p_->h_sample_seed, sizeof(unsigned long long), cudaHostAllocDefault), "host sample seed");
     cu(cudaHostAlloc(&p_->h_sample_step, sizeof(unsigned long long), cudaHostAllocDefault), "host sample step");
     *p_->h_sample_temp = 0.f;
+    p_->d_sample_top_k=p_->alloc<int>(1);
+    p_->d_sample_top_p=p_->alloc<float>(1);
+    cu(cudaHostAlloc(&p_->h_sample_top_k, sizeof(int), cudaHostAllocDefault), "host sample top_k");
+    cu(cudaHostAlloc(&p_->h_sample_top_p, sizeof(float), cudaHostAllocDefault), "host sample top_p");
+    *p_->h_sample_top_k = 0;
+    *p_->h_sample_top_p = 1.f;
+    // top_k/top_p truncation scratch -- allocated once here (vocab-sized, fixed address), never
+    // reallocated per-call. Sizing the two CUB temp-storage buffers is a load-time-only call, no
+    // kernel launch involved.
+    p_->d_vocab_iota=p_->alloc<int>(cfg.vocab);
+    p_->d_sorted_logits=p_->alloc<float>(cfg.vocab);
+    p_->d_sorted_idx=p_->alloc<int>(cfg.vocab);
+    p_->d_topk_exp=p_->alloc<float>(cfg.vocab);
+    p_->d_topk_cumsum=p_->alloc<float>(cfg.vocab);
+    kernels::launch_vocab_iota_init(p_->d_vocab_iota, cfg.vocab);
+    p_->sort_temp_bytes = kernels::topk_sort_temp_storage_bytes(cfg.vocab);
+    p_->scan_temp_bytes = kernels::topk_scan_temp_storage_bytes(cfg.vocab);
+    cu(cudaMalloc(&p_->d_sort_temp, p_->sort_temp_bytes), "topk sort temp");
+    cu(cudaMalloc(&p_->d_scan_temp, p_->scan_temp_bytes), "topk scan temp");
     p_->d_shared_ids=p_->alloc<int>(1); p_->d_shared_w=p_->alloc<float>(1);
     int zero=0; float one=1.f;
     cu(cudaMemcpy(p_->d_shared_ids,&zero,sizeof(int),cudaMemcpyHostToDevice),"shared ids");
@@ -482,6 +519,11 @@ Qwen35Model::~Qwen35Model() {
     cudaFreeHost(p_->h_scalars); cudaFreeHost(p_->h_out_id);
     cudaFree(p_->d_sample_temp); cudaFree(p_->d_sample_seed); cudaFree(p_->d_sample_step);
     cudaFreeHost(p_->h_sample_temp); cudaFreeHost(p_->h_sample_seed); cudaFreeHost(p_->h_sample_step);
+    cudaFree(p_->d_sample_top_k); cudaFree(p_->d_sample_top_p);
+    cudaFreeHost(p_->h_sample_top_k); cudaFreeHost(p_->h_sample_top_p);
+    cudaFree(p_->d_vocab_iota); cudaFree(p_->d_sorted_logits); cudaFree(p_->d_sorted_idx);
+    cudaFree(p_->d_topk_exp); cudaFree(p_->d_topk_cumsum);
+    cudaFree(p_->d_sort_temp); cudaFree(p_->d_scan_temp);
     cudaFree(p_->d_shared_ids); cudaFree(p_->d_shared_w);
     // Qwen3.6 Gated-DeltaNet buffers (allocated only for the hybrid model)
     cudaFree(p_->qraw); cudaFree(p_->qgate);
@@ -576,7 +618,8 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
 }
 
 int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
-                               unsigned long long seed, unsigned long long sample_step) {
+                               unsigned long long seed, unsigned long long sample_step,
+                               int top_k, float top_p) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -635,6 +678,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     cu(cudaMemcpyAsync(s.d_sample_temp, s.h_sample_temp, sizeof(float), cudaMemcpyHostToDevice, st), "sample temp");
     cu(cudaMemcpyAsync(s.d_sample_seed, s.h_sample_seed, sizeof(unsigned long long), cudaMemcpyHostToDevice, st), "sample seed");
     cu(cudaMemcpyAsync(s.d_sample_step, s.h_sample_step, sizeof(unsigned long long), cudaMemcpyHostToDevice, st), "sample step");
+    *s.h_sample_top_k = top_k;
+    *s.h_sample_top_p = top_p;
+    cu(cudaMemcpyAsync(s.d_sample_top_k, s.h_sample_top_k, sizeof(int), cudaMemcpyHostToDevice, st), "sample top_k");
+    cu(cudaMemcpyAsync(s.d_sample_top_p, s.h_sample_top_p, sizeof(float), cudaMemcpyHostToDevice, st), "sample top_p");
 
     // Depth-adaptive KV-split (see adaptive_nsplits_for() above for the tiers/occupancy math).
     // DFlash DECODE: freeze n_splits once an actual dflash verify graph is captured. Adapting it
@@ -1687,10 +1734,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
         kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
     dbg_f32(s.logits, c.vocab, 91, -2);   // tag 91: final logits (post logit_scale/softcap)
-    // Always launched, never host-gated on temperature: this call site is inside a CUDA graph
-    // whose node topology is frozen at capture time and may be replayed for a LATER, separate
-    // request (e.g. via use_prefix_session's shared seq_id=0) with a different temperature. The
-    // kernel itself reads temperature from device memory refreshed above and no-ops when <= 0.
+    // Always launched, never host-gated on top_k/top_p/temperature: this call site is inside a
+    // CUDA graph whose node topology is frozen at capture time and may be replayed for a LATER,
+    // separate request (e.g. via use_prefix_session's shared seq_id=0) with different values. Both
+    // kernels read their params from device memory refreshed above and no-op (or are provably
+    // inert -- see qwen35.h's forward_token doc comment) when disabled/at temperature<=0.
+    kernels::launch_topk_topp_mask(s.logits, c.vocab, s.d_vocab_iota, s.d_sorted_logits, s.d_sorted_idx,
+                                   s.d_topk_exp, s.d_topk_cumsum, s.d_sort_temp, s.sort_temp_bytes,
+                                   s.d_scan_temp, s.scan_temp_bytes,
+                                   s.d_sample_top_k, s.d_sample_top_p, st);
     kernels::launch_temperature_sample(s.logits, 1, c.vocab, s.d_sample_temp, s.d_sample_seed,
                                        s.d_sample_step, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);

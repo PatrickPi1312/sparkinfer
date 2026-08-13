@@ -38,6 +38,12 @@ public:
         // respects it.
         float temperature = 0.f;
         uint64_t seed = 0;              // only meaningful when temperature > 0
+        // top_k <= 0 or >= vocab disables top_k (no truncation). top_p <= 0 or >= 1.0 disables
+        // top_p. Both truncate the candidate set before the Gumbel draw above; neither requires
+        // temperature > 0 to be accepted -- see Qwen35Model::forward_token's doc comment for the
+        // inertness proof. Same prefill-phase-seed-token caveat as temperature applies unchanged.
+        int top_k = 0;
+        float top_p = 1.0f;
     };
 
     struct Result {

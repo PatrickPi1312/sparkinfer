@@ -962,6 +962,47 @@ bool test_request_controls_seed_validation() {
     return true;
 }
 
+bool test_request_controls_top_p_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(controls.top_p == 1.0f);
+    CHECK(parse_request_controls(R"({"top_p":1.0})", controls, err));
+    CHECK(controls.top_p == 1.0f);
+    CHECK(parse_request_controls(R"({"top_p":0.9})", controls, err));
+    CHECK(controls.top_p > 0.89f && controls.top_p < 0.91f);
+    CHECK(parse_request_controls(R"({"top_p":0.0001})", controls, err));
+    CHECK(controls.top_p > 0.f && controls.top_p < 0.001f);
+    CHECK(!parse_request_controls(R"({"top_p":0})", controls, err));
+    CHECK(!parse_request_controls(R"({"top_p":-0.1})", controls, err));
+    CHECK(!parse_request_controls(R"({"top_p":1.1})", controls, err));
+    CHECK(!parse_request_controls(R"({"top_p":"high"})", controls, err));
+    // Does not require temperature to be set.
+    CHECK(parse_request_controls(R"({"top_p":0.5})", controls, err));
+    CHECK(controls.temperature == 0.f);
+    return true;
+}
+
+bool test_request_controls_top_k_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(controls.top_k == 0);
+    CHECK(parse_request_controls(R"({"top_k":0})", controls, err));
+    CHECK(controls.top_k == 0);
+    CHECK(parse_request_controls(R"({"top_k":40})", controls, err));
+    CHECK(controls.top_k == 40);
+    CHECK(parse_request_controls(R"({"top_k":1000000})", controls, err));  // no upper-bound rejection
+    CHECK(controls.top_k == 1000000);
+    CHECK(!parse_request_controls(R"({"top_k":-1})", controls, err));
+    CHECK(!parse_request_controls(R"({"top_k":1.5})", controls, err));
+    CHECK(!parse_request_controls(R"({"top_k":"high"})", controls, err));
+    // Does not require temperature to be set.
+    CHECK(parse_request_controls(R"({"top_k":5})", controls, err));
+    CHECK(controls.temperature == 0.f);
+    return true;
+}
+
 bool test_should_reject_dflash_temperature() {
     CHECK(!should_reject_dflash_temperature(/*dflash_env_on=*/false, /*temperature=*/0.7f));
     CHECK(!should_reject_dflash_temperature(/*dflash_env_on=*/true, /*temperature=*/0.f));
@@ -1184,6 +1225,8 @@ int main() {
     if (!test_validate_response_format_json_schema()) return 1;
     if (!test_request_controls_temperature_validation()) return 1;
     if (!test_request_controls_seed_validation()) return 1;
+    if (!test_request_controls_top_p_validation()) return 1;
+    if (!test_request_controls_top_k_validation()) return 1;
     if (!test_should_reject_dflash_temperature()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
