@@ -85,6 +85,12 @@ struct RequestControls {
     // ContinuousBatchEngine::Request's doc comment for the inertness proof.
     int top_k = 0;
     float top_p = 1.0f;
+    // [-2.0, 2.0]; 0 (default, OpenAI's own default) disables both. Sampling controls, same tier
+    // as temperature/top_k/top_p (NOT logprobs, which is pure output reporting) -- threaded
+    // through every complete_streaming call site, including the json_mode/tool-calling retry
+    // loops that top_k/top_p already reach but logprobs/top_logprobs do not.
+    float presence_penalty = 0.f;
+    float frequency_penalty = 0.f;
     // logprobs=false (default) attaches no logprobs field anywhere in the response. top_logprobs
     // is only meaningful when logprobs is true -- unlike top_k/top_p, this IS cross-validated
     // against a sibling field: parse_request_controls rejects top_logprobs supplied without
@@ -99,6 +105,13 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
 // getenv() so it's unit-testable without a process-wide env var): true => the request should be
 // rejected with 400. temperature<=0 is always accepted regardless of dflash_env_on.
 bool should_reject_dflash_temperature(bool dflash_env_on, float temperature);
+
+// Pure decision function for the DFlash+presence/frequency-penalty incompatibility -- mirrors
+// should_reject_dflash_temperature, but is a SEPARATE check (not folded into it) because penalty
+// has no inertness proof at temperature<=0 the way top_k/top_p do: a nonzero penalty CAN change
+// the greedy-argmax winner on its own. true => the request should be rejected with 400.
+// presence_penalty==0 && frequency_penalty==0 is always accepted regardless of dflash_env_on.
+bool should_reject_dflash_penalty(bool dflash_env_on, float presence_penalty, float frequency_penalty);
 
 // Best-effort validation only -- there is no constrained decoding in this backend, so this
 // cannot guarantee the model's output actually conforms; it just checks after the fact.

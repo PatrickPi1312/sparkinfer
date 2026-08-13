@@ -23,6 +23,7 @@ using sparkinfer_server::apply_qwen36_tools_template;
 using sparkinfer_server::parse_chat_request_json;
 using sparkinfer_server::parse_qwen36_tool_output;
 using sparkinfer_server::parse_request_controls;
+using sparkinfer_server::should_reject_dflash_penalty;
 using sparkinfer_server::should_reject_dflash_temperature;
 using sparkinfer_server::validate_response_format;
 
@@ -1030,10 +1031,63 @@ bool test_request_controls_logprobs_validation() {
     return true;
 }
 
+bool test_request_controls_presence_penalty_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(controls.presence_penalty == 0.f);
+    CHECK(parse_request_controls(R"({"presence_penalty":0})", controls, err));
+    CHECK(controls.presence_penalty == 0.f);
+    CHECK(parse_request_controls(R"({"presence_penalty":1.5})", controls, err));
+    CHECK(controls.presence_penalty > 1.49f && controls.presence_penalty < 1.51f);
+    CHECK(parse_request_controls(R"({"presence_penalty":-2.0})", controls, err));
+    CHECK(controls.presence_penalty == -2.0f);
+    CHECK(parse_request_controls(R"({"presence_penalty":2.0})", controls, err));
+    CHECK(controls.presence_penalty == 2.0f);
+    CHECK(!parse_request_controls(R"({"presence_penalty":-2.1})", controls, err));
+    CHECK(!parse_request_controls(R"({"presence_penalty":2.1})", controls, err));
+    CHECK(!parse_request_controls(R"({"presence_penalty":"high"})", controls, err));
+    // Does not require temperature to be set.
+    CHECK(parse_request_controls(R"({"presence_penalty":1.0})", controls, err));
+    CHECK(controls.temperature == 0.f);
+    return true;
+}
+
+bool test_request_controls_frequency_penalty_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(controls.frequency_penalty == 0.f);
+    CHECK(parse_request_controls(R"({"frequency_penalty":0})", controls, err));
+    CHECK(controls.frequency_penalty == 0.f);
+    CHECK(parse_request_controls(R"({"frequency_penalty":1.5})", controls, err));
+    CHECK(controls.frequency_penalty > 1.49f && controls.frequency_penalty < 1.51f);
+    CHECK(parse_request_controls(R"({"frequency_penalty":-2.0})", controls, err));
+    CHECK(controls.frequency_penalty == -2.0f);
+    CHECK(parse_request_controls(R"({"frequency_penalty":2.0})", controls, err));
+    CHECK(controls.frequency_penalty == 2.0f);
+    CHECK(!parse_request_controls(R"({"frequency_penalty":-2.1})", controls, err));
+    CHECK(!parse_request_controls(R"({"frequency_penalty":2.1})", controls, err));
+    CHECK(!parse_request_controls(R"({"frequency_penalty":"high"})", controls, err));
+    // Does not require temperature to be set.
+    CHECK(parse_request_controls(R"({"frequency_penalty":1.0})", controls, err));
+    CHECK(controls.temperature == 0.f);
+    return true;
+}
+
 bool test_should_reject_dflash_temperature() {
     CHECK(!should_reject_dflash_temperature(/*dflash_env_on=*/false, /*temperature=*/0.7f));
     CHECK(!should_reject_dflash_temperature(/*dflash_env_on=*/true, /*temperature=*/0.f));
     CHECK(should_reject_dflash_temperature(/*dflash_env_on=*/true, /*temperature=*/0.7f));
+    return true;
+}
+
+bool test_should_reject_dflash_penalty() {
+    CHECK(!should_reject_dflash_penalty(/*dflash_env_on=*/false, /*presence=*/1.0f, /*frequency=*/1.0f));
+    CHECK(!should_reject_dflash_penalty(/*dflash_env_on=*/true, /*presence=*/0.f, /*frequency=*/0.f));
+    CHECK(should_reject_dflash_penalty(/*dflash_env_on=*/true, /*presence=*/1.0f, /*frequency=*/0.f));
+    CHECK(should_reject_dflash_penalty(/*dflash_env_on=*/true, /*presence=*/0.f, /*frequency=*/1.0f));
+    CHECK(should_reject_dflash_penalty(/*dflash_env_on=*/true, /*presence=*/-1.0f, /*frequency=*/0.f));
     return true;
 }
 
@@ -1255,7 +1309,10 @@ int main() {
     if (!test_request_controls_top_p_validation()) return 1;
     if (!test_request_controls_top_k_validation()) return 1;
     if (!test_request_controls_logprobs_validation()) return 1;
+    if (!test_request_controls_presence_penalty_validation()) return 1;
+    if (!test_request_controls_frequency_penalty_validation()) return 1;
     if (!test_should_reject_dflash_temperature()) return 1;
+    if (!test_should_reject_dflash_penalty()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
     if (!test_unsafe_protocol_names()) return 1;

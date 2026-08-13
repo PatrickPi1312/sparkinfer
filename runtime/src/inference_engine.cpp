@@ -171,10 +171,12 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         seq_id = 0;
         if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
         model_->activate_session(seq_id);
+        model_->reset_penalty_counts(seq_id);   // session 0 is shared across unrelated requests
     } else {
         bool alloc_failed = false;
         seq_id = model_->open_session(budget, &alloc_failed);
         if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
+        model_->reset_penalty_counts(seq_id);   // explicit, not relying on open_session's internal zero
     }
 
     job.request_id = next_req_id_.fetch_add(1);
@@ -407,7 +409,8 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     job.next_token = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true,
                                            job.req.temperature, job.req.seed,
                                            (uint64_t)job.decode_emitted,
-                                           job.req.top_k, job.req.top_p);
+                                           job.req.top_k, job.req.top_p,
+                                           job.req.presence_penalty, job.req.frequency_penalty);
     // Must run in THIS step_job() call, synchronously, before any OTHER job's forward_token()
     // (worker_loop() interleaves jobs sharing one Qwen35Model instance) can overwrite the shared
     // decode scratch last_token_logprobs() reads from. See Job::on_token_logprob's doc comment.

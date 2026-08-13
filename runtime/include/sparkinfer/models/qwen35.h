@@ -196,9 +196,23 @@ public:
     // masking never changes a greedy result -- neither param needs temperature>0 to be accepted,
     // and neither needs its own DFlash-incompatibility check (temperature>0 is already rejected
     // under DFlash independent of top_k/top_p).
+    //
+    // presence_penalty/frequency_penalty (OpenAI's [-2.0, 2.0] range; 0 disables both) subtract
+    // count-weighted terms from the FULL vocab-sized logits row BEFORE top_k/top_p truncation
+    // above -- see kernels::launch_presence_frequency_penalty. UNLIKE top_k/top_p, this has NO
+    // inertness proof at temperature<=0: a nonzero penalty can change WHICH token has the highest
+    // logit even under pure greedy argmax, since it isn't restricted to non-winning ranks the way
+    // truncation is. DFlash (which requires exact greedy-argmax determinism against its draft
+    // model) must therefore reject presence_penalty!=0 || frequency_penalty!=0 independently of
+    // temperature -- see should_reject_dflash_penalty in chat_tools.hpp, mirroring
+    // should_reject_dflash_temperature. Counts accumulate in the CURRENT session's per-session
+    // penalty_counts buffer (see SessionBuffers, activate_session()) across every decode step of
+    // the SAME request -- reset once per request at submit time
+    // (Qwen35Model::reset_penalty_counts), NOT per forward_token() call.
     int forward_token(int token_id, int position, bool sample = true, float temperature = 0.f,
                       unsigned long long seed = 0, unsigned long long sample_step = 0,
-                      int top_k = 0, float top_p = 1.f);
+                      int top_k = 0, float top_p = 1.f,
+                      float presence_penalty = 0.f, float frequency_penalty = 0.f);
 
     // Copy the most recent step's logits (vocab floats) to host. Valid after a
     // forward_token() call. Used for teacher-forced scoring (perplexity / KL).
@@ -285,6 +299,19 @@ public:
     void close_session(uint64_t seq_id, const std::vector<int>* store_tokens = nullptr);
     void activate_session(uint64_t seq_id);
     uint64_t active_session() const;
+
+    // Zeros seq_id's running presence/frequency-penalty count buffer. MUST be called once per
+    // REQUEST that will use this seq_id, even for a freshly open_session()'d id (open_session
+    // already zeros at allocation time, but this call is the single, unambiguous "this request's
+    // counts start at zero" point -- see ContinuousBatchEngine::submit_locked's call sites).
+    // CRITICALLY needed for seq_id == 0 (the shared prefix session): unlike lin_state/
+    // lin_conv_state, which are DELIBERATELY persistent/shared across the many unrelated requests
+    // that reuse session 0 via use_prefix_session (that sharing IS the prefix-cache
+    // optimization), OpenAI's presence/frequency-penalty semantics are scoped to "the CURRENT
+    // completion's generated tokens" -- a fresh request reusing session 0 must start with
+    // all-zero counts, or one client's generation would incorrectly penalize a later, unrelated
+    // client's request sharing the same prefix session. No-op if seq_id has no session entry.
+    void reset_penalty_counts(uint64_t seq_id);
 
     // Token budget for KV allocation: prompt + decode headroom, capped at max_seq.
     static int session_token_budget(size_t prompt_len, int max_new, int max_seq);

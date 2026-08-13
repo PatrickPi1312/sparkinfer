@@ -123,6 +123,13 @@ bool is_linear_layer(const Qwen35Config& c, int layer) {
 struct SessionBuffers {
     float* lin_state = nullptr;
     bf16* lin_conv_state = nullptr;
+    // Per-request running count of how many times each vocab id has appeared in THIS session's
+    // generated completion so far -- for presence_penalty/frequency_penalty. Unlike lin_state/
+    // lin_conv_state (hybrid-architecture-only), this exists for EVERY model. vocab-sized, alloc'd
+    // once per session slot; see Qwen35Model::reset_penalty_counts for why it must ALSO be
+    // explicitly re-zeroed once per REQUEST (not just once per session-slot creation) whenever a
+    // session is reused across multiple requests (seq_id 0, the shared prefix session).
+    int* penalty_counts = nullptr;
 };
 
 struct Qwen35Model::Impl {
@@ -173,6 +180,12 @@ struct Qwen35Model::Impl {
     bf16 *sh_gate = nullptr, *sh_up = nullptr, *sh_h = nullptr;   // shared-expert GEMV scratch [moe_ffn]
     bf16 *lin_conv_state = nullptr;
     float* lin_state = nullptr;
+    // "Current" session's penalty_counts (swapped by activate_session(), unconditionally, for
+    // every model -- see SessionBuffers). penalty_counts_default backs session 0's entry, alloc'd
+    // once at load time; sessions[seq_id].penalty_counts for every other session is alloc'd by
+    // open_session().
+    int* penalty_counts = nullptr;
+    int* penalty_counts_default = nullptr;
     float* logits;
     int *d_scalars, *d_tok, *d_out_id, *d_pos, *d_seqlen, *d_writepos, *d_shared_ids;
     int *d_cap_row = nullptr;   // dflash capture row, packed into d_scalars[4]
@@ -190,6 +203,11 @@ struct Qwen35Model::Impl {
     float* h_sample_top_p = nullptr;
     int* d_sample_top_k = nullptr;
     float* d_sample_top_p = nullptr;
+    // presence_penalty/frequency_penalty params, same refresh-before-every-call discipline.
+    float* h_sample_presence_penalty = nullptr;
+    float* h_sample_frequency_penalty = nullptr;
+    float* d_sample_presence_penalty = nullptr;
+    float* d_sample_frequency_penalty = nullptr;
     // top_k/top_p truncation scratch: allocated ONCE at load time (vocab-sized), fixed address,
     // never reallocated per-call -- see kernels::launch_topk_topp_mask's doc comment for why this
     // must always process the full vocab regardless of top_k/top_p (CUB's num_items is a host
@@ -367,6 +385,13 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         p_->shared_gate_tmp=p_->alloc<bf16>(1);
     }
     p_->logits=p_->alloc<float>(cfg.vocab);
+    // presence_penalty/frequency_penalty per-vocab running count, session-0's own buffer (every
+    // OTHER session's own count buffer is alloc'd by open_session()) -- unconditional, every
+    // model, unlike lin_state/lin_conv_state above (hybrid-architecture-only).
+    p_->penalty_counts_default=p_->alloc<int>(cfg.vocab);
+    p_->penalty_counts=p_->penalty_counts_default;
+    cu(cudaMemsetAsync(p_->penalty_counts_default, 0, (size_t)cfg.vocab * sizeof(int), p_->stream),
+       "penalty_counts_default zero");
     p_->d_scalars=p_->alloc<int>(5);
     p_->d_tok=p_->d_scalars + 0; p_->d_pos=p_->d_scalars + 1;
     p_->d_writepos=p_->d_scalars + 2; p_->d_seqlen=p_->d_scalars + 3;
@@ -387,6 +412,12 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     cu(cudaHostAlloc(&p_->h_sample_top_p, sizeof(float), cudaHostAllocDefault), "host sample top_p");
     *p_->h_sample_top_k = 0;
     *p_->h_sample_top_p = 1.f;
+    p_->d_sample_presence_penalty=p_->alloc<float>(1);
+    p_->d_sample_frequency_penalty=p_->alloc<float>(1);
+    cu(cudaHostAlloc(&p_->h_sample_presence_penalty, sizeof(float), cudaHostAllocDefault), "host sample presence_penalty");
+    cu(cudaHostAlloc(&p_->h_sample_frequency_penalty, sizeof(float), cudaHostAllocDefault), "host sample frequency_penalty");
+    *p_->h_sample_presence_penalty = 0.f;
+    *p_->h_sample_frequency_penalty = 0.f;
     // top_k/top_p truncation scratch -- allocated once here (vocab-sized, fixed address), never
     // reallocated per-call. Sizing the two CUB temp-storage buffers is a load-time-only call, no
     // kernel launch involved.
@@ -511,10 +542,13 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_SHEXP_PIPE")) p_->use_shexp_pipe = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ADDNORM3")) p_->use_addnorm3 = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_ROUTER_FUSED")) p_->use_router_fused = !(e[0] == '0');
-    if (cfg.hybrid) {
+    {
         SessionBuffers d;
-        d.lin_state = p_->lin_state;
-        d.lin_conv_state = p_->lin_conv_state;
+        if (cfg.hybrid) {
+            d.lin_state = p_->lin_state;
+            d.lin_conv_state = p_->lin_conv_state;
+        }
+        d.penalty_counts = p_->penalty_counts_default;   // unconditional -- every model
         p_->sessions[0] = d;
     }
 }
@@ -524,6 +558,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->x); cudaFree(p_->xn); cudaFree(p_->q); cudaFree(p_->k); cudaFree(p_->v);
     cudaFree(p_->attn); cudaFree(p_->ao); cudaFree(p_->h); cudaFree(p_->hn);
     cudaFree(p_->routed); cudaFree(p_->shared); cudaFree(p_->logits);
+    cudaFree(p_->penalty_counts_default);
     // main's packed decode scalars (d_tok/d_pos/d_seqlen/d_writepos alias into d_scalars — not freed separately)
     cudaFree(p_->d_scalars); cudaFree(p_->d_out_id);
     cudaFreeHost(p_->h_scalars); cudaFreeHost(p_->h_out_id);
@@ -531,6 +566,8 @@ Qwen35Model::~Qwen35Model() {
     cudaFreeHost(p_->h_sample_temp); cudaFreeHost(p_->h_sample_seed); cudaFreeHost(p_->h_sample_step);
     cudaFree(p_->d_sample_top_k); cudaFree(p_->d_sample_top_p);
     cudaFreeHost(p_->h_sample_top_k); cudaFreeHost(p_->h_sample_top_p);
+    cudaFree(p_->d_sample_presence_penalty); cudaFree(p_->d_sample_frequency_penalty);
+    cudaFreeHost(p_->h_sample_presence_penalty); cudaFreeHost(p_->h_sample_frequency_penalty);
     cudaFree(p_->d_vocab_iota); cudaFree(p_->d_sorted_logits); cudaFree(p_->d_sorted_idx);
     cudaFree(p_->d_topk_exp); cudaFree(p_->d_topk_cumsum);
     cudaFree(p_->d_sort_temp); cudaFree(p_->d_scan_temp);
@@ -661,7 +698,8 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
 
 int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
                                unsigned long long seed, unsigned long long sample_step,
-                               int top_k, float top_p) {
+                               int top_k, float top_p,
+                               float presence_penalty, float frequency_penalty) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -724,6 +762,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     *s.h_sample_top_p = top_p;
     cu(cudaMemcpyAsync(s.d_sample_top_k, s.h_sample_top_k, sizeof(int), cudaMemcpyHostToDevice, st), "sample top_k");
     cu(cudaMemcpyAsync(s.d_sample_top_p, s.h_sample_top_p, sizeof(float), cudaMemcpyHostToDevice, st), "sample top_p");
+    *s.h_sample_presence_penalty = presence_penalty;
+    *s.h_sample_frequency_penalty = frequency_penalty;
+    cu(cudaMemcpyAsync(s.d_sample_presence_penalty, s.h_sample_presence_penalty, sizeof(float), cudaMemcpyHostToDevice, st), "sample presence_penalty");
+    cu(cudaMemcpyAsync(s.d_sample_frequency_penalty, s.h_sample_frequency_penalty, sizeof(float), cudaMemcpyHostToDevice, st), "sample frequency_penalty");
 
     // Depth-adaptive KV-split (see adaptive_nsplits_for() above for the tiers/occupancy math).
     // DFlash DECODE: freeze n_splits once an actual dflash verify graph is captured. Adapting it
@@ -1776,6 +1818,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
         kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
     dbg_f32(s.logits, c.vocab, 91, -2);   // tag 91: final logits (post logit_scale/softcap)
+    // Always launched, never host-gated: presence/frequency penalty has NO inertness proof at
+    // presence_penalty==0 && frequency_penalty==0 the way top_k/top_p do at temperature<=0 -- see
+    // qwen35.h's forward_token doc comment. Applied BEFORE launch_topk_topp_mask's sort so the
+    // penalized distribution flows through top_k/top_p truncation, temperature sampling, AND
+    // logprobs reporting -- matches real-world OpenAI/vLLM behavior of reporting logprobs against
+    // what was actually sampled from.
+    kernels::launch_presence_frequency_penalty(s.logits, s.penalty_counts, c.vocab,
+                                               s.d_sample_presence_penalty, s.d_sample_frequency_penalty, st);
     // Always launched, never host-gated on top_k/top_p/temperature: this call site is inside a
     // CUDA graph whose node topology is frozen at capture time and may be replayed for a LATER,
     // separate request (e.g. via use_prefix_session's shared seq_id=0) with different values. Both
@@ -1793,6 +1843,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // LATER, different request whose logprobs setting differs. Negligible cost (single thread).
     kernels::launch_extract_chosen_logit(s.d_out_id, s.d_rank_by_id, s.d_sorted_logits,
                                          s.d_chosen_logit, st);
+    // Always launched, unconditionally: records this step's sampled token into the CURRENT
+    // session's running penalty count so the NEXT decode step's penalty application sees it.
+    kernels::launch_increment_penalty_count(s.penalty_counts, s.d_out_id, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
     if (capturing_graph && dflash_cap) {
@@ -2298,25 +2351,40 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
     if (num_tokens <= 0) return 0;
     const uint64_t seq_id = s.next_session_id.fetch_add(1);
     if (!s.kv->allocate(seq_id, num_tokens)) return 0;   // pool full -- normal, transient
+    SessionBuffers buf;
+    // Unconditional, every model -- unlike lin_state/lin_conv_state below (hybrid-only). This
+    // fresh session serves exactly one request end-to-end before close_session() frees it (1:1
+    // lifecycle via ContinuousBatchEngine::finish_job), so a one-time zero here is sufficient --
+    // unlike session 0, which is reused across many DIFFERENT requests and needs an explicit
+    // per-request reset (see reset_penalty_counts()).
+    buf.penalty_counts = s.alloc<int>(s.cfg.vocab);
+    bool alloc_ok = buf.penalty_counts != nullptr;
     if (s.cfg.hybrid) {
-        SessionBuffers buf;
         buf.lin_state = s.alloc<float>((size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
                                        s.cfg.linear_head_dim * s.cfg.linear_head_dim);
         buf.lin_conv_state = s.alloc<bf16>((size_t)s.cfg.n_layers *
                                            (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim);
-        if (!buf.lin_state || !buf.lin_conv_state) {
-            // A real cudaMalloc failure (already logged by alloc<T>'s cu() wrapper as
-            // "[qwen35] malloc: out of memory") -- not the KV pool being full, which was already
-            // checked above. Surfaced separately so callers can tell "genuinely no capacity right
-            // now" (retry later) apart from "device is out of memory" (permanent until restart).
-            if (alloc_failed) *alloc_failed = true;
-            s.kv->free(seq_id);
-            if (buf.lin_state) cudaFree(buf.lin_state);
-            if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);
-            return 0;
-        }
-        s.sessions[seq_id] = buf;
+        alloc_ok = alloc_ok && buf.lin_state && buf.lin_conv_state;
     }
+    if (!alloc_ok) {
+        // A real cudaMalloc failure (already logged by alloc<T>'s cu() wrapper as
+        // "[qwen35] malloc: out of memory") -- not the KV pool being full, which was already
+        // checked above. Surfaced separately so callers can tell "genuinely no capacity right
+        // now" (retry later) apart from "device is out of memory" (permanent until restart).
+        if (alloc_failed) *alloc_failed = true;
+        s.kv->free(seq_id);
+        if (buf.penalty_counts) cudaFree(buf.penalty_counts);
+        if (buf.lin_state) cudaFree(buf.lin_state);
+        if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);
+        return 0;
+    }
+    // Explicit zero, not relying on alloc<T>'s (plain cudaMalloc) zeroing guarantee -- unlike
+    // lin_state/lin_conv_state, which are written wholesale before ever being read (GDN state is
+    // computed fresh as the prefill/decode loop processes this session's own tokens), a stale,
+    // nonzero penalty count would be silently, incorrectly wrong from token 1.
+    cu(cudaMemsetAsync(buf.penalty_counts, 0, (size_t)s.cfg.vocab * sizeof(int), s.stream),
+       "penalty_counts zero");
+    s.sessions[seq_id] = buf;
     return seq_id;
 }
 
@@ -2348,6 +2416,10 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
         // as a fixed ~108 MiB/request leak independent of token count (#779).
         if (it->second.lin_state) cudaFree(it->second.lin_state);
         if (it->second.lin_conv_state) cudaFree(it->second.lin_conv_state);
+        // Unconditional, every model -- mirrors the lin_state/lin_conv_state free above exactly.
+        // The seq_id == 0 guard at the top of this function already protects
+        // penalty_counts_default from ever being freed here, same aliasing-safety story as #779.
+        if (it->second.penalty_counts) cudaFree(it->second.penalty_counts);
         s.sessions.erase(it);
     }
     if (s.active_seq_id == seq_id) activate_session(0);
@@ -2358,22 +2430,33 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
     if (s.active_seq_id == seq_id) return;
     s.active_seq_id = seq_id;
     auto it = s.sessions.find(seq_id);
-    if (s.cfg.hybrid) {
-        if (it != s.sessions.end()) {
+    if (it == s.sessions.end() && seq_id == 0) it = s.sessions.find(0);  // defensive fallback
+    if (it != s.sessions.end()) {
+        if (s.cfg.hybrid) {
             s.lin_state = it->second.lin_state;
             s.lin_conv_state = it->second.lin_conv_state;
-        } else if (seq_id == 0) {
-            auto z = s.sessions.find(0);
-            if (z != s.sessions.end()) {
-                s.lin_state = z->second.lin_state;
-                s.lin_conv_state = z->second.lin_conv_state;
-            }
         }
+        // penalty_counts swaps for EVERY model (hybrid or not) -- unlike lin_state/lin_conv_state
+        // above, this isn't architecture-specific, it's a per-request sampling-control accumulator.
+        s.penalty_counts = it->second.penalty_counts;
     }
     invalidate_decode_graph();
 }
 
 uint64_t Qwen35Model::active_session() const { return p_->active_seq_id; }
+
+void Qwen35Model::reset_penalty_counts(uint64_t seq_id) {
+    Impl& s = *p_;
+    // Looked up via the sessions map directly, NOT s.penalty_counts (the "currently active"
+    // pointer, which belongs to whatever the WORKER thread last swapped in via activate_session()
+    // for some other job entirely) -- this is called from ContinuousBatchEngine::submit_locked()
+    // on the HTTP-facing thread, so going through the map avoids racing/aliasing the currently-
+    // active decode's scratch.
+    auto it = s.sessions.find(seq_id);
+    if (it == s.sessions.end() || !it->second.penalty_counts) return;   // defensive; should not happen
+    cu(cudaMemsetAsync(it->second.penalty_counts, 0, (size_t)s.cfg.vocab * sizeof(int), s.stream),
+       "penalty_counts reset");
+}
 
 // Greedy-only: this and dflash_generate() are never called from sparkinfer_server (which drives
 // generation through ContinuousBatchEngine::step_job -> forward_token() directly, never through

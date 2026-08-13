@@ -79,6 +79,40 @@ __global__ void extract_chosen_logit_kernel(const int* __restrict__ out_id,
     if (threadIdx.x == 0 && blockIdx.x == 0) *chosen_logit = sorted_logits[rank_by_id[*out_id]];
 }
 
+// logits[v] -= frequency_penalty * counts[v] + presence_penalty * (counts[v] > 0 ? 1 : 0), for
+// every v in [0, vocab). OpenAI's exact presence/frequency-penalty formula (counts[v] = number of
+// times vocab id v has appeared in THIS request's generated completion so far, accumulated across
+// prior decode steps by increment_penalty_count_kernel below -- NOT the prompt). Always launched
+// unconditionally on the CUDA-graph-captured decode path -- presence_penalty_f32/
+// frequency_penalty_f32 are read from device memory refreshed before every forward_token() call,
+// since this node's topology is frozen at capture time and may be replayed for a LATER, different
+// request with different penalty values (e.g. via use_prefix_session's shared seq_id=0). At
+// presence_penalty==0 && frequency_penalty==0 this is a pure subtract-zero pass -- still a
+// full-vocab memory-bound cost, no way to skip it without a host-side branch inside a captured
+// graph (see fused.h's documented dead end on conditional graph nodes for why that path was
+// abandoned for top_k/top_p and is not revisited here).
+__global__ void apply_presence_frequency_penalty_kernel(float* __restrict__ logits,
+                                                         const int* __restrict__ counts, int vocab,
+                                                         const float* __restrict__ presence_penalty_f32,
+                                                         const float* __restrict__ frequency_penalty_f32) {
+    const float pp = *presence_penalty_f32, fp = *frequency_penalty_f32;
+    for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < vocab; v += gridDim.x * blockDim.x) {
+        const int c = counts[v];
+        logits[v] -= fp * (float)c + pp * (c > 0 ? 1.f : 0.f);
+    }
+}
+
+// counts[chosen_id] += 1 -- records that this decode step's sampled token was chosen_id, so the
+// NEXT decode step's apply_presence_frequency_penalty_kernel sees the updated running count.
+// <<<1,1>>>, negligible cost, mirrors extract_chosen_logit_kernel's shape. Always launched
+// unconditionally (same graph-replay-safety rationale) -- this unconditional +=1 on session 0's
+// shared buffer is exactly what makes a fresh per-request reset (Qwen35Model::
+// reset_penalty_counts) load-bearing: without it, this buffer would keep accumulating counts
+// across every request that has ever reused session 0.
+__global__ void increment_penalty_count_kernel(int* __restrict__ counts, const int* __restrict__ out_id) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) counts[*out_id] += 1;
+}
+
 }  // namespace
 
 size_t topk_sort_temp_storage_bytes(int vocab) {
@@ -128,6 +162,19 @@ void launch_extract_chosen_logit(const int* out_id, const int* rank_by_id,
                                  const float* sorted_logits, float* chosen_logit,
                                  cudaStream_t stream) {
     extract_chosen_logit_kernel<<<1, 1, 0, stream>>>(out_id, rank_by_id, sorted_logits, chosen_logit);
+}
+
+void launch_presence_frequency_penalty(float* logits, const int* counts, int vocab,
+                                       const float* presence_penalty_f32,
+                                       const float* frequency_penalty_f32,
+                                       cudaStream_t stream) {
+    const int bx = (vocab + 255) / 256 > 1024 ? 1024 : (vocab + 255) / 256;
+    apply_presence_frequency_penalty_kernel<<<bx < 1 ? 1 : bx, 256, 0, stream>>>(
+        logits, counts, vocab, presence_penalty_f32, frequency_penalty_f32);
+}
+
+void launch_increment_penalty_count(int* counts, const int* out_id, cudaStream_t stream) {
+    increment_penalty_count_kernel<<<1, 1, 0, stream>>>(counts, out_id);
 }
 
 }  // namespace kernels

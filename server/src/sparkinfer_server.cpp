@@ -508,13 +508,26 @@ int main(int argc, char** argv) {
                  // inert at temperature<=0 -- see ContinuousBatchEngine::Request's doc comment).
                  // logprobs needs no check either -- it's pure output reporting, never touches
                  // the sampling path at all.
-                 if (sparkinfer_server::should_reject_dflash_temperature(
-                         [] { const char* e = getenv("SPARKINFER_DFLASH"); return e && e[0] == '1'; }(),
-                         controls.temperature)) {
+                 const bool dflash_env_on =
+                     [] { const char* e = getenv("SPARKINFER_DFLASH"); return e && e[0] == '1'; }();
+                 if (sparkinfer_server::should_reject_dflash_temperature(dflash_env_on, controls.temperature)) {
                      g_requests_client_error++;
                      res.status = 400;
                      res.set_content("{\"error\":{\"message\":\"temperature sampling is not supported "
                                      "while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 // Unlike top_k/top_p (provably inert at temperature<=0, see above), presence/
+                 // frequency penalty can change the greedy-argmax winner even at temperature==0 --
+                 // no inertness proof exists, so this needs its own DFlash check, independent of
+                 // the temperature check above.
+                 if (sparkinfer_server::should_reject_dflash_penalty(
+                         dflash_env_on, controls.presence_penalty, controls.frequency_penalty)) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"presence_penalty/frequency_penalty are not "
+                                     "supported while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
                                      "application/json");
                      return;
                  }
@@ -585,6 +598,8 @@ int main(int argc, char** argv) {
                           include_usage = controls.include_usage, stop = controls.stop,
                           temperature = controls.temperature, seed = controls.seed,
                           top_k = controls.top_k, top_p = controls.top_p,
+                          presence_penalty = controls.presence_penalty,
+                          frequency_penalty = controls.frequency_penalty,
                           logprobs = controls.logprobs, top_logprobs = controls.top_logprobs]
                          (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
@@ -631,7 +646,7 @@ int main(int argc, char** argv) {
                                          }
                                          return sink.is_writable();
                                      };
-                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, temperature, seed, top_k, top_p);
+                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, temperature, seed, top_k, top_p, presence_penalty, frequency_penalty);
                                      total_prompt_tokens += (long long)cur_prompt_ids.size();
                                      total_completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
@@ -795,7 +810,8 @@ int main(int argc, char** argv) {
                                  want_logprobs ? std::function<void(const sparkinfer_server::TokenLogprob&)>(on_tok_logprob)
                                               : nullptr;
                              const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
-                                 temperature, seed, top_k, top_p, logprobs, top_logprobs, maybe_on_tok_logprob);
+                                 temperature, seed, top_k, top_p, presence_penalty, frequency_penalty,
+                                 logprobs, top_logprobs, maybe_on_tok_logprob);
                              const int prompt_tokens = (int)prompt_ids.size();
                              const int completion_tokens = (int)stream_ids.size();
                              g_prompt_tokens_total += (uint64_t)prompt_tokens;
@@ -946,7 +962,7 @@ int main(int argc, char** argv) {
                              }
                              return true;
                          };
-                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, controls.temperature, controls.seed, controls.top_k, controls.top_p);
+                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, controls.temperature, controls.seed, controls.top_k, controls.top_p, controls.presence_penalty, controls.frequency_penalty);
                          total_prompt_tokens += (long long)cur_prompt_ids.size();
                          total_completion_tokens += (long long)ids.size();
                          if (!outcome.error.empty()) {
@@ -1034,6 +1050,7 @@ int main(int argc, char** argv) {
                                       : nullptr;
                      outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok,
                          controls.temperature, controls.seed, controls.top_k, controls.top_p,
+                         controls.presence_penalty, controls.frequency_penalty,
                          controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob);
                      // Defensive clamp -- should already hold, cheap insurance against any
                      // subtle off-by-one between the two accumulation paths above.

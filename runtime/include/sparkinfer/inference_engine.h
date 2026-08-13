@@ -44,6 +44,15 @@ public:
         // inertness proof. Same prefill-phase-seed-token caveat as temperature applies unchanged.
         int top_k = 0;
         float top_p = 1.0f;
+        // [-2.0, 2.0]; 0 (default) disables both. OpenAI semantics: subtracted from every vocab
+        // logit each decode step, weighted by this request's own running per-token generation
+        // count (presence: binary "appeared at all"; frequency: linear in count) -- see
+        // Qwen35Model::forward_token's doc comment. UNLIKE top_k/top_p above, this has no
+        // inertness proof at temperature<=0 -- it can change the greedy winner -- so it needs its
+        // own DFlash-incompatibility check (should_reject_dflash_penalty), independent of the
+        // existing temperature>0 check.
+        float presence_penalty = 0.f;
+        float frequency_penalty = 0.f;
         // top_logprobs is only meaningful when logprobs is true. Delivery is via the separate
         // on_token_logprob callback (complete_streaming's new trailing param), not this struct --
         // pure data here, same as every other sampling control.

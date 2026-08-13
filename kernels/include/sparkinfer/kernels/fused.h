@@ -161,6 +161,36 @@ void launch_extract_chosen_logit(const int* out_id, const int* rank_by_id,
                                  const float* sorted_logits, float* chosen_logit,
                                  cudaStream_t stream = nullptr);
 
+// OpenAI-style presence_penalty/frequency_penalty: logits[v] -= frequency_penalty*counts[v] +
+// presence_penalty*(counts[v]>0), for every v in [0,vocab). `counts` is the CURRENT session's
+// running per-vocab-id generation count (Qwen35Model::Impl::penalty_counts, already swapped in
+// by activate_session() before forward_token() runs -- same "by the time any decode kernel
+// launches, the correct session's buffer is already swapped in" guarantee lin_state gets).
+// presence_penalty_f32/frequency_penalty_f32 are read from device memory on EVERY launch, same
+// graph-replay-across-requests rationale as launch_temperature_sample's temp/seed/step -- ALWAYS
+// launch this unconditionally on a CUDA-graph-captured decode path, never host-gate on the
+// penalty values being nonzero. UNLIKE top_k/top_p, this has NO inertness proof at
+// presence_penalty==0 && frequency_penalty==0 the way top_k/top_p do at temperature<=0 -- see
+// qwen35.h's forward_token doc comment; a nonzero penalty can change the greedy-argmax winner on
+// its own, which is why DFlash needs its own separate rejection check for this (see
+// should_reject_dflash_penalty in chat_tools.hpp).
+//
+// Call BEFORE launch_topk_topp_mask so the penalized distribution flows through top_k/top_p
+// truncation, temperature sampling, AND logprobs reporting -- matches real-world OpenAI/vLLM
+// behavior of reporting logprobs against what was actually sampled from, not an artificially
+// "raw" distribution.
+void launch_presence_frequency_penalty(float* logits, const int* counts, int vocab,
+                                       const float* presence_penalty_f32,
+                                       const float* frequency_penalty_f32,
+                                       cudaStream_t stream = nullptr);
+
+// Records that this decode step's sampled token (*out_id) was chosen, incrementing its running
+// count in the CURRENT session's counts buffer -- so the NEXT decode step's
+// launch_presence_frequency_penalty call sees the update. <<<1,1>>>, negligible cost. Always
+// launched unconditionally (same graph-replay-safety rationale as everything else on this path).
+// Call AFTER launch_argmax, alongside launch_extract_chosen_logit.
+void launch_increment_penalty_count(int* counts, const int* out_id, cudaStream_t stream = nullptr);
+
 // Load-time-only helpers (no kernel launch involved beyond a one-time iota fill) -- call once per
 // model load, never on the decode hot path.
 size_t topk_sort_temp_storage_bytes(int vocab);

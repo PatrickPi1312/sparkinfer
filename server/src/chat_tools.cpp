@@ -1170,6 +1170,32 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
         }
         out.top_k = static_cast<int>(std::min<long long>(k, std::numeric_limits<int>::max()));
     }
+    if (root.contains("presence_penalty") && !root["presence_penalty"].is_null()) {
+        const auto& value = root["presence_penalty"];
+        if (!value.is_number()) {
+            err = "presence_penalty must be a number";
+            return false;
+        }
+        const double p = value.get<double>();
+        if (!(p >= -2.0) || !(p <= 2.0)) {  // NaN-safe: comparisons against NaN are false either way
+            err = "presence_penalty must be between -2.0 and 2.0";
+            return false;
+        }
+        out.presence_penalty = static_cast<float>(p);
+    }
+    if (root.contains("frequency_penalty") && !root["frequency_penalty"].is_null()) {
+        const auto& value = root["frequency_penalty"];
+        if (!value.is_number()) {
+            err = "frequency_penalty must be a number";
+            return false;
+        }
+        const double f = value.get<double>();
+        if (!(f >= -2.0) || !(f <= 2.0)) {
+            err = "frequency_penalty must be between -2.0 and 2.0";
+            return false;
+        }
+        out.frequency_penalty = static_cast<float>(f);
+    }
     if (root.contains("logprobs") && !root["logprobs"].is_null()) {
         if (!root["logprobs"].is_boolean()) {
             err = "logprobs must be a boolean";
@@ -1199,6 +1225,10 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
 
 bool should_reject_dflash_temperature(bool dflash_env_on, float temperature) {
     return dflash_env_on && temperature > 0.f;
+}
+
+bool should_reject_dflash_penalty(bool dflash_env_on, float presence_penalty, float frequency_penalty) {
+    return dflash_env_on && (presence_penalty != 0.f || frequency_penalty != 0.f);
 }
 
 std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking) {
