@@ -1,0 +1,88 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a test agent. Use the provided functions when they are needed."
+    },
+    {
+      "role": "user",
+      "content": "Find two classic books and then summarize their titles."
+    }
+  ],
+  "model": "qwen3.6-35b-a3b-ud-q4-k-m",
+  "max_tokens": 4096,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_catalog",
+        "description": "Find catalog entries matching structured search criteria.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "object",
+              "properties": {
+                "category": {
+                  "type": "string"
+                },
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "category"
+              ],
+              "additionalProperties": false
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            }
+          },
+          "required": [
+            "query",
+            "limit"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "summarize_items",
+        "description": "Summarize a list of item titles.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "titles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": {
+              "type": "string",
+              "enum": [
+                "brief",
+                "detailed"
+              ]
+            }
+          },
+          "required": [
+            "titles"
+          ]
+        }
+      }
+    }
+  ]
+}

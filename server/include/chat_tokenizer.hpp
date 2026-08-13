@@ -1,15 +1,12 @@
 #pragma once
 
+#include "chat_tools.hpp"
+
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace sparkinfer_server {
-
-struct ChatMessage {
-    std::string role;
-    std::string content;
-};
 
 // HuggingFace tokenizer.json + Qwen3.6 chat template.
 class ChatTokenizer {
@@ -25,7 +22,7 @@ public:
     void set_museglimmer(bool on);
 
     bool encode_chat_request(const std::string& request_json, std::vector<int>& ids, bool enable_thinking,
-                             std::string& err) const;
+                             std::string& err, ChatRequest* parsed_request = nullptr) const;
     std::string decode(const std::vector<int>& ids) const;
     std::string decode_delta(std::vector<int>& acc, int new_id) const;
 
@@ -37,6 +34,8 @@ private:
 struct ParsedAssistantOutput {
     std::string reasoning_content;
     std::string content;
+    std::vector<ToolCall> tool_calls;
+    std::string error;
 };
 
 // Incrementally routes decoded text into reasoning vs answer for SSE streaming.
@@ -56,6 +55,12 @@ private:
     enum class Phase { kBeforeThink, kInThink, kInAnswer } phase_ = Phase::kBeforeThink;
     std::string carry_;
     std::string prefix_buffer_;
+    // Qwen (non-museglimmer) starts in Phase::kInThink directly (the prompt already primes
+    // "<think>\n"), but a generation can still defensively repeat the opening marker -- see
+    // parse_assistant_output's identical handling for the non-streaming path. Checked once,
+    // on the first non-empty data seen in kInThink, so a literal "<think>" appearing later in
+    // genuine reasoning text is never mistaken for the marker.
+    bool think_open_checked_ = false;
 
     // Muse Glimmer (harmony-style) state: segments are <|start|>{header}<|message|>{body}
     // then <|eom|> (more segments follow, same assistant turn) or <|eot|> (turn done). The
@@ -73,9 +78,13 @@ private:
 
 bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessage>& messages, std::string& err);
 bool parse_enable_thinking(const std::string& request_json, bool default_value = false);
+bool validate_chat_request_model_support(const ChatRequest& request, bool museglimmer,
+                                         std::string& err);
 std::string apply_qwen36_chat_template(const std::vector<ChatMessage>& messages, bool enable_thinking = false);
 std::string apply_museglimmer_chat_template(const std::vector<ChatMessage>& messages,
                                             const std::string& reasoning_strength = "high");
-ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking, bool museglimmer = false);
+ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking,
+                                             bool museglimmer = false,
+                                             const ChatRequest* request = nullptr);
 
 }  // namespace sparkinfer_server
