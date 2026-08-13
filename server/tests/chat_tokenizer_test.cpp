@@ -74,12 +74,67 @@ bool test_nonthinking_stream_hides_terminal_marker() {
     return true;
 }
 
+bool test_muse_rejects_all_tool_protocol_history() {
+    sparkinfer_server::ChatRequest parsed;
+    std::string error;
+    const std::string request = R"JSON({
+      "messages":[
+        {"role":"assistant","content":null,"tool_calls":[{
+          "id":"call_1","type":"function",
+          "function":{"name":"lookup","arguments":"{\"query\":\"x\"}"}
+        }]},
+        {"role":"tool","tool_call_id":"call_1","content":"ok"},
+        {"role":"user","content":"continue"}
+      ],
+      "tools":[{"type":"function","function":{
+        "name":"lookup",
+        "parameters":{"type":"object","properties":{"query":{"type":"string"}}}
+      }}],
+      "tool_choice":"none"
+    })JSON";
+    CHECK(sparkinfer_server::parse_chat_request_json(request, parsed, error));
+    CHECK(!sparkinfer_server::validate_chat_request_model_support(parsed, true, error));
+    CHECK(error.find("supported only for Qwen3.6") != std::string::npos);
+    error.clear();
+    CHECK(sparkinfer_server::validate_chat_request_model_support(parsed, false, error));
+    return true;
+}
+
+bool test_tool_choice_none_still_uses_strict_output_parser() {
+    const std::string request_json = R"JSON({
+      "messages":[{"role":"user","content":"Do not call tools."}],
+      "tools":[{"type":"function","function":{
+        "name":"terminal",
+        "parameters":{"type":"object","properties":{"command":{"type":"string"}}}
+      }}],
+      "tool_choice":"none"
+    })JSON";
+    sparkinfer_server::ChatRequest request;
+    std::string error;
+    CHECK(sparkinfer_server::parse_chat_request_json(request_json, request, error));
+    const auto forbidden = sparkinfer_server::parse_assistant_output(
+        "<tool_call>\n<function=terminal>\n<parameter=command>\nid\n</parameter>\n"
+        "</function>\n</tool_call>",
+        false, false, &request);
+    CHECK(!forbidden.error.empty());
+    CHECK(forbidden.content.empty());
+    CHECK(forbidden.tool_calls.empty());
+
+    const auto answer = sparkinfer_server::parse_assistant_output(
+        "No tool used.<|im_end|>", false, false, &request);
+    CHECK(answer.error.empty());
+    CHECK(answer.content == "No tool used.");
+    return true;
+}
+
 }  // namespace
 
 int main() {
     if (!test_thinking_prompt_and_nonstream_parser()) return 1;
     if (!test_thinking_stream_boundaries()) return 1;
     if (!test_nonthinking_stream_hides_terminal_marker()) return 1;
+    if (!test_muse_rejects_all_tool_protocol_history()) return 1;
+    if (!test_tool_choice_none_still_uses_strict_output_parser()) return 1;
     std::printf("chat_tokenizer_test: OK\n");
     return 0;
 }

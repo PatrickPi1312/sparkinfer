@@ -479,8 +479,10 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
-                 const bool tool_mode = !chat_request.tools.empty() &&
-                     chat_request.tool_choice != sparkinfer_server::ToolChoiceMode::kNone;
+                 // Presence of a tool protocol requires strict, buffered parsing even when
+                 // tool_choice=none. The latter disables execution, not output validation:
+                 // native tool markup must never leak through as ordinary assistant content.
+                 const bool tool_protocol = !chat_request.tools.empty();
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
@@ -516,7 +518,7 @@ int main(int argc, char** argv) {
                      res.set_chunked_content_provider(
                          "text/event-stream",
                          [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
-                          chat_request, tool_mode, include_usage = controls.include_usage]
+                          chat_request, tool_protocol, include_usage = controls.include_usage]
                          (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
                                  sink.done();
@@ -537,7 +539,7 @@ int main(int argc, char** argv) {
                                  // native Qwen XML is complete and schema-valid. This still emits
                                  // valid atomic OpenAI SSE deltas, and guarantees malformed or
                                  // partial markup can never leak as executable client content.
-                                 if (tool_mode) {
+                                 if (tool_protocol) {
                                      stream_ids.push_back(tid);
                                      return sink.is_writable();
                                  }
@@ -577,7 +579,7 @@ int main(int argc, char** argv) {
                              }
 
                              std::string finish_reason = outcome.reached_token_limit ? "length" : "stop";
-                             if (tool_mode) {
+                             if (tool_protocol) {
                                  std::string text;
                                  std::string decode_err;
                                  if (!decode_ids(stream_ids, text, decode_err)) {
@@ -591,22 +593,31 @@ int main(int argc, char** argv) {
                                  auto parsed = sparkinfer_server::parse_assistant_output(
                                      text, enable_thinking, engine.is_museglimmer(), &chat_request);
                                  if (!parsed.error.empty()) {
-                                     g_requests_server_error++;
-                                     const nlohmann::json error = {
-                                         {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
-                                     write_sse_json(sink, error);
-                                     write_stream_done(sink);
-                                     sink.done();
-                                     return true;
+                                     if (outcome.reached_token_limit) {
+                                         // A truncated native call is not an executable result,
+                                         // but token exhaustion is still a normal completion.
+                                         // Emit no buffered markup and finish with "length".
+                                         parsed = {};
+                                     } else {
+                                         g_requests_server_error++;
+                                         const nlohmann::json error = {
+                                             {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
+                                         write_sse_json(sink, error);
+                                         write_stream_done(sink);
+                                         sink.done();
+                                         return true;
+                                     }
                                  }
                                  write_stream_delta(sink, cid, created, "reasoning_content",
                                                     parsed.reasoning_content);
                                  write_stream_delta(sink, cid, created, "content", parsed.content);
-                                 for (size_t i = 0; i < parsed.tool_calls.size(); ++i) {
-                                     parsed.tool_calls[i].id = random_id("call_");
-                                     write_stream_tool_call(sink, cid, created, i, parsed.tool_calls[i]);
+                                 if (!outcome.reached_token_limit) {
+                                     for (size_t i = 0; i < parsed.tool_calls.size(); ++i) {
+                                         parsed.tool_calls[i].id = random_id("call_");
+                                         write_stream_tool_call(sink, cid, created, i, parsed.tool_calls[i]);
+                                     }
+                                     if (!parsed.tool_calls.empty()) finish_reason = "tool_calls";
                                  }
-                                 if (!parsed.tool_calls.empty()) finish_reason = "tool_calls";
                              } else {
                                  sparkinfer_server::ThinkingStreamSplitter::Delta flush;
                                  splitter.finish(flush);
@@ -647,21 +658,28 @@ int main(int argc, char** argv) {
                  g_completion_tokens_total += (uint64_t)outcome.tokens.size();
 
                  auto parsed = sparkinfer_server::parse_assistant_output(
-                     text, enable_thinking, engine.is_museglimmer(), tool_mode ? &chat_request : nullptr);
+                     text, enable_thinking, engine.is_museglimmer(),
+                     tool_protocol ? &chat_request : nullptr);
                  if (!parsed.error.empty()) {
-                     g_requests_server_error++;
-                     res.status = 500;
-                     const nlohmann::json error = {
-                         {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
-                     res.set_content(error.dump(), "application/json");
-                     return;
+                     if (outcome.reached_token_limit) {
+                         // Never expose a truncated native tag sequence. A length stop is a
+                         // valid completion, so return an empty assistant result instead of 5xx.
+                         parsed = {};
+                     } else {
+                         g_requests_server_error++;
+                         res.status = 500;
+                         const nlohmann::json error = {
+                             {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
+                         res.set_content(error.dump(), "application/json");
+                         return;
+                     }
                  }
 
                  nlohmann::json message = {{"role", "assistant"}};
                  if (!parsed.reasoning_content.empty())
                      message["reasoning_content"] = parsed.reasoning_content;
                  std::string finish_reason = outcome.reached_token_limit ? "length" : "stop";
-                 if (!parsed.tool_calls.empty()) {
+                 if (!parsed.tool_calls.empty() && !outcome.reached_token_limit) {
                      message["content"] = parsed.content.empty()
                          ? nlohmann::json(nullptr) : nlohmann::json(parsed.content);
                      message["tool_calls"] = nlohmann::json::array();

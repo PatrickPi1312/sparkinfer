@@ -13,6 +13,13 @@ cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_SERVER=ON
 cmake --build build -j$(nproc) --target sparkinfer_server
 ```
 
+Pull-request and release CI packages the Linux server with its runtime libraries and includes it
+in GitHub Artifact Attestations. After downloading the bundle, verify the server provenance with:
+
+```bash
+gh attestation verify sparkinfer-bin/bin/sparkinfer_server -R gittensor-ai-lab/sparkinfer
+```
+
 Or reuse the bench harness build root:
 
 ```bash
@@ -59,6 +66,16 @@ control markup is validated against the offered schema and is never exposed to c
 Omitted `tool_choice`, `"auto"`, and `"none"` are supported. Forced/named choices and
 `parallel_tool_calls: false` return `400` until those constraints can be enforced by the runtime.
 Tool calls are currently Qwen3.6-only; Muse Glimmer uses a different tool protocol.
+Muse requests containing tool definitions or tool-call history return `400`, including when
+`tool_choice` is `"none"`, so unsupported protocol data cannot be silently dropped.
+JSON Schema `pattern` uses the safe, linear-time RE2 syntax; unsupported expressions are rejected.
+Supported validation keywords are `type`, `properties`, `required`, `additionalProperties`,
+`items`, `enum`, numeric bounds, item/string length bounds, and `pattern`; unsupported validation
+keywords return `400` rather than being silently ignored. Annotation keywords `description`,
+`default`, and `title` are retained in the model prompt.
+Qwen's native XML leaves string values unquoted. For a mixed string/non-string union, a value
+that is valid JSON is interpreted as its JSON type first (for example, `1` becomes an integer);
+avoid such unions when JSON-looking text must remain a string.
 
 ### Graceful shutdown
 

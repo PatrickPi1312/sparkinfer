@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -433,6 +434,239 @@ bool test_schema_constraints() {
     return true;
 }
 
+bool test_schema_pattern_is_linear_time() {
+    const std::string body = R"JSON({
+      "messages":[{"role":"user","content":"Check a value."}],
+      "tools":[{"type":"function","function":{
+        "name":"check_value",
+        "parameters":{
+          "type":"object",
+          "properties":{"value":{"type":"string","pattern":"^(a+)+$"}},
+          "required":["value"],
+          "additionalProperties":false
+        }
+      }}]
+    })JSON";
+    ChatRequest request;
+    CHECK(parse_request(body, request));
+    const std::string raw =
+        "<tool_call>\n<function=check_value>\n<parameter=value>\n" +
+        std::string(30, 'a') + "!\n</parameter>\n</function>\n</tool_call>";
+    const auto start = std::chrono::steady_clock::now();
+    const ParsedToolOutput output = parse_qwen36_tool_output(raw, false, request);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    CHECK(!output.error.empty());
+    CHECK(elapsed < std::chrono::seconds(1));
+    return true;
+}
+
+bool test_schema_unions_and_dynamic_properties() {
+    const std::string body = R"JSON({
+      "messages":[{"role":"user","content":"Send dynamic values."}],
+      "tools":[{"type":"function","function":{
+        "name":"dynamic_values",
+        "parameters":{
+          "type":"object",
+          "properties":{
+            "nullable_text":{"type":["string","null"]},
+            "nullable_null":{"type":["string","null"]},
+            "json_like_text":{"type":["string","null"]},
+            "mixed_value":{"type":["string","integer"]},
+            "inferred_text":{"enum":["red","blue"]},
+            "inferred_number":{"enum":[1,2]}
+          },
+          "required":["dynamic_count"],
+          "additionalProperties":{"type":"integer"}
+        }
+      }}]
+    })JSON";
+    ChatRequest request;
+    CHECK(parse_request(body, request));
+    const std::string raw =
+        "<tool_call>\n<function=dynamic_values>\n"
+        "<parameter=nullable_text>\nhello\n</parameter>\n"
+        "<parameter=nullable_null>\nnull\n</parameter>\n"
+        "<parameter=json_like_text>\n123\n</parameter>\n"
+        "<parameter=mixed_value>\n123\n</parameter>\n"
+        "<parameter=inferred_text>\nred\n</parameter>\n"
+        "<parameter=inferred_number>\n2\n</parameter>\n"
+        "<parameter=dynamic_count>\n3\n</parameter>\n"
+        "</function>\n</tool_call>";
+    const ParsedToolOutput output = parse_qwen36_tool_output(raw, false, request);
+    CHECK(output.error.empty());
+    CHECK(output.tool_calls.size() == 1);
+    const json args = arguments(output.tool_calls[0]);
+    CHECK(args["nullable_text"] == "hello");
+    CHECK(args["nullable_null"].is_null());
+    CHECK(args["json_like_text"].is_string() && args["json_like_text"] == "123");
+    CHECK(args["mixed_value"].is_number_integer() && args["mixed_value"] == 123);
+    CHECK(args["inferred_text"] == "red");
+    CHECK(args["inferred_number"].is_number_integer() && args["inferred_number"] == 2);
+    CHECK(args["dynamic_count"] == 3);
+
+    const std::string bad_dynamic =
+        "<tool_call>\n<function=dynamic_values>\n"
+        "<parameter=dynamic_count>\nnot-an-integer\n</parameter>\n"
+        "</function>\n</tool_call>";
+    CHECK(!parse_qwen36_tool_output(bad_dynamic, false, request).error.empty());
+
+    json history = json::parse(body);
+    history["messages"] = json::array({
+        {{"role", "assistant"},
+         {"content", nullptr},
+         {"tool_calls", json::array({
+             {{"id", "call_dynamic"},
+              {"type", "function"},
+              {"function", {{"name", "dynamic_values"},
+                            {"arguments", "{\"dynamic_count\":3,\"nullable_text\":\"hello\"}"}}}}
+         })}},
+        {{"role", "tool"}, {"tool_call_id", "call_dynamic"}, {"content", "ok"}},
+        {{"role", "user"}, {"content", "Continue."}}
+    });
+    ChatRequest history_request;
+    CHECK(parse_request(history.dump(), history_request));
+    const std::string prompt = apply_qwen36_tools_template(history_request, false);
+    CHECK(contains(prompt, "<parameter=nullable_text>\nhello\n</parameter>"));
+    CHECK(contains(prompt, "<parameter=dynamic_count>\n3\n</parameter>"));
+
+    for (const json& additional : {json(), json(true)}) {
+        json permissive = json::parse(body);
+        json& schema = permissive["tools"][0]["function"]["parameters"];
+        schema.erase("additionalProperties");
+        if (!additional.is_null()) schema["additionalProperties"] = additional;
+        ChatRequest permissive_request;
+        CHECK(parse_request(permissive.dump(), permissive_request));
+        const std::string freeform =
+            "<tool_call>\n<function=dynamic_values>\n"
+            "<parameter=dynamic_count>\n3\n</parameter>\n"
+            "<parameter=freeform>\n{\"nested\":true}\n</parameter>\n"
+            "</function>\n</tool_call>";
+        const ParsedToolOutput accepted =
+            parse_qwen36_tool_output(freeform, false, permissive_request);
+        CHECK(accepted.error.empty());
+        CHECK(arguments(accepted.tool_calls[0])["freeform"]["nested"] == true);
+    }
+
+    json closed = json::parse(body);
+    closed["tools"][0]["function"]["parameters"]["additionalProperties"] = false;
+    closed["tools"][0]["function"]["parameters"].erase("required");
+    ChatRequest closed_request;
+    CHECK(parse_request(closed.dump(), closed_request));
+    CHECK(!parse_qwen36_tool_output(raw, false, closed_request).error.empty());
+
+    history["messages"][0]["tool_calls"][0]["function"]["arguments"] =
+        "{\"dynamic_count\":\"wrong\"}";
+    std::string history_error;
+    CHECK(!parse_chat_request_json(history.dump(), history_request, history_error));
+    return true;
+}
+
+bool test_unicode_string_lengths() {
+    const std::string body = R"JSON({
+      "messages":[{"role":"user","content":"Send one character."}],
+      "tools":[{"type":"function","function":{
+        "name":"one_character",
+        "parameters":{
+          "type":"object",
+          "properties":{"value":{"type":"string","minLength":1,"maxLength":1}},
+          "required":["value"],
+          "additionalProperties":false
+        }
+      }}]
+    })JSON";
+    ChatRequest request;
+    CHECK(parse_request(body, request));
+    auto call = [](const std::string& value) {
+        return "<tool_call>\n<function=one_character>\n<parameter=value>\n" + value +
+               "\n</parameter>\n</function>\n</tool_call>";
+    };
+    CHECK(parse_qwen36_tool_output(call("é"), false, request).error.empty());
+    CHECK(parse_qwen36_tool_output(call("😀"), false, request).error.empty());
+    CHECK(!parse_qwen36_tool_output(call("ab"), false, request).error.empty());
+    return true;
+}
+
+bool test_large_integer_bounds_are_exact() {
+    const std::string body = R"JSON({
+      "messages":[{"role":"user","content":"Send a large integer."}],
+      "tools":[{"type":"function","function":{
+        "name":"large_integer",
+        "parameters":{
+          "type":"object",
+          "properties":{"value":{"type":"integer","minimum":9007199254740993}},
+          "required":["value"],
+          "additionalProperties":false
+        }
+      }}]
+    })JSON";
+    ChatRequest request;
+    CHECK(parse_request(body, request));
+    auto call = [](const char* value) {
+        return std::string("<tool_call>\n<function=large_integer>\n<parameter=value>\n") +
+               value + "\n</parameter>\n</function>\n</tool_call>";
+    };
+    CHECK(!parse_qwen36_tool_output(call("9007199254740992"), false, request).error.empty());
+    CHECK(parse_qwen36_tool_output(call("9007199254740993"), false, request).error.empty());
+    return true;
+}
+
+bool test_schema_keyword_type_applicability() {
+    for (const auto& invalid : {
+             std::pair<const char*, json>{"required", {{"type", "string"},
+                                                        {"required", {"x"}}}},
+             std::pair<const char*, json>{"items", {{"type", "object"},
+                                                     {"items", json::object()}}},
+             std::pair<const char*, json>{"maxLength", {{"type", "integer"},
+                                                         {"maxLength", 1}}},
+             std::pair<const char*, json>{"minimum", {{"type", "string"},
+                                                       {"minimum", 1}}}}) {
+        json body = {
+            {"messages", {{{"role", "user"}, {"content", "test"}}}},
+            {"tools", json::array({{
+                {"type", "function"},
+                {"function", {
+                    {"name", "schema_test"},
+                    {"parameters", {
+                        {"type", "object"},
+                        {"properties", {{"value", invalid.second}}}
+                    }}
+                }}
+            }})}
+        };
+        ChatRequest request;
+        std::string error;
+        CHECK(!parse_chat_request_json(body.dump(), request, error));
+        CHECK(contains(error, invalid.first));
+    }
+    return true;
+}
+
+bool test_unsupported_schema_keywords_are_rejected() {
+    for (const char* unsupported : {"const", "multipleOf", "oneOf"}) {
+        json body = {
+            {"messages", {{{"role", "user"}, {"content", "test"}}}},
+            {"tools", json::array({{
+                {"type", "function"},
+                {"function", {
+                    {"name", "schema_test"},
+                    {"parameters", {
+                        {"type", "object"},
+                        {"properties", {{"value", {{"type", "integer"},
+                                                     {unsupported, unsupported == std::string("oneOf")
+                                                         ? json::array({json{{"type", "integer"}}})
+                                                         : json(2)}}}}}
+                    }}
+                }}
+            }})}
+        };
+        ChatRequest request;
+        std::string error;
+        CHECK(!parse_chat_request_json(body.dump(), request, error));
+        CHECK(contains(error, "unsupported field"));
+    }
+    return true;
+}
+
 bool test_parallel_tool_calls() {
     ChatRequest request;
     CHECK(parse_request(hermes_request(), request));
@@ -644,6 +878,12 @@ int main() {
     if (!test_implicit_thinking_prefill_suffix()) return 1;
     if (!test_all_json_schema_value_types()) return 1;
     if (!test_schema_constraints()) return 1;
+    if (!test_schema_pattern_is_linear_time()) return 1;
+    if (!test_schema_unions_and_dynamic_properties()) return 1;
+    if (!test_unicode_string_lengths()) return 1;
+    if (!test_large_integer_bounds_are_exact()) return 1;
+    if (!test_schema_keyword_type_applicability()) return 1;
+    if (!test_unsupported_schema_keywords_are_rejected()) return 1;
     if (!test_parallel_tool_calls()) return 1;
     if (!test_plain_answer()) return 1;
     if (!test_control_markup_never_leaks_as_content()) return 1;

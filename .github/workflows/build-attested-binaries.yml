@@ -61,7 +61,7 @@ jobs:
             -DBUILD_EXAMPLES=ON
 
       - name: Build
-        run: cmake --build build -j"$(nproc)" --target qwen3_gguf_bench chat_tools_test chat_tokenizer_test
+        run: cmake --build build -j"$(nproc)" --target qwen3_gguf_bench sparkinfer_server chat_tools_test chat_tokenizer_test
 
       - name: Test chat protocol
         working-directory: build
@@ -72,9 +72,11 @@ jobs:
           set -euo pipefail
           mkdir -p "${BUNDLE}/bin" "${BUNDLE}/lib"
           install -m755 build/runtime/qwen3_gguf_bench "${BUNDLE}/bin/"
+          install -m755 build/server/sparkinfer_server "${BUNDLE}/bin/"
           find build/runtime build/moe -maxdepth 1 \( -name 'libsparkinfer_runtime.so*' -o -name 'libsparkinfer_moe.so*' \) \
             -exec install -m755 {} "${BUNDLE}/lib/" \;
           BENCH_SHA="$(sha256sum "${BUNDLE}/bin/qwen3_gguf_bench" | awk '{print $1}')"
+          SERVER_SHA="$(sha256sum "${BUNDLE}/bin/sparkinfer_server" | awk '{print $1}')"
           jq -n \
             --arg platform "linux-amd64" \
             --arg cuda "12.8" \
@@ -83,9 +85,13 @@ jobs:
             --arg ref "${GITHUB_REF}" \
             --arg binary "bin/qwen3_gguf_bench" \
             --arg binary_sha256 "${BENCH_SHA}" \
-            '{platform:$platform,cuda:$cuda,sm:$sm,commit:$commit,ref:$ref,binary:$binary,binary_sha256:$binary_sha256}' \
+            --arg server_binary "bin/sparkinfer_server" \
+            --arg server_binary_sha256 "${SERVER_SHA}" \
+            '{platform:$platform,cuda:$cuda,sm:$sm,commit:$commit,ref:$ref,binary:$binary,binary_sha256:$binary_sha256,server_binary:$server_binary,server_binary_sha256:$server_binary_sha256}' \
             > "${BUNDLE}/BUILD_MANIFEST.json"
           (cd "${BUNDLE}" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          (cd "${BUNDLE}" && sha256sum -c SHA256SUMS)
+          LD_LIBRARY_PATH="${BUNDLE}/lib:${LD_LIBRARY_PATH:-}" "${BUNDLE}/bin/sparkinfer_server" --help
           ls -laR "${BUNDLE}"
 
       - name: Generate artifact attestation

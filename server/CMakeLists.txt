@@ -17,6 +17,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+# JSON Schema patterns come from untrusted API requests. Use RE2's bounded,
+# linear-time engine instead of std::regex, whose backtracking implementation
+# can be driven into exponential runtime by a short adversarial pattern/value.
+set(RE2_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(RE2_USE_ICU OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    re2
+    URL      https://github.com/google/re2/archive/refs/tags/2023-03-01.tar.gz
+    URL_HASH SHA256=7a9a4824958586980926a300b4717202485c4b4115ac031822e29aa4ef207e48
+)
+FetchContent_MakeAvailable(re2)
+
 add_executable(sparkinfer_server
     src/sparkinfer_server.cpp
     src/model_engine.cpp
@@ -34,6 +46,7 @@ target_link_libraries(sparkinfer_server PRIVATE
     sparkinfer_runtime
     tokenizers_cpp
     nlohmann_json::nlohmann_json
+    re2::re2
     CUDA::cudart
     Threads::Threads
 )
@@ -50,6 +63,7 @@ if(BUILD_TESTS)
     )
     target_link_libraries(chat_tools_test PRIVATE
         nlohmann_json::nlohmann_json
+        re2::re2
     )
     target_compile_definitions(chat_tools_test PRIVATE
         SPARKINFER_SERVER_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests"
@@ -68,6 +82,7 @@ if(BUILD_TESTS)
     target_link_libraries(chat_tokenizer_test PRIVATE
         tokenizers_cpp
         nlohmann_json::nlohmann_json
+        re2::re2
     )
     target_compile_features(chat_tokenizer_test PRIVATE cxx_std_17)
     add_test(NAME chat_tokenizer_test COMMAND chat_tokenizer_test)

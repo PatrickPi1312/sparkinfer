@@ -72,6 +72,8 @@ private:
 
 bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessage>& messages, std::string& err);
 bool parse_enable_thinking(const std::string& request_json, bool default_value = false);
+bool validate_chat_request_model_support(const ChatRequest& request, bool museglimmer,
+                                         std::string& err);
 std::string apply_qwen36_chat_template(const std::vector<ChatMessage>& messages, bool enable_thinking = false);
 std::string apply_museglimmer_chat_template(const std::vector<ChatMessage>& messages,
                                             const std::string& reasoning_strength = "high");

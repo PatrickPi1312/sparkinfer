@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <initializer_list>
 #include <map>
-#include <regex>
+#include <re2/re2.h>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -61,6 +63,12 @@ Reminder:
 bool set_error(std::string& err, const std::string& message) {
     err = message;
     return false;
+}
+
+re2::RE2::Options safe_regex_options() {
+    re2::RE2::Options options;
+    options.set_log_errors(false);
+    return options;
 }
 
 bool parse_strict_json(const std::string& text, json& value, std::string& err,
@@ -229,9 +237,100 @@ bool is_nonnegative_integer(const json& value) {
            (value.is_number_integer() && value.get<json::number_integer_t>() >= 0);
 }
 
+int compare_integer_to_float(const json& integer, double floating) {
+    if (integer.is_number_unsigned()) {
+        const uint64_t value = integer.get<json::number_unsigned_t>();
+        if (floating < 0.0) return 1;
+        // 2^64 is exactly representable as double; every uint64_t is below it.
+        if (floating >= 18446744073709551616.0) return -1;
+        const uint64_t truncated = static_cast<uint64_t>(floating);
+        if (value < truncated) return -1;
+        if (value > truncated) return 1;
+        if (floating > static_cast<double>(truncated)) return -1;
+        return 0;
+    }
+    const int64_t value = integer.get<json::number_integer_t>();
+    // Both powers of two are exact doubles and bound every int64_t conversion.
+    if (floating < -9223372036854775808.0) return 1;
+    if (floating >= 9223372036854775808.0) return -1;
+    const int64_t truncated = static_cast<int64_t>(floating);
+    if (value < truncated) return -1;
+    if (value > truncated) return 1;
+    const double truncated_float = static_cast<double>(truncated);
+    if (floating > truncated_float) return -1;
+    if (floating < truncated_float) return 1;
+    return 0;
+}
+
+int compare_json_numbers(const json& lhs, const json& rhs) {
+    const bool lhs_float = lhs.is_number_float();
+    const bool rhs_float = rhs.is_number_float();
+    if (lhs_float && rhs_float) {
+        const double left = lhs.get<json::number_float_t>();
+        const double right = rhs.get<json::number_float_t>();
+        return left < right ? -1 : (left > right ? 1 : 0);
+    }
+    if (!lhs_float && rhs_float)
+        return compare_integer_to_float(lhs, rhs.get<json::number_float_t>());
+    if (lhs_float && !rhs_float)
+        return -compare_integer_to_float(rhs, lhs.get<json::number_float_t>());
+    if (lhs.is_number_unsigned() && rhs.is_number_unsigned()) {
+        const uint64_t left = lhs.get<json::number_unsigned_t>();
+        const uint64_t right = rhs.get<json::number_unsigned_t>();
+        return left < right ? -1 : (left > right ? 1 : 0);
+    }
+    if (!lhs.is_number_unsigned() && !rhs.is_number_unsigned()) {
+        const int64_t left = lhs.get<json::number_integer_t>();
+        const int64_t right = rhs.get<json::number_integer_t>();
+        return left < right ? -1 : (left > right ? 1 : 0);
+    }
+    if (lhs.is_number_unsigned()) {
+        const int64_t right = rhs.get<json::number_integer_t>();
+        if (right < 0) return 1;
+        const uint64_t left = lhs.get<json::number_unsigned_t>();
+        const uint64_t converted = static_cast<uint64_t>(right);
+        return left < converted ? -1 : (left > converted ? 1 : 0);
+    }
+    const int64_t left = lhs.get<json::number_integer_t>();
+    if (left < 0) return -1;
+    const uint64_t converted = static_cast<uint64_t>(left);
+    const uint64_t right = rhs.get<json::number_unsigned_t>();
+    return converted < right ? -1 : (converted > right ? 1 : 0);
+}
+
+bool declared_type_allows(const json& schema, const char* wanted) {
+    if (!schema.contains("type")) return true;
+    const json& type = schema["type"];
+    if (type.is_string()) return type == wanted;
+    if (type.is_array())
+        return std::find(type.begin(), type.end(), json(wanted)) != type.end();
+    return false;
+}
+
+bool require_keyword_type(const json& schema, const std::string& where,
+                          std::initializer_list<const char*> keywords,
+                          const char* required_type, std::string& err) {
+    if (declared_type_allows(schema, required_type)) return true;
+    for (const char* keyword : keywords) {
+        if (schema.contains(keyword))
+            return set_error(err, where + "." + keyword + " requires type " + required_type);
+    }
+    return true;
+}
+
 bool valid_schema_node(const json& schema, const std::string& where, bool top_level,
                        std::string& err) {
     if (!schema.is_object()) return set_error(err, where + " must be an object");
+    if (!is_allowed_key(schema,
+                        {"type", "description", "default", "title", "properties",
+                         "required", "additionalProperties", "items", "enum", "minimum",
+                         "maximum", "exclusiveMinimum", "exclusiveMaximum", "minItems",
+                         "maxItems", "minLength", "maxLength", "pattern"},
+                        where, err)) return false;
+    for (const char* annotation : {"description", "title"}) {
+        if (schema.contains(annotation) && !schema[annotation].is_string())
+            return set_error(err, where + "." + annotation + " must be a string");
+    }
     const std::set<std::string> allowed_types = {
         "array", "boolean", "integer", "null", "number", "object", "string"};
     if (schema.contains("type")) {
@@ -254,6 +353,22 @@ bool valid_schema_node(const json& schema, const std::string& where, bool top_le
             return set_error(err, where + ".type must be a string or non-empty array of strings");
         }
     }
+    if (!require_keyword_type(schema, where,
+                              {"properties", "required", "additionalProperties"},
+                              "object", err) ||
+        !require_keyword_type(schema, where, {"items", "minItems", "maxItems"},
+                              "array", err) ||
+        !require_keyword_type(schema, where, {"minLength", "maxLength", "pattern"},
+                              "string", err)) return false;
+    if (!declared_type_allows(schema, "number") &&
+        !declared_type_allows(schema, "integer")) {
+        for (const char* keyword :
+             {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}) {
+            if (schema.contains(keyword))
+                return set_error(err, where + "." + keyword +
+                                      " requires type number or integer");
+        }
+    }
     if (schema.contains("properties")) {
         if (!schema["properties"].is_object())
             return set_error(err, where + ".properties must be an object");
@@ -270,8 +385,11 @@ bool valid_schema_node(const json& schema, const std::string& where, bool top_le
                 return set_error(err, where + ".required entries must be non-empty strings");
             const std::string name = item.get<std::string>();
             if (!seen.insert(name).second) return set_error(err, where + ".required contains duplicate " + name);
-            if (schema.contains("properties") && !schema["properties"].contains(name))
-                return set_error(err, where + ".required names unknown property " + name);
+            if (schema.contains("properties") && !schema["properties"].contains(name) &&
+                schema.contains("additionalProperties") &&
+                schema["additionalProperties"].is_boolean() &&
+                !schema["additionalProperties"].get<bool>())
+                return set_error(err, where + ".required names a forbidden property " + name);
         }
     }
     if (schema.contains("additionalProperties") && !schema["additionalProperties"].is_boolean() &&
@@ -285,14 +403,15 @@ bool valid_schema_node(const json& schema, const std::string& where, bool top_le
             return set_error(err, where + ".items must be an object schema");
         if (!valid_schema_node(schema["items"], where + ".items", false, err)) return false;
     }
-    if (schema.contains("enum") && !schema["enum"].is_array())
-        return set_error(err, where + ".enum must be an array");
+    if (schema.contains("enum") &&
+        (!schema["enum"].is_array() || schema["enum"].empty()))
+        return set_error(err, where + ".enum must be a non-empty array");
     for (const char* keyword : {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}) {
         if (schema.contains(keyword) && !schema[keyword].is_number())
             return set_error(err, where + "." + keyword + " must be a number");
     }
     if (schema.contains("minimum") && schema.contains("maximum") &&
-        schema["minimum"].get<double>() > schema["maximum"].get<double>())
+        compare_json_numbers(schema["minimum"], schema["maximum"]) > 0)
         return set_error(err, where + ".minimum must not exceed maximum");
     for (const char* keyword : {"minItems", "maxItems", "minLength", "maxLength"}) {
         if (schema.contains(keyword) && !is_nonnegative_integer(schema[keyword]))
@@ -307,11 +426,10 @@ bool valid_schema_node(const json& schema, const std::string& where, bool top_le
     if (schema.contains("pattern")) {
         if (!schema["pattern"].is_string())
             return set_error(err, where + ".pattern must be a string");
-        try {
-            (void)std::regex(schema["pattern"].get<std::string>(), std::regex::ECMAScript);
-        } catch (const std::regex_error&) {
-            return set_error(err, where + ".pattern is not a valid ECMAScript regular expression");
-        }
+        const re2::RE2 pattern(schema["pattern"].get_ref<const std::string&>(),
+                               safe_regex_options());
+        if (!pattern.ok())
+            return set_error(err, where + ".pattern is not a supported safe regular expression");
     }
     return true;
 }
@@ -343,6 +461,14 @@ bool parse_tool_definition(const json& value, ToolDefinition& tool, const std::s
         for (const auto& property : function["parameters"]["properties"].items()) {
             if (!safe_protocol_name(property.key()))
                 return set_error(err, where + ".function.parameters property " + property.key() +
+                                      " is not safe for the Qwen tool protocol");
+        }
+    }
+    if (function["parameters"].contains("required")) {
+        for (const auto& property : function["parameters"]["required"]) {
+            if (!safe_protocol_name(property.get_ref<const std::string&>()))
+                return set_error(err, where + ".function.parameters required property " +
+                                      property.get<std::string>() +
                                       " is not safe for the Qwen tool protocol");
         }
     }
@@ -499,6 +625,69 @@ bool parse_scalar_from_text(const std::string& value, json& parsed) {
     return parse_strict_json(value, parsed, ignored, "parameter value");
 }
 
+bool schema_allows_type(const json& schema, const std::string& wanted) {
+    if (schema.contains("type")) {
+        const json& type = schema["type"];
+        if (type.is_string()) return type == wanted;
+        if (type.is_array())
+            return std::find(type.begin(), type.end(), json(wanted)) != type.end();
+        return false;
+    }
+    if (!schema.contains("enum")) return true;
+    for (const auto& item : schema["enum"]) {
+        if ((wanted == "string" && item.is_string()) ||
+            (wanted == "object" && item.is_object()) ||
+            (wanted == "array" && item.is_array()) ||
+            (wanted == "integer" && (item.is_number_integer() || item.is_number_unsigned())) ||
+            (wanted == "number" && item.is_number()) ||
+            (wanted == "boolean" && item.is_boolean()) ||
+            (wanted == "null" && item.is_null())) return true;
+    }
+    return false;
+}
+
+bool schema_allows_non_string(const json& schema) {
+    for (const char* type : {"object", "array", "integer", "number", "boolean", "null"})
+        if (schema_allows_type(schema, type)) return true;
+    return false;
+}
+
+bool utf8_code_point_count(const std::string& value, std::size_t& count) {
+    count = 0;
+    for (std::size_t i = 0; i < value.size();) {
+        const unsigned char lead = static_cast<unsigned char>(value[i]);
+        std::size_t length = 0;
+        uint32_t code_point = 0;
+        if (lead <= 0x7f) {
+            length = 1;
+            code_point = lead;
+        } else if (lead >= 0xc2 && lead <= 0xdf) {
+            length = 2;
+            code_point = lead & 0x1f;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            length = 3;
+            code_point = lead & 0x0f;
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            length = 4;
+            code_point = lead & 0x07;
+        } else {
+            return false;
+        }
+        if (i + length > value.size()) return false;
+        for (std::size_t j = 1; j < length; ++j) {
+            const unsigned char continuation = static_cast<unsigned char>(value[i + j]);
+            if ((continuation & 0xc0) != 0x80) return false;
+            code_point = (code_point << 6) | (continuation & 0x3f);
+        }
+        if ((length == 3 && code_point >= 0xd800 && code_point <= 0xdfff) ||
+            (length == 3 && code_point < 0x800) ||
+            (length == 4 && (code_point < 0x10000 || code_point > 0x10ffff))) return false;
+        ++count;
+        i += length;
+    }
+    return true;
+}
+
 bool validate_value(const json& value, const json& schema, const std::string& path, std::string& err) {
     if (!schema.is_object()) return true;
     if (schema.contains("type")) {
@@ -525,37 +714,37 @@ bool validate_value(const json& value, const json& schema, const std::string& pa
             return set_error(err, path + " is not one of the allowed enum values");
     }
     if (value.is_number()) {
-        const double number = value.get<double>();
         if (schema.contains("minimum") && schema["minimum"].is_number() &&
-            number < schema["minimum"].get<double>())
+            compare_json_numbers(value, schema["minimum"]) < 0)
             return set_error(err, path + " is below minimum");
         if (schema.contains("maximum") && schema["maximum"].is_number() &&
-            number > schema["maximum"].get<double>())
+            compare_json_numbers(value, schema["maximum"]) > 0)
             return set_error(err, path + " is above maximum");
         if (schema.contains("exclusiveMinimum") && schema["exclusiveMinimum"].is_number() &&
-            number <= schema["exclusiveMinimum"].get<double>())
+            compare_json_numbers(value, schema["exclusiveMinimum"]) <= 0)
             return set_error(err, path + " is not above exclusiveMinimum");
         if (schema.contains("exclusiveMaximum") && schema["exclusiveMaximum"].is_number() &&
-            number >= schema["exclusiveMaximum"].get<double>())
+            compare_json_numbers(value, schema["exclusiveMaximum"]) >= 0)
             return set_error(err, path + " is not below exclusiveMaximum");
     }
     if (value.is_string()) {
         const std::string& string_value = value.get_ref<const std::string&>();
+        std::size_t string_length = 0;
+        if (!utf8_code_point_count(string_value, string_length))
+            return set_error(err, path + " is not valid UTF-8");
         if (schema.contains("minLength") &&
-            string_value.size() < schema["minLength"].get<std::size_t>())
+            string_length < schema["minLength"].get<std::size_t>())
             return set_error(err, path + " is shorter than minLength");
         if (schema.contains("maxLength") &&
-            string_value.size() > schema["maxLength"].get<std::size_t>())
+            string_length > schema["maxLength"].get<std::size_t>())
             return set_error(err, path + " is longer than maxLength");
         if (schema.contains("pattern")) {
-            try {
-                const std::regex pattern(schema["pattern"].get<std::string>(),
-                                         std::regex::ECMAScript);
-                if (!std::regex_search(string_value, pattern))
-                    return set_error(err, path + " does not match pattern");
-            } catch (const std::regex_error&) {
+            const re2::RE2 pattern(schema["pattern"].get_ref<const std::string&>(),
+                                   safe_regex_options());
+            if (!pattern.ok())
                 return set_error(err, path + " has an invalid pattern schema");
-            }
+            if (!re2::RE2::PartialMatch(string_value, pattern))
+                return set_error(err, path + " does not match pattern");
         }
     }
     if (value.is_object()) {
@@ -593,6 +782,42 @@ bool validate_value(const json& value, const json& schema, const std::string& pa
         }
     }
     return true;
+}
+
+bool parse_parameter_value(const std::string& value, const json& schema, json& parsed) {
+    const bool allows_string = schema_allows_type(schema, "string");
+    const bool allows_non_string = schema_allows_non_string(schema);
+    if (allows_string && !allows_non_string) {
+        parsed = value;
+        return true;
+    }
+    if (allows_non_string) {
+        json candidate;
+        if (parse_scalar_from_text(value, candidate)) {
+            std::string validation_error;
+            if (validate_value(candidate, schema, "parameter value", validation_error)) {
+                parsed = std::move(candidate);
+                return true;
+            }
+        }
+    }
+    if (allows_string) {
+        parsed = value;
+        return true;
+    }
+    return false;
+}
+
+const json* property_schema_for_key(const json& object_schema, const json& properties,
+                                    const std::string& key) {
+    if (properties.contains(key)) return &properties[key];
+    if (object_schema.contains("additionalProperties")) {
+        const json& additional = object_schema["additionalProperties"];
+        if (additional.is_boolean() && !additional.get<bool>()) return nullptr;
+        if (additional.is_object()) return &additional;
+    }
+    static const json unconstrained = json::object();
+    return &unconstrained;
 }
 
 const ToolDefinition* offered_tool(const ChatRequest& request, const std::string& name) {
@@ -635,7 +860,9 @@ bool parse_one_xml_call(const std::string& block, const ChatRequest& request, To
         if (!safe_protocol_name(key))
             return set_error(err, "tool call has an invalid parameter name");
         if (arguments.contains(key)) return set_error(err, "tool call contains duplicate parameter " + key);
-        if (!properties.contains(key)) return set_error(err, "tool call contains unknown parameter " + key);
+        const json* property_schema = property_schema_for_key(schema, properties, key);
+        if (!property_schema)
+            return set_error(err, "tool call contains unknown parameter " + key);
         const size_t value_start = key_end + 1;
         const size_t value_end = block.find(kParameterClose, value_start);
         if (value_end == std::string::npos) return set_error(err, "tool call has an unterminated parameter " + key);
@@ -646,18 +873,10 @@ bool parse_one_xml_call(const std::string& block, const ChatRequest& request, To
         if (!value.empty() && value.back() == '\n') value.pop_back();
         if (has_protocol_markup(value))
             return set_error(err, "parameter " + key + " contains reserved protocol markup");
-        const json& property_schema = properties[key];
-        std::string type;
-        if (property_schema.contains("type") && property_schema["type"].is_string())
-            type = property_schema["type"].get<std::string>();
         json parsed;
-        if (type == "string") {
-            parsed = value;
-        } else {
-            if (!parse_scalar_from_text(value, parsed))
-                return set_error(err, "parameter " + key + " is not valid JSON for its schema type");
-        }
-        if (!validate_value(parsed, property_schema, "parameter " + key, err)) return false;
+        if (!parse_parameter_value(value, *property_schema, parsed))
+            return set_error(err, "parameter " + key + " is not valid for its schema type");
+        if (!validate_value(parsed, *property_schema, "parameter " + key, err)) return false;
         arguments[key] = std::move(parsed);
         pos = value_end + std::char_traits<char>::length(kParameterClose);
     }
@@ -725,16 +944,10 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
             if (!parse_strict_json(call.arguments, arguments, err,
                                    "messages[" + std::to_string(i) +
                                        "].tool_calls arguments")) return false;
-            const json properties =
-                tool->spec["function"]["parameters"].value("properties", json::object());
             for (const auto& argument : arguments.items()) {
                 if (!safe_protocol_name(argument.key()))
                     return set_error(err, "messages[" + std::to_string(i) +
                                               "].tool_calls contains an unsafe parameter name");
-                if (!properties.contains(argument.key()))
-                    return set_error(err, "messages[" + std::to_string(i) +
-                                              "].tool_calls contains unknown parameter " +
-                                              argument.key());
             }
             if (!validate_value(arguments, tool->spec["function"]["parameters"],
                                 "messages[" + std::to_string(i) + "].tool_calls arguments", err)) return false;

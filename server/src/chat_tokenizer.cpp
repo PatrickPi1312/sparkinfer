@@ -165,6 +165,23 @@ bool parse_enable_thinking(const std::string& request_json, bool default_value) 
     return default_value;
 }
 
+bool validate_chat_request_model_support(const ChatRequest& request, bool museglimmer,
+                                         std::string& err) {
+    if (!museglimmer) return true;
+    bool has_tool_history = false;
+    for (const ChatMessage& message : request.messages) {
+        if (message.role == "tool" || !message.tool_calls.empty()) {
+            has_tool_history = true;
+            break;
+        }
+    }
+    if (!request.tools.empty() || has_tool_history) {
+        err = "tool calling is currently supported only for Qwen3.6 models";
+        return false;
+    }
+    return true;
+}
+
 std::string apply_qwen36_chat_template(const std::vector<ChatMessage>& messages, bool enable_thinking) {
     // Matches server/scripts/chat_tokens.py (thinking disabled) and HF enable_thinking=true.
     std::ostringstream parts;
@@ -260,7 +277,7 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable
                                              const ChatRequest* request) {
     if (museglimmer) return parse_museglimmer_output(raw, enable_thinking);
 
-    if (request && !request->tools.empty() && request->tool_choice != ToolChoiceMode::kNone) {
+    if (request && !request->tools.empty()) {
         const ParsedToolOutput parsed = parse_qwen36_tool_output(raw, enable_thinking, *request);
         ParsedAssistantOutput out;
         out.reasoning_content = parsed.reasoning_content;
@@ -494,10 +511,7 @@ bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::ve
     }
     ChatRequest request;
     if (!parse_chat_request_json(request_json, request, err)) return false;
-    if (impl_->museglimmer && !request.tools.empty() && request.tool_choice != ToolChoiceMode::kNone) {
-        err = "tool calling is currently supported only for Qwen3.6 models";
-        return false;
-    }
+    if (!validate_chat_request_model_support(request, impl_->museglimmer, err)) return false;
 
     const std::string prompt = impl_->museglimmer
         ? apply_museglimmer_chat_template(request.messages, enable_thinking ? "high" : "low")
