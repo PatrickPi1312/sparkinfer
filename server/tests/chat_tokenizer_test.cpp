@@ -37,6 +37,14 @@ bool test_thinking_prompt_and_nonstream_parser() {
         "<think>\nreason\n</think>\nanswer", true, false);
     CHECK(repeated.reasoning_content == "reason");
     CHECK(repeated.content == "answer");
+
+    // Same tolerance when the repeated marker isn't the very first byte (e.g. a stray leading
+    // token before it) -- the marker itself must never leak into reasoning_content.
+    const auto repeated_not_at_start = sparkinfer_server::parse_assistant_output(
+        " <think>\nreason\n</think>\nanswer", true, false);
+    CHECK(repeated_not_at_start.reasoning_content == "reason");
+    CHECK(repeated_not_at_start.content == "answer");
+    CHECK(repeated_not_at_start.reasoning_content.find("<think>") == std::string::npos);
     return true;
 }
 
@@ -59,6 +67,32 @@ bool test_thinking_stream_boundaries() {
     CHECK(content.find("<think>") == std::string::npos);
     CHECK(content.find("</think>") == std::string::npos);
     CHECK(content.find("<|im_end|>") == std::string::npos);
+    return true;
+}
+
+bool test_thinking_stream_repeated_opening_marker() {
+    // Streaming starts directly in the "inside <think>" phase (the prompt already primed
+    // "<think>\n"), but must still tolerate -- and strip -- a defensively repeated opening
+    // marker the same way the non-streaming parser does, rather than leaking it into
+    // reasoning_content.
+    sparkinfer_server::ThinkingStreamSplitter splitter(true, false);
+    std::string reasoning;
+    std::string content;
+    for (const char* piece : {"<thi", "nk>\nreason\n</thi", "nk>\nanswer"}) {
+        const auto delta = splitter.feed(piece);
+        reasoning += delta.reasoning_content;
+        content += delta.content;
+    }
+    sparkinfer_server::ThinkingStreamSplitter::Delta tail;
+    splitter.finish(tail);
+    reasoning += tail.reasoning_content;
+    content += tail.content;
+    // Streaming reasoning_content chunks aren't leading-whitespace-trimmed the way the
+    // non-streaming parser's final string is (pre-existing, orthogonal to this fix) -- the
+    // marker itself must simply never appear in the output.
+    CHECK(reasoning == "\nreason\n");
+    CHECK(content == "answer");
+    CHECK(reasoning.find("<think>") == std::string::npos);
     return true;
 }
 
@@ -132,6 +166,7 @@ bool test_tool_choice_none_still_uses_strict_output_parser() {
 int main() {
     if (!test_thinking_prompt_and_nonstream_parser()) return 1;
     if (!test_thinking_stream_boundaries()) return 1;
+    if (!test_thinking_stream_repeated_opening_marker()) return 1;
     if (!test_nonthinking_stream_hides_terminal_marker()) return 1;
     if (!test_muse_rejects_all_tool_protocol_history()) return 1;
     if (!test_tool_choice_none_still_uses_strict_output_parser()) return 1;

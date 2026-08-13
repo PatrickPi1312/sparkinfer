@@ -185,8 +185,11 @@ bool parse_content(const json& value, std::string& content, bool& is_null,
         const json& part = value[i];
         if (!part.is_object() || !part.contains("type") || !part["type"].is_string())
             return set_error(err, where + ".content[" + std::to_string(i) + "] must have a string type");
-        if (part["type"] != "text")
-            return set_error(err, where + ".content[" + std::to_string(i) + "] has unsupported non-text type");
+        // Non-text parts (image_url, audio, ...) are ignored, not rejected -- this backend has
+        // no vision/audio input path, but a client sending a mixed multimodal payload (common
+        // even against text-only backends, since agent frameworks often build one payload
+        // shape for every provider) should still get an answer from the text that IS present.
+        if (part["type"] != "text") continue;
         if (!part.contains("text") || !part["text"].is_string())
             return set_error(err, where + ".content[" + std::to_string(i) + "].text must be a string");
         content += part["text"].get<std::string>();
@@ -511,6 +514,10 @@ bool parse_message(const json& value, ChatMessage& message, size_t index, std::s
     if (!value.contains("role") || !value["role"].is_string())
         return set_error(err, where + ".role must be a string");
     message.role = value["role"].get<std::string>();
+    // "developer" is OpenAI's newer replacement for "system" (some current client SDKs send
+    // it by default) -- treat it as an alias rather than rejecting a request this backend can
+    // otherwise serve perfectly well.
+    if (message.role == "developer") message.role = "system";
     if (message.role != "system" && message.role != "user" && message.role != "assistant" &&
         message.role != "tool")
         return set_error(err, where + ".role is unsupported");
@@ -589,7 +596,14 @@ std::string json_value_for_parameter(const json& value) {
 }
 
 std::string render_tool_call(const ToolCall& call) {
-    json arguments = json::parse(call.arguments);
+    // call.arguments is always produced internally by parse_arguments's own .dump(), so this
+    // should be unreachable -- but every other JSON parse in this file goes through the
+    // exception-safe parse_strict_json rather than the throwing overload, to avoid an uncaught
+    // exception surfacing as an unstructured 500 from inside the HTTP handler.
+    json arguments;
+    std::string parse_err;
+    if (!parse_strict_json(call.arguments, arguments, parse_err, "tool call arguments"))
+        arguments = json::object();
     std::ostringstream out;
     out << kToolCallOpen << '\n' << kFunctionOpen << call.name << ">\n";
     for (const auto& item : arguments.items()) {
@@ -1106,6 +1120,11 @@ ParsedToolOutput parse_qwen36_tool_output(const std::string& raw, bool enable_th
     size_t pos = first_call;
     while (pos < remaining.size()) {
         while (pos < remaining.size() && std::isspace(static_cast<unsigned char>(remaining[pos]))) ++pos;
+        // Trailing whitespace with nothing after it (e.g. a lone newline the model emitted
+        // right before hitting EOS/token-limit, with no literal <|im_end|> text -- decode()
+        // skips special-token text entirely, so that's the common case, not an edge case) is a
+        // clean end of output, not "malformed markup after a tool call".
+        if (pos == remaining.size()) break;
         if (remaining.compare(pos, std::char_traits<char>::length(kImEnd), kImEnd) == 0) {
             pos += std::char_traits<char>::length(kImEnd);
             while (pos < remaining.size() && std::isspace(static_cast<unsigned char>(remaining[pos]))) ++pos;

@@ -55,6 +55,12 @@ private:
     enum class Phase { kBeforeThink, kInThink, kInAnswer } phase_ = Phase::kBeforeThink;
     std::string carry_;
     std::string prefix_buffer_;
+    // Qwen (non-museglimmer) starts in Phase::kInThink directly (the prompt already primes
+    // "<think>\n"), but a generation can still defensively repeat the opening marker -- see
+    // parse_assistant_output's identical handling for the non-streaming path. Checked once,
+    // on the first non-empty data seen in kInThink, so a literal "<think>" appearing later in
+    // genuine reasoning text is never mistaken for the marker.
+    bool think_open_checked_ = false;
 
     // Muse Glimmer (harmony-style) state: segments are <|start|>{header}<|message|>{body}
     // then <|eom|> (more segments follow, same assistant turn) or <|eot|> (turn done). The

@@ -49,6 +49,11 @@ std::atomic<uint64_t> g_requests_alloc_failed{0};   // 503 -- real device OOM, n
 std::atomic<uint64_t> g_requests_timeout{0};
 std::atomic<uint64_t> g_requests_cancelled{0};
 std::atomic<uint64_t> g_requests_server_error{0};   // 5xx
+// 502 -- the model produced tool-call output that failed schema/markup validation for a reason
+// other than truncation. Distinct from server_error so monitoring doesn't conflate model-output
+// quality variance with a real infrastructure fault -- the exact conflation #779 already
+// documented once for overloaded (429) vs alloc_failed (503).
+std::atomic<uint64_t> g_requests_invalid_tool_output{0};
 std::atomic<uint64_t> g_prompt_tokens_total{0};
 std::atomic<uint64_t> g_completion_tokens_total{0};
 
@@ -385,6 +390,8 @@ int main(int argc, char** argv) {
              << g_requests_cancelled.load() << "\n"
              << "sparkinfer_requests_by_outcome_total{outcome=\"server_error\"} "
              << g_requests_server_error.load() << "\n"
+             << "sparkinfer_requests_by_outcome_total{outcome=\"invalid_tool_output\"} "
+             << g_requests_invalid_tool_output.load() << "\n"
                 "# HELP sparkinfer_tokens_total Tokens processed\n"
                 "# TYPE sparkinfer_tokens_total counter\n"
              << "sparkinfer_tokens_total{kind=\"prompt\"} " << g_prompt_tokens_total.load() << "\n"
@@ -573,6 +580,13 @@ int main(int argc, char** argv) {
                                  err_chunk << "data: {\"error\":{\"message\":\"" << json_escape(outcome.error)
                                            << "\"}}\n\n";
                                  sink.write(err_chunk.str().c_str(), (size_t)err_chunk.str().size());
+                                 // A client that explicitly asked for usage still deserves the
+                                 // token counts even though generation faulted -- ttft/generation
+                                 // timing isn't meaningful for a hard engine error, so omit those
+                                 // (write_stream_usage only includes a field when its arg is >= 0).
+                                 if (include_usage)
+                                     write_stream_usage(sink, cid, created, prompt_tokens,
+                                                        completion_tokens, -1.0, -1.0, -1.0);
                                  write_stream_done(sink);
                                  sink.done();
                                  return true;
@@ -599,7 +613,7 @@ int main(int argc, char** argv) {
                                          // Emit no buffered markup and finish with "length".
                                          parsed = {};
                                      } else {
-                                         g_requests_server_error++;
+                                         g_requests_invalid_tool_output++;
                                          const nlohmann::json error = {
                                              {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
                                          write_sse_json(sink, error);
@@ -611,13 +625,16 @@ int main(int argc, char** argv) {
                                  write_stream_delta(sink, cid, created, "reasoning_content",
                                                     parsed.reasoning_content);
                                  write_stream_delta(sink, cid, created, "content", parsed.content);
-                                 if (!outcome.reached_token_limit) {
-                                     for (size_t i = 0; i < parsed.tool_calls.size(); ++i) {
-                                         parsed.tool_calls[i].id = random_id("call_");
-                                         write_stream_tool_call(sink, cid, created, i, parsed.tool_calls[i]);
-                                     }
-                                     if (!parsed.tool_calls.empty()) finish_reason = "tool_calls";
+                                 // parsed.tool_calls is only non-empty here when parsed.error was
+                                 // empty (the reached_token_limit-and-error case already reset
+                                 // parsed to {} above) -- i.e. a complete, valid call, even if the
+                                 // model also happened to exhaust its token budget emitting it.
+                                 // Gating this on !reached_token_limit dropped that call entirely.
+                                 for (size_t i = 0; i < parsed.tool_calls.size(); ++i) {
+                                     parsed.tool_calls[i].id = random_id("call_");
+                                     write_stream_tool_call(sink, cid, created, i, parsed.tool_calls[i]);
                                  }
+                                 if (!parsed.tool_calls.empty()) finish_reason = "tool_calls";
                              } else {
                                  sparkinfer_server::ThinkingStreamSplitter::Delta flush;
                                  splitter.finish(flush);
@@ -666,8 +683,8 @@ int main(int argc, char** argv) {
                          // valid completion, so return an empty assistant result instead of 5xx.
                          parsed = {};
                      } else {
-                         g_requests_server_error++;
-                         res.status = 500;
+                         g_requests_invalid_tool_output++;
+                         res.status = 502;
                          const nlohmann::json error = {
                              {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
                          res.set_content(error.dump(), "application/json");
@@ -679,7 +696,9 @@ int main(int argc, char** argv) {
                  if (!parsed.reasoning_content.empty())
                      message["reasoning_content"] = parsed.reasoning_content;
                  std::string finish_reason = outcome.reached_token_limit ? "length" : "stop";
-                 if (!parsed.tool_calls.empty() && !outcome.reached_token_limit) {
+                 // See the streaming path's identical comment: parsed.tool_calls is only
+                 // non-empty here for a complete, successfully-parsed call.
+                 if (!parsed.tool_calls.empty()) {
                      message["content"] = parsed.content.empty()
                          ? nlohmann::json(nullptr) : nlohmann::json(parsed.content);
                      message["tool_calls"] = nlohmann::json::array();

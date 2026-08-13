@@ -298,7 +298,7 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable
     // enabled, so generated text normally starts inside that block and contains only the
     // closing marker. Accept a repeated opening marker defensively, but do not require one.
     const size_t open = raw.find(kThinkOpen);
-    const size_t body_start = open == 0 ? strlen(kThinkOpen) : 0;
+    const size_t body_start = open == std::string::npos ? 0 : open + strlen(kThinkOpen);
     const size_t close = raw.find(kThinkClose, body_start);
     if (close != std::string::npos) {
         out.reasoning_content = raw.substr(body_start, close - body_start);
@@ -431,6 +431,21 @@ ThinkingStreamSplitter::Delta ThinkingStreamSplitter::feed(const std::string& pi
         }
 
         if (phase_ == Phase::kInThink) {
+            if (!think_open_checked_ && !data.empty()) {
+                if (data.compare(0, strlen(kThinkOpen), kThinkOpen) == 0) {
+                    data.erase(0, strlen(kThinkOpen));
+                    think_open_checked_ = true;
+                } else {
+                    const size_t keep = marker_prefix_len(data, kThinkOpen);
+                    if (keep > 0 && keep == data.size()) {
+                        // Whole chunk so far could still be a partial opening marker --
+                        // hold it and re-decide once more data arrives.
+                        carry_ = data;
+                        break;
+                    }
+                    think_open_checked_ = true;
+                }
+            }
             const size_t pos = data.find(kThinkClose);
             if (pos == std::string::npos) {
                 const size_t keep = marker_prefix_len(data, kThinkClose);

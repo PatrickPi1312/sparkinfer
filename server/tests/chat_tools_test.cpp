@@ -706,6 +706,42 @@ bool test_parallel_tool_calls() {
     return true;
 }
 
+bool test_nontext_content_parts_are_ignored_not_rejected() {
+    // A mixed multimodal payload (common even against text-only backends -- agent frameworks
+    // often build one request shape for every provider) must still succeed using whatever text
+    // parts are present, not hard-reject the whole request.
+    json body = {
+        {"model", "spark"},
+        {"messages", json::array({json::object({
+             {"role", "user"},
+             {"content", json::array({
+                  json::object({{"type", "text"}, {"text", "describe this: "}}),
+                  json::object({{"type", "image_url"}, {"image_url", json::object({{"url", "http://x/y.png"}})}}),
+                  json::object({{"type", "text"}, {"text", "please"}}),
+              })},
+         })})},
+    };
+    ChatRequest request;
+    CHECK(parse_request(body.dump(), request));
+    CHECK(request.messages.size() == 1);
+    CHECK(request.messages[0].content == "describe this: please");
+    return true;
+}
+
+bool test_developer_role_is_accepted_as_system_alias() {
+    json body = {
+        {"model", "spark"},
+        {"messages", json::array({json::object({
+             {"role", "developer"}, {"content", "be terse"},
+         })})},
+    };
+    ChatRequest request;
+    CHECK(parse_request(body.dump(), request));
+    CHECK(request.messages.size() == 1);
+    CHECK(request.messages[0].role == "system");
+    return true;
+}
+
 bool test_plain_answer() {
     ChatRequest request;
     CHECK(parse_request(hermes_request(), request));
@@ -747,6 +783,25 @@ bool test_control_markup_never_leaks_as_content() {
     CHECK(thinking_remnant.reasoning_content.empty());
     CHECK(thinking_remnant.content.empty());
     CHECK(thinking_remnant.tool_calls.empty());
+    return true;
+}
+
+bool test_trailing_whitespace_after_tool_call_is_not_malformed() {
+    // ChatTokenizer::decode() skips literal text for special tokens (including <|im_end|>), so
+    // on a normal EOS stop the decoded text usually does NOT contain a literal <|im_end|>
+    // suffix -- any whitespace-only token the model emits right before EOS must not be treated
+    // as "text or malformed markup appears after a tool call".
+    ChatRequest request;
+    CHECK(parse_request(hermes_request(), request));
+    const std::string raw =
+        "<tool_call>\n<function=lookup_catalog>\n"
+        "<parameter=query>\n{\"category\":\"books\",\"tags\":[]}\n</parameter>\n"
+        "<parameter=limit>\n2\n</parameter>\n"
+        "</function>\n</tool_call>\n";
+    const ParsedToolOutput output = parse_qwen36_tool_output(raw, false, request);
+    CHECK(output.error.empty());
+    CHECK(output.tool_calls.size() == 1);
+    CHECK(output.tool_calls[0].name == "lookup_catalog");
     return true;
 }
 
@@ -887,6 +942,9 @@ int main() {
     if (!test_parallel_tool_calls()) return 1;
     if (!test_plain_answer()) return 1;
     if (!test_control_markup_never_leaks_as_content()) return 1;
+    if (!test_trailing_whitespace_after_tool_call_is_not_malformed()) return 1;
+    if (!test_nontext_content_parts_are_ignored_not_rejected()) return 1;
+    if (!test_developer_role_is_accepted_as_system_alias()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
     if (!test_unsafe_protocol_names()) return 1;
