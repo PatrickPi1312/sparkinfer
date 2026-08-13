@@ -1,15 +1,12 @@
 #pragma once
 
+#include "chat_tools.hpp"
+
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace sparkinfer_server {
-
-struct ChatMessage {
-    std::string role;
-    std::string content;
-};
 
 // HuggingFace tokenizer.json + Qwen3.6 chat template.
 class ChatTokenizer {
@@ -25,7 +22,7 @@ public:
     void set_museglimmer(bool on);
 
     bool encode_chat_request(const std::string& request_json, std::vector<int>& ids, bool enable_thinking,
-                             std::string& err) const;
+                             std::string& err, ChatRequest* parsed_request = nullptr) const;
     std::string decode(const std::vector<int>& ids) const;
     std::string decode_delta(std::vector<int>& acc, int new_id) const;
 
@@ -37,6 +34,8 @@ private:
 struct ParsedAssistantOutput {
     std::string reasoning_content;
     std::string content;
+    std::vector<ToolCall> tool_calls;
+    std::string error;
 };
 
 // Incrementally routes decoded text into reasoning vs answer for SSE streaming.
@@ -76,6 +75,8 @@ bool parse_enable_thinking(const std::string& request_json, bool default_value =
 std::string apply_qwen36_chat_template(const std::vector<ChatMessage>& messages, bool enable_thinking = false);
 std::string apply_museglimmer_chat_template(const std::vector<ChatMessage>& messages,
                                             const std::string& reasoning_strength = "high");
-ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking, bool museglimmer = false);
+ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking,
+                                             bool museglimmer = false,
+                                             const ChatRequest* request = nullptr);
 
 }  // namespace sparkinfer_server

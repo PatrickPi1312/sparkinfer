@@ -1,5 +1,6 @@
 #include "chat_tokenizer.hpp"
 
+#include <nlohmann/json.hpp>
 #include <tokenizers_cpp.h>
 
 #include <algorithm>
@@ -20,89 +21,14 @@ std::string read_file(const std::string& path) {
     return ss.str();
 }
 
-// Unescape a minimal JSON string value (handles \\ \n \t \").
-std::string json_unescape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] != '\\' || i + 1 >= s.size()) {
-            out.push_back(s[i]);
-            continue;
-        }
-        char c = s[++i];
-        switch (c) {
-            case '"': out.push_back('"'); break;
-            case '\\': out.push_back('\\'); break;
-            case '/': out.push_back('/'); break;
-            case 'b': out.push_back('\b'); break;
-            case 'f': out.push_back('\f'); break;
-            case 'n': out.push_back('\n'); break;
-            case 'r': out.push_back('\r'); break;
-            case 't': out.push_back('\t'); break;
-            default: out.push_back(c); break;
-        }
-    }
-    return out;
-}
-
-bool extract_json_string(const std::string& body, size_t start, size_t& end, std::string& out) {
-    size_t q = body.find('"', start);
-    if (q == std::string::npos) return false;
-    std::string raw;
-    for (size_t i = q + 1; i < body.size(); i++) {
-        if (body[i] == '\\' && i + 1 < body.size()) {
-            raw.push_back(body[i++]);
-            raw.push_back(body[i]);
-            continue;
-        }
-        if (body[i] == '"') {
-            end = i + 1;
-            out = json_unescape(raw);
-            return true;
-        }
-        raw.push_back(body[i]);
-    }
-    return false;
-}
-
-// Find closing brace of a JSON object, respecting quoted strings.
-size_t find_json_object_end(const std::string& s, size_t start) {
-    if (start >= s.size() || s[start] != '{') return std::string::npos;
-    int depth = 0;
-    bool in_string = false;
-    for (size_t i = start; i < s.size(); i++) {
-        const char c = s[i];
-        if (in_string) {
-            if (c == '\\' && i + 1 < s.size()) {
-                i++;
-                continue;
-            }
-            if (c == '"') in_string = false;
-            continue;
-        }
-        if (c == '"') {
-            in_string = true;
-            continue;
-        }
-        if (c == '{')
-            depth++;
-        else if (c == '}') {
-            depth--;
-            if (depth == 0) return i;
-        }
-    }
-    return std::string::npos;
-}
-
 constexpr const char* kImEnd = "<|" "im_end|>";
 constexpr const char* kThinkOpen = "<" "think>";
 constexpr const char* kThinkClose = "</" "think>";
 
 // Muse Glimmer harmony-style segment markers (server/scripts equivalent of Qwen3.6's
 // im_start/im_end/think tags). See tokenizer.chat_template in the model's GGUF for the
-// canonical jinja this mirrors (system/user/assistant/tool rendering, tool calls and
-// per-tool-namespace recipients are not implemented -- request parsing has no `tools` field
-// yet, so those branches of the upstream template are never exercised here).
+// canonical jinja this mirrors. Muse's ATEM tool protocol is deliberately rejected at request
+// validation until it receives its own renderer/parser; Qwen3.6 tools must never be sent here.
 constexpr const char* kMgStart = "<|start|>";
 constexpr const char* kMgMessage = "<|message|>";
 constexpr const char* kMgEot = "<|eot|>";
@@ -119,6 +45,11 @@ size_t marker_prefix_len(const std::string& data, const char* marker) {
 
 void trim_leading_ws(std::string& s) {
     while (!s.empty() && (s[0] == '\n' || s[0] == '\r' || s[0] == ' ' || s[0] == '\t')) s.erase(0, 1);
+}
+
+void trim_trailing_ws(std::string& s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t'))
+        s.pop_back();
 }
 
 void strip_trailing_im_end(std::string& s) {
@@ -215,111 +146,22 @@ void ChatTokenizer::set_museglimmer(bool on) {
 }
 
 bool parse_chat_messages(const std::string& request_json, std::vector<ChatMessage>& messages, std::string& err) {
-    messages.clear();
-    const std::string key = "\"messages\"";
-    size_t p = request_json.find(key);
-    if (p == std::string::npos) {
-        err = "missing messages in request";
-        return false;
-    }
-    p = request_json.find('[', p);
-    if (p == std::string::npos) {
-        err = "malformed messages array";
-        return false;
-    }
-
-    size_t i = p + 1;
-    while (i < request_json.size()) {
-        while (i < request_json.size() && (request_json[i] == ' ' || request_json[i] == ',')) i++;
-        if (i >= request_json.size() || request_json[i] == ']') break;
-        if (request_json[i] != '{') {
-            err = "malformed message object";
-            return false;
-        }
-
-        ChatMessage msg;
-        const size_t obj_end = find_json_object_end(request_json, i);
-        if (obj_end == std::string::npos) {
-            err = "unterminated message object";
-            return false;
-        }
-        const std::string obj = request_json.substr(i, obj_end - i + 1);
-
-        size_t role_pos = obj.find("\"role\"");
-        if (role_pos != std::string::npos) {
-            size_t dummy = 0;
-            extract_json_string(obj, role_pos + 6, dummy, msg.role);
-        }
-        size_t content_pos = obj.find("\"content\"");
-        if (content_pos != std::string::npos) {
-            size_t c = obj.find(':', content_pos);
-            if (c != std::string::npos) {
-                while (c < obj.size() && (obj[c] == ':' || obj[c] == ' ')) c++;
-                if (c < obj.size() && obj[c] == '"') {
-                    size_t dummy = 0;
-                    extract_json_string(obj, c, dummy, msg.content);
-                } else if (c < obj.size() && obj[c] == '[') {
-                    // Multimodal content parts: only concatenate "text" KEY values.
-                    // A naive find("\"text\"") also matches the type VALUE {"type":"text"},
-                    // and when extract fails `j` never advances → infinite loop / OOM.
-                    size_t j = c;
-                    const size_t lim = obj.size();
-                    while (j < lim) {
-                        const size_t text_key = obj.find("\"text\"", j);
-                        if (text_key == std::string::npos) break;
-                        j = text_key + 6;  // always past this match — scan cannot rewind
-                        size_t v = j;
-                        while (v < lim && (obj[v] == ':' || obj[v] == ' ')) ++v;
-                        if (v == j || v >= lim || obj[v] != '"') continue;  // type value, not a key
-                        size_t part_end = 0;
-                        std::string piece;
-                        if (!extract_json_string(obj, v, part_end, piece)) break;
-                        if (!msg.content.empty()) msg.content.push_back(' ');
-                        msg.content += piece;
-                        j = part_end;
-                    }
-                }
-            }
-        }
-
-        if (msg.role.empty()) msg.role = "user";
-        messages.push_back(std::move(msg));
-        i = obj_end + 1;
-    }
-
-    if (messages.empty()) {
-        err = "no messages in request";
-        return false;
-    }
+    ChatRequest request;
+    if (!parse_chat_request_json(request_json, request, err)) return false;
+    messages = std::move(request.messages);
     return true;
 }
 
 bool parse_enable_thinking(const std::string& request_json, bool default_value) {
-    const std::string needle = "\"enable_thinking\"";
-    auto parse_at = [&](size_t pos) -> bool {
-        pos = request_json.find(':', pos);
-        if (pos == std::string::npos) return default_value;
-        const size_t t = request_json.find("true", pos);
-        const size_t f = request_json.find("false", pos);
-        const size_t comma = request_json.find(',', pos);
-        const size_t end = comma == std::string::npos ? request_json.size() : comma;
-        if (t != std::string::npos && t < end) return true;
-        if (f != std::string::npos && f < end) return false;
-        return default_value;
-    };
-
-    const size_t messages = request_json.find("\"messages\"");
-    const size_t first = request_json.find(needle);
-    if (first != std::string::npos && (messages == std::string::npos || first < messages))
-        return parse_at(first);
-
-    const size_t kwargs = request_json.find("chat_template_kwargs");
-    if (kwargs != std::string::npos) {
-        const size_t in_kwargs = request_json.find(needle, kwargs);
-        if (in_kwargs != std::string::npos) return parse_at(in_kwargs);
+    const auto root = nlohmann::json::parse(request_json, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) return default_value;
+    const auto top = root.find("enable_thinking");
+    if (top != root.end() && top->is_boolean()) return top->get<bool>();
+    const auto kwargs = root.find("chat_template_kwargs");
+    if (kwargs != root.end() && kwargs->is_object()) {
+        const auto nested = kwargs->find("enable_thinking");
+        if (nested != kwargs->end() && nested->is_boolean()) return nested->get<bool>();
     }
-
-    if (first != std::string::npos) return parse_at(first);
     return default_value;
 }
 
@@ -414,8 +256,19 @@ ParsedAssistantOutput parse_museglimmer_output(const std::string& raw, bool enab
     return out;
 }
 
-ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking, bool museglimmer) {
+ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking, bool museglimmer,
+                                             const ChatRequest* request) {
     if (museglimmer) return parse_museglimmer_output(raw, enable_thinking);
+
+    if (request && !request->tools.empty() && request->tool_choice != ToolChoiceMode::kNone) {
+        const ParsedToolOutput parsed = parse_qwen36_tool_output(raw, enable_thinking, *request);
+        ParsedAssistantOutput out;
+        out.reasoning_content = parsed.reasoning_content;
+        out.content = parsed.content;
+        out.tool_calls = parsed.tool_calls;
+        out.error = parsed.error;
+        return out;
+    }
 
     ParsedAssistantOutput out;
     if (!enable_thinking) {
@@ -424,14 +277,11 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable
         return out;
     }
 
+    // The official Qwen3.6 generation prompt already ends in "<think>\n" when thinking is
+    // enabled, so generated text normally starts inside that block and contains only the
+    // closing marker. Accept a repeated opening marker defensively, but do not require one.
     const size_t open = raw.find(kThinkOpen);
-    if (open == std::string::npos) {
-        out.content = strip_think_markers(raw);
-        strip_trailing_im_end(out.content);
-        return out;
-    }
-
-    const size_t body_start = open + strlen(kThinkOpen);
+    const size_t body_start = open == 0 ? strlen(kThinkOpen) : 0;
     const size_t close = raw.find(kThinkClose, body_start);
     if (close != std::string::npos) {
         out.reasoning_content = raw.substr(body_start, close - body_start);
@@ -440,6 +290,7 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable
         out.reasoning_content = raw.substr(body_start);
     }
     trim_leading_ws(out.reasoning_content);
+    trim_trailing_ws(out.reasoning_content);
     trim_leading_ws(out.content);
     out.content = strip_think_markers(std::move(out.content));
     strip_trailing_im_end(out.content);
@@ -449,6 +300,12 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable
 ThinkingStreamSplitter::ThinkingStreamSplitter(bool enable_thinking, bool museglimmer)
     : enable_thinking_(enable_thinking), museglimmer_(museglimmer) {
     if (!enable_thinking_) phase_ = Phase::kInAnswer;
+    else if (!museglimmer_) {
+        // Qwen3.6's prompt pre-fills "<think>\n". Streaming therefore begins in the body,
+        // not before an opening marker; wait directly for </think> and never leak reasoning
+        // into delta.content.
+        phase_ = Phase::kInThink;
+    }
 }
 
 ThinkingStreamSplitter::Delta ThinkingStreamSplitter::feed(const std::string& piece) {
@@ -627,25 +484,31 @@ void ThinkingStreamSplitter::finish(Delta& tail) {
     trim_leading_ws(tail.content);
 }
 
-bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::vector<int>& ids, bool enable_thinking,
-                                         std::string& err) const {
+bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::vector<int>& ids,
+                                         bool enable_thinking, std::string& err,
+                                         ChatRequest* parsed_request) const {
     ids.clear();
     if (!impl_->tok) {
         err = "tokenizer not loaded";
         return false;
     }
-    std::vector<ChatMessage> messages;
-    if (!parse_chat_messages(request_json, messages, err)) return false;
+    ChatRequest request;
+    if (!parse_chat_request_json(request_json, request, err)) return false;
+    if (impl_->museglimmer && !request.tools.empty() && request.tool_choice != ToolChoiceMode::kNone) {
+        err = "tool calling is currently supported only for Qwen3.6 models";
+        return false;
+    }
 
     const std::string prompt = impl_->museglimmer
-        ? apply_museglimmer_chat_template(messages, enable_thinking ? "high" : "low")
-        : apply_qwen36_chat_template(messages, enable_thinking);
+        ? apply_museglimmer_chat_template(request.messages, enable_thinking ? "high" : "low")
+        : apply_qwen36_tools_template(request, enable_thinking);
     const std::vector<int32_t> enc = impl_->tok->Encode(prompt);
     ids.assign(enc.begin(), enc.end());
     if (ids.empty()) {
         err = "tokenize returned no ids";
         return false;
     }
+    if (parsed_request) *parsed_request = std::move(request);
     return true;
 }
 

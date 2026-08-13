@@ -47,7 +47,18 @@ export SPARKINFER_ROOT="$(pwd)"
 | `GET /v1/capacity` | This worker's live occupancy: `active_requests`, `free_kv_blocks`, `max_queue_depth`, `accepting_requests`. Single-process only — not fleet-wide. |
 | `GET /metrics` | Prometheus text-exposition counters/gauges: request totals by outcome (`ok`/`client_error`/`overloaded`/`timeout`/`cancelled`/`server_error`), prompt/completion token totals, active requests, free KV blocks, uptime. |
 | `POST /v1/tokenize` | Token count for a chat request body |
-| `POST /v1/chat/completions` | Chat (JSON `messages`, optional `stream`, `enable_thinking`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) plus additive GPU timing fields (`ttft_ms`, `generation_ms`, `decode_tps`) that standard OpenAI SDKs ignore. Streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]`. A streaming client that disconnects mid-response cancels generation (checked via `DataSink::is_writable()`) instead of running to completion for nobody. Overload (no queue capacity) returns `429`; a request that exceeds `SPARKINFER_REQUEST_TIMEOUT_S` returns `504`. |
+| `POST /v1/chat/completions` | Chat (JSON `messages`, optional `tools`, `tool_choice`, `stream`, `enable_thinking`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) plus additive GPU timing fields (`ttft_ms`, `generation_ms`, `decode_tps`) that standard OpenAI SDKs ignore. With `stream_options.include_usage=true`, streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]`. A streaming client that disconnects mid-response cancels generation (checked via `DataSink::is_writable()`) instead of running to completion for nobody. Overload (no queue capacity) returns `429`; a request that exceeds `SPARKINFER_REQUEST_TIMEOUT_S` returns `504`. |
+
+### Function tools
+
+Qwen3.6 accepts OpenAI function definitions in `tools`, assistant `tool_calls` history, and
+matching `role: "tool"` results. Both streaming and non-streaming responses expose native model
+calls as `message.tool_calls` / `delta.tool_calls` with `finish_reason: "tool_calls"`; native XML
+control markup is validated against the offered schema and is never exposed to clients.
+
+Omitted `tool_choice`, `"auto"`, and `"none"` are supported. Forced/named choices and
+`parallel_tool_calls: false` return `400` until those constraints can be enforced by the runtime.
+Tool calls are currently Qwen3.6-only; Muse Glimmer uses a different tool protocol.
 
 ### Graceful shutdown
 

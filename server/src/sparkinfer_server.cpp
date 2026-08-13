@@ -1,6 +1,8 @@
 #include "chat_tokenizer.hpp"
 #include "model_engine.hpp"
 
+#include <nlohmann/json.hpp>
+
 // Do not define CPPHTTPLIB_OPENSSL_SUPPORT — even `= 0` enables OpenSSL in httplib.
 #include "../third_party/httplib.h"
 
@@ -11,6 +13,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -58,42 +61,6 @@ std::string repo_root() {
     return ".";
 }
 
-// Minimal JSON helpers (avoid extra deps on this branch).
-std::string json_get_string(const std::string& body, const std::string& key) {
-    const std::string needle = "\"" + key + "\"";
-    size_t p = body.find(needle);
-    if (p == std::string::npos) return {};
-    p = body.find(':', p);
-    if (p == std::string::npos) return {};
-    p = body.find('"', p);
-    if (p == std::string::npos) return {};
-    size_t e = body.find('"', p + 1);
-    if (e == std::string::npos) return {};
-    return body.substr(p + 1, e - p - 1);
-}
-
-bool json_get_bool(const std::string& body, const std::string& key, bool def) {
-    const std::string needle = "\"" + key + "\"";
-    size_t p = body.find(needle);
-    if (p == std::string::npos) return def;
-    p = body.find(':', p);
-    if (p == std::string::npos) return def;
-    if (body.find("true", p) != std::string::npos && body.find("true", p) < body.find(',', p))
-        return true;
-    if (body.find("false", p) != std::string::npos && body.find("false", p) < body.find(',', p))
-        return false;
-    return def;
-}
-
-int json_get_int(const std::string& body, const std::string& key, int def) {
-    const std::string needle = "\"" + key + "\"";
-    size_t p = body.find(needle);
-    if (p == std::string::npos) return def;
-    p = body.find(':', p);
-    if (p == std::string::npos) return def;
-    return atoi(body.c_str() + p + 1);
-}
-
 std::string json_escape(const std::string& s) {
     std::ostringstream o;
     for (unsigned char c : s) {
@@ -111,26 +78,12 @@ std::string json_escape(const std::string& s) {
     return o.str();
 }
 
-std::string random_id() {
-    static std::mt19937_64 rng{std::random_device{}()};
+std::string random_id(const char* prefix = "chatcmpl-") {
+    thread_local std::mt19937_64 rng{std::random_device{}()};
     std::uniform_int_distribution<uint64_t> dist;
     std::ostringstream ss;
-    ss << "chatcmpl-" << std::hex << dist(rng);
+    ss << prefix << std::hex << dist(rng);
     return ss.str();
-}
-
-std::string usage_json(int prompt_tokens, int completion_tokens, double ttft_ms = -1.0,
-                       double generation_ms = -1.0, double decode_tps = -1.0) {
-    std::ostringstream o;
-    const int total = prompt_tokens + completion_tokens;
-    o << "\"usage\":{\"prompt_tokens\":" << prompt_tokens << ",\"completion_tokens\":" << completion_tokens
-      << ",\"total_tokens\":" << total;
-    // Additive OpenAI-compatible fields only -- ignored by standard SDKs/clients.
-    if (ttft_ms >= 0.0) o << ",\"ttft_ms\":" << std::fixed << std::setprecision(3) << ttft_ms;
-    if (generation_ms >= 0.0) o << ",\"generation_ms\":" << std::fixed << std::setprecision(3) << generation_ms;
-    if (decode_tps >= 0.0) o << ",\"decode_tps\":" << std::fixed << std::setprecision(2) << decode_tps;
-    o << "}";
-    return o.str();
 }
 
 bool auth_ok(const httplib::Request& req) {
@@ -143,19 +96,135 @@ bool auth_ok(const httplib::Request& req) {
            it->second.substr(prefix.size()) == g_api_key;
 }
 
-bool encode_messages(const std::string& body, std::vector<int>& ids, bool enable_thinking, std::string& err) {
-    return g_tokenizer.encode_chat_request(body, ids, enable_thinking, err);
+bool encode_messages(const std::string& body, std::vector<int>& ids, bool enable_thinking,
+                     std::string& err, sparkinfer_server::ChatRequest* request = nullptr) {
+    return g_tokenizer.encode_chat_request(body, ids, enable_thinking, err, request);
+}
+
+struct RequestControls {
+    bool stream = false;
+    bool include_usage = false;
+    int max_tokens = 256;
+};
+
+bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err) {
+    const auto root = nlohmann::json::parse(body, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) {
+        err = "request body must be a JSON object";
+        return false;
+    }
+    if (root.contains("stream")) {
+        if (!root["stream"].is_boolean()) {
+            err = "stream must be a boolean";
+            return false;
+        }
+        out.stream = root["stream"].get<bool>();
+    }
+    const char* max_key = root.contains("max_completion_tokens") ? "max_completion_tokens" : "max_tokens";
+    if (root.contains(max_key)) {
+        const auto& value = root[max_key];
+        if (!value.is_number_integer() && !value.is_number_unsigned()) {
+            err = std::string(max_key) + " must be a positive integer";
+            return false;
+        }
+        try {
+            const auto requested = value.get<long long>();
+            if (requested <= 0 || requested > std::numeric_limits<int>::max()) {
+                err = std::string(max_key) + " is outside the supported range";
+                return false;
+            }
+            out.max_tokens = static_cast<int>(requested);
+        } catch (const nlohmann::json::exception&) {
+            err = std::string(max_key) + " is outside the supported range";
+            return false;
+        }
+    }
+    if (root.contains("stream_options")) {
+        if (!root["stream_options"].is_object()) {
+            err = "stream_options must be an object";
+            return false;
+        }
+        const auto& opts = root["stream_options"];
+        if (opts.contains("include_usage")) {
+            if (!opts["include_usage"].is_boolean()) {
+                err = "stream_options.include_usage must be a boolean";
+                return false;
+            }
+            out.include_usage = opts["include_usage"].get<bool>();
+        }
+    }
+    return true;
+}
+
+nlohmann::json stream_chunk_base(const std::string& cid, long long created) {
+    return {{"id", cid}, {"object", "chat.completion.chunk"}, {"created", created},
+            {"model", g_model_name}};
+}
+
+bool write_sse_json(httplib::DataSink& sink, const nlohmann::json& value) {
+    const std::string event = "data: " + value.dump() + "\n\n";
+    return sink.write(event.c_str(), event.size());
+}
+
+bool write_stream_role(httplib::DataSink& sink, const std::string& cid, long long created) {
+    auto chunk = stream_chunk_base(cid, created);
+    chunk["choices"] = nlohmann::json::array({{{"index", 0},
+                                                {"delta", {{"role", "assistant"},
+                                                           {"content", nullptr}}},
+                                                {"finish_reason", nullptr}}});
+    return write_sse_json(sink, chunk);
 }
 
 bool write_stream_delta(httplib::DataSink& sink, const std::string& cid, long long created, const std::string& field,
                         const std::string& piece) {
     if (piece.empty()) return true;
-    std::ostringstream chunk;
-    chunk << "data: {\"id\":\"" << cid << "\",\"object\":\"chat.completion.chunk\","
-          << "\"created\":" << created << ",\"model\":\"" << g_model_name << "\","
-          << "\"choices\":[{\"index\":0,\"delta\":{\"" << field << "\":\"" << json_escape(piece)
-          << "\"},\"finish_reason\":null}]}\n\n";
-    return sink.write(chunk.str().c_str(), (size_t)chunk.str().size());
+    auto chunk = stream_chunk_base(cid, created);
+    chunk["choices"] = nlohmann::json::array({{{"index", 0},
+                                                {"delta", {{field, piece}}},
+                                                {"finish_reason", nullptr}}});
+    return write_sse_json(sink, chunk);
+}
+
+bool write_stream_tool_call(httplib::DataSink& sink, const std::string& cid, long long created,
+                            size_t index, const sparkinfer_server::ToolCall& call) {
+    auto chunk = stream_chunk_base(cid, created);
+    nlohmann::json delta_call = {{"index", index}, {"id", call.id}, {"type", "function"},
+                                {"function", {{"name", call.name},
+                                              {"arguments", call.arguments}}}};
+    chunk["choices"] = nlohmann::json::array({{{"index", 0},
+                                                {"delta", {{"tool_calls",
+                                                            nlohmann::json::array({delta_call})}}},
+                                                {"finish_reason", nullptr}}});
+    return write_sse_json(sink, chunk);
+}
+
+bool write_stream_finish(httplib::DataSink& sink, const std::string& cid, long long created,
+                         const std::string& reason) {
+    auto chunk = stream_chunk_base(cid, created);
+    chunk["choices"] = nlohmann::json::array({{{"index", 0},
+                                                {"delta", nlohmann::json::object()},
+                                                {"finish_reason", reason}}});
+    return write_sse_json(sink, chunk);
+}
+
+bool write_stream_usage(httplib::DataSink& sink, const std::string& cid, long long created,
+                        int prompt_tokens, int completion_tokens, double ttft_ms,
+                        double generation_ms, double decode_tps) {
+    auto chunk = stream_chunk_base(cid, created);
+    chunk["choices"] = nlohmann::json::array();
+    nlohmann::json usage = {{"prompt_tokens", prompt_tokens},
+                            {"completion_tokens", completion_tokens},
+                            {"total_tokens", prompt_tokens + completion_tokens}};
+    if (ttft_ms >= 0.0) usage["ttft_ms"] = ttft_ms;
+    if (generation_ms >= 0.0) usage["generation_ms"] = generation_ms;
+    if (decode_tps >= 0.0) usage["decode_tps"] = decode_tps;
+    chunk["usage"] = std::move(usage);
+    return write_sse_json(sink, chunk);
+}
+
+bool write_stream_done(httplib::DataSink& sink) {
+    static const std::string done = "data: [DONE]\n\n";
+    return sink.write(done.c_str(), done.size());
 }
 
 bool decode_ids(const std::vector<int>& ids, std::string& text, std::string& err) {
@@ -385,22 +454,33 @@ int main(int argc, char** argv) {
                  }
 
                  g_requests_total++;
-                 const bool stream = json_get_bool(req.body, "stream", false);
-                 if (stream) g_requests_streaming++;
-                 const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, false);
-                 int max_tokens = json_get_int(req.body, "max_tokens", 256);
-                 if (max_tokens <= 0) max_tokens = 256;
-                 if (max_tokens > max_output_tokens()) max_tokens = max_output_tokens();
-
-                 std::vector<int> prompt_ids;
+                 RequestControls controls;
                  std::string err;
-                 if (!encode_messages(req.body, prompt_ids, enable_thinking, err)) {
+                 if (!parse_request_controls(req.body, controls, err)) {
                      g_requests_client_error++;
                      res.status = 400;
                      res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
                                      "application/json");
                      return;
                  }
+                 const bool stream = controls.stream;
+                 if (stream) g_requests_streaming++;
+                 const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, false);
+                 int max_tokens = controls.max_tokens;
+                 if (max_tokens <= 0) max_tokens = 256;
+                 if (max_tokens > max_output_tokens()) max_tokens = max_output_tokens();
+
+                 std::vector<int> prompt_ids;
+                 sparkinfer_server::ChatRequest chat_request;
+                 if (!encode_messages(req.body, prompt_ids, enable_thinking, err, &chat_request)) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 const bool tool_mode = !chat_request.tools.empty() &&
+                     chat_request.tool_choice != sparkinfer_server::ToolChoiceMode::kNone;
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
@@ -435,9 +515,15 @@ int main(int argc, char** argv) {
                  if (stream) {
                      res.set_chunked_content_provider(
                          "text/event-stream",
-                         [&engine, prompt_ids, max_tokens, cid, created, enable_thinking](size_t offset,
-                                                                                          httplib::DataSink& sink) {
+                         [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
+                          chat_request, tool_mode, include_usage = controls.include_usage]
+                         (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
+                                 sink.done();
+                                 return true;
+                             }
+                             if (!write_stream_role(sink, cid, created)) {
+                                 g_requests_cancelled++;
                                  sink.done();
                                  return true;
                              }
@@ -447,6 +533,14 @@ int main(int argc, char** argv) {
                              // Returning false cancels generation -- the client is gone, so there
                              // is no point spending GPU time finishing the response.
                              auto on_tok = [&](int tid) -> bool {
+                                 // Tool-capable responses are intentionally buffered until the
+                                 // native Qwen XML is complete and schema-valid. This still emits
+                                 // valid atomic OpenAI SSE deltas, and guarantees malformed or
+                                 // partial markup can never leak as executable client content.
+                                 if (tool_mode) {
+                                     stream_ids.push_back(tid);
+                                     return sink.is_writable();
+                                 }
                                  std::string piece = g_tokenizer.decode_delta(stream_ids, tid);
                                  const auto delta = splitter.feed(piece);
                                  bool ok = true;
@@ -468,10 +562,6 @@ int main(int argc, char** argv) {
                                  sink.done();
                                  return true;
                              }
-                             sparkinfer_server::ThinkingStreamSplitter::Delta flush;
-                             splitter.finish(flush);
-                             write_stream_delta(sink, cid, created, "reasoning_content", flush.reasoning_content);
-                             write_stream_delta(sink, cid, created, "content", flush.content);
                              if (!outcome.error.empty()) {
                                  if (outcome.overloaded) g_requests_overloaded++;
                                  else if (outcome.alloc_failed) g_requests_alloc_failed++;
@@ -481,23 +571,57 @@ int main(int argc, char** argv) {
                                  err_chunk << "data: {\"error\":{\"message\":\"" << json_escape(outcome.error)
                                            << "\"}}\n\n";
                                  sink.write(err_chunk.str().c_str(), (size_t)err_chunk.str().size());
-                             } else {
-                                 g_requests_ok++;
+                                 write_stream_done(sink);
+                                 sink.done();
+                                 return true;
                              }
-                             std::ostringstream usage_chunk;
-                             usage_chunk << "data: {\"id\":\"" << cid << "\",\"object\":\"chat.completion.chunk\","
-                                         << "\"created\":" << created << ",\"model\":\"" << g_model_name << "\","
-                                         << "\"choices\":[],"
-                                         << usage_json(prompt_tokens, completion_tokens, outcome.ttft_ms,
-                                                       outcome.generation_ms, outcome.decode_tps)
-                                         << "}\n\n";
-                             sink.write(usage_chunk.str().c_str(), (size_t)usage_chunk.str().size());
-                             std::string tail =
-                                 "data: {\"id\":\"" + cid +
-                                 "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
-                                 "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
-                                 "data: [DONE]\n\n";
-                             sink.write(tail.c_str(), tail.size());
+
+                             std::string finish_reason = outcome.reached_token_limit ? "length" : "stop";
+                             if (tool_mode) {
+                                 std::string text;
+                                 std::string decode_err;
+                                 if (!decode_ids(stream_ids, text, decode_err)) {
+                                     g_requests_server_error++;
+                                     const nlohmann::json error = {{"error", {{"message", decode_err}}}};
+                                     write_sse_json(sink, error);
+                                     write_stream_done(sink);
+                                     sink.done();
+                                     return true;
+                                 }
+                                 auto parsed = sparkinfer_server::parse_assistant_output(
+                                     text, enable_thinking, engine.is_museglimmer(), &chat_request);
+                                 if (!parsed.error.empty()) {
+                                     g_requests_server_error++;
+                                     const nlohmann::json error = {
+                                         {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
+                                     write_sse_json(sink, error);
+                                     write_stream_done(sink);
+                                     sink.done();
+                                     return true;
+                                 }
+                                 write_stream_delta(sink, cid, created, "reasoning_content",
+                                                    parsed.reasoning_content);
+                                 write_stream_delta(sink, cid, created, "content", parsed.content);
+                                 for (size_t i = 0; i < parsed.tool_calls.size(); ++i) {
+                                     parsed.tool_calls[i].id = random_id("call_");
+                                     write_stream_tool_call(sink, cid, created, i, parsed.tool_calls[i]);
+                                 }
+                                 if (!parsed.tool_calls.empty()) finish_reason = "tool_calls";
+                             } else {
+                                 sparkinfer_server::ThinkingStreamSplitter::Delta flush;
+                                 splitter.finish(flush);
+                                 write_stream_delta(sink, cid, created, "reasoning_content",
+                                                    flush.reasoning_content);
+                                 write_stream_delta(sink, cid, created, "content", flush.content);
+                             }
+
+                             g_requests_ok++;
+                             write_stream_finish(sink, cid, created, finish_reason);
+                             if (include_usage)
+                                 write_stream_usage(sink, cid, created, prompt_tokens,
+                                                    completion_tokens, outcome.ttft_ms,
+                                                    outcome.generation_ms, outcome.decode_tps);
+                             write_stream_done(sink);
                              sink.done();
                              return true;
                          });
@@ -519,24 +643,55 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
-                 g_requests_ok++;
                  g_prompt_tokens_total += (uint64_t)prompt_ids.size();
                  g_completion_tokens_total += (uint64_t)outcome.tokens.size();
 
-                 const auto parsed = sparkinfer_server::parse_assistant_output(text, enable_thinking, engine.is_museglimmer());
+                 auto parsed = sparkinfer_server::parse_assistant_output(
+                     text, enable_thinking, engine.is_museglimmer(), tool_mode ? &chat_request : nullptr);
+                 if (!parsed.error.empty()) {
+                     g_requests_server_error++;
+                     res.status = 500;
+                     const nlohmann::json error = {
+                         {"error", {{"message", "invalid model tool call: " + parsed.error}}}};
+                     res.set_content(error.dump(), "application/json");
+                     return;
+                 }
 
-                 std::ostringstream body;
-                 body << "{\"id\":\"" << cid << "\",\"object\":\"chat.completion\",\"created\":" << created
-                      << ",\"model\":\"" << g_model_name << "\",\"choices\":[{\"index\":0,\"message\":{"
-                      << "\"role\":\"assistant\"";
+                 nlohmann::json message = {{"role", "assistant"}};
                  if (!parsed.reasoning_content.empty())
-                     body << ",\"reasoning_content\":\"" << json_escape(parsed.reasoning_content) << "\"";
-                 body << ",\"content\":\"" << json_escape(parsed.content) << "\""
-                      << "},\"finish_reason\":\"stop\"}],"
-                      << usage_json((int)prompt_ids.size(), (int)outcome.tokens.size(), outcome.ttft_ms,
-                                    outcome.generation_ms, outcome.decode_tps)
-                      << "}";
-                 res.set_content(body.str(), "application/json");
+                     message["reasoning_content"] = parsed.reasoning_content;
+                 std::string finish_reason = outcome.reached_token_limit ? "length" : "stop";
+                 if (!parsed.tool_calls.empty()) {
+                     message["content"] = parsed.content.empty()
+                         ? nlohmann::json(nullptr) : nlohmann::json(parsed.content);
+                     message["tool_calls"] = nlohmann::json::array();
+                     for (auto& call : parsed.tool_calls) {
+                         call.id = random_id("call_");
+                         message["tool_calls"].push_back({
+                             {"id", call.id}, {"type", "function"},
+                             {"function", {{"name", call.name}, {"arguments", call.arguments}}}});
+                     }
+                     finish_reason = "tool_calls";
+                 } else {
+                     message["content"] = parsed.content;
+                 }
+
+                 nlohmann::json usage = {
+                     {"prompt_tokens", (int)prompt_ids.size()},
+                     {"completion_tokens", (int)outcome.tokens.size()},
+                     {"total_tokens", (int)(prompt_ids.size() + outcome.tokens.size())}};
+                 if (outcome.ttft_ms >= 0.0) usage["ttft_ms"] = outcome.ttft_ms;
+                 if (outcome.generation_ms >= 0.0) usage["generation_ms"] = outcome.generation_ms;
+                 if (outcome.decode_tps >= 0.0) usage["decode_tps"] = outcome.decode_tps;
+                 const nlohmann::json body = {
+                     {"id", cid}, {"object", "chat.completion"}, {"created", created},
+                     {"model", g_model_name},
+                     {"choices", nlohmann::json::array({{{"index", 0},
+                                                          {"message", message},
+                                                          {"finish_reason", finish_reason}}})},
+                     {"usage", usage}};
+                 g_requests_ok++;
+                 res.set_content(body.dump(), "application/json");
              });
 
     // Transport-level deadlines. Defaults are generous, not aggressive: a cold 32k-context
