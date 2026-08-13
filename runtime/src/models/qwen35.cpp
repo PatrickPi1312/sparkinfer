@@ -2204,10 +2204,18 @@ void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_t
     s.kv->free(seq_id);
     auto it = s.sessions.find(seq_id);
     if (it != s.sessions.end()) {
-        if (it->second.lin_state && it->second.lin_state != s.lin_state)
-            cudaFree(it->second.lin_state);
-        if (it->second.lin_conv_state && it->second.lin_conv_state != s.lin_conv_state)
-            cudaFree(it->second.lin_conv_state);
+        // open_session() only ever stores a freshly cudaMalloc'd, uniquely-owned buffer here
+        // (seq_id == 0 -- the one case that could alias the model's persistent default buffers
+        // -- returns before this point, see the guard at the top of this function). A `!=
+        // s.lin_state` check used to gate these frees, but activate_session(seq_id) (called at
+        // the top of every ContinuousBatchEngine::step_job, before finish_job/close_session runs
+        // later in that same call) unconditionally aliases s.lin_state to *this* session's own
+        // buffer -- so by the time close_session() ran, the two pointers were always equal and
+        // the free was always skipped. Every hybrid-model (Muse Glimmer, Qwen3.6) request via the
+        // server leaked its full lin_state/lin_conv_state allocation, permanently, confirmed live
+        // as a fixed ~108 MiB/request leak independent of token count (#779).
+        if (it->second.lin_state) cudaFree(it->second.lin_state);
+        if (it->second.lin_conv_state) cudaFree(it->second.lin_conv_state);
         s.sessions.erase(it);
     }
     if (s.active_seq_id == seq_id) activate_session(0);
