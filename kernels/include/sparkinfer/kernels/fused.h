@@ -88,6 +88,20 @@ void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab,
 void launch_logit_softcap(float* logits, int n_rows, int vocab, float scale, float cap,
                           cudaStream_t stream = nullptr);
 
+// Gumbel-max temperature sampling, mutating logits in place before argmax:
+//   logits[v] = logits[v] / *temp_f32 - log(-log(curand_uniform(Philox(seed, row*vocab+v, step))))
+// temp/seed/step are read from device memory on EVERY launch (not baked into a CUDA graph node
+// at capture time), so one captured decode graph can safely replay this across separate requests
+// with different temperature/seed values without re-capturing. *temp_f32 <= 0 is a cheap internal
+// no-op (logits left untouched, byte-identical to plain greedy argmax) -- callers on a
+// CUDA-graph-captured path must always launch this unconditionally rather than host-gating on
+// temperature, since the graph's node topology is frozen at capture time and may be replayed for
+// a later request with a different temperature. logits: [n_rows, vocab] (fp32), same buffer
+// launch_argmax reads next.
+void launch_temperature_sample(float* logits, int n_rows, int vocab,
+                               const float* temp_f32, const unsigned long long* seed_u64,
+                               const unsigned long long* step_u64, cudaStream_t stream = nullptr);
+
 // Benchmark-only decode feedback: tok = out_id; pos/writepos/seqlen += 1.
 // Capturable, so a decode CUDA graph can self-feed during throughput timing.
 void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream = nullptr);

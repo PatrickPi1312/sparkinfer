@@ -18,9 +18,12 @@ using sparkinfer_server::ResponseFormat;
 using sparkinfer_server::ResponseFormatType;
 using sparkinfer_server::ToolChoiceMode;
 using sparkinfer_server::ToolCall;
+using sparkinfer_server::RequestControls;
 using sparkinfer_server::apply_qwen36_tools_template;
 using sparkinfer_server::parse_chat_request_json;
 using sparkinfer_server::parse_qwen36_tool_output;
+using sparkinfer_server::parse_request_controls;
+using sparkinfer_server::should_reject_dflash_temperature;
 using sparkinfer_server::validate_response_format;
 
 #define CHECK(expr)                                                                            \
@@ -925,6 +928,47 @@ bool test_validate_response_format_json_schema() {
     return true;
 }
 
+bool test_request_controls_temperature_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(controls.temperature == 0.f);
+    CHECK(parse_request_controls(R"({"temperature":0})", controls, err));
+    CHECK(controls.temperature == 0.f);
+    CHECK(parse_request_controls(R"({"temperature":0.7})", controls, err));
+    CHECK(controls.temperature > 0.69f && controls.temperature < 0.71f);
+    CHECK(parse_request_controls(R"({"temperature":2.0})", controls, err));
+    CHECK(controls.temperature == 2.0f);
+    CHECK(!parse_request_controls(R"({"temperature":-0.1})", controls, err));
+    CHECK(!parse_request_controls(R"({"temperature":2.1})", controls, err));
+    CHECK(!parse_request_controls(R"({"temperature":"high"})", controls, err));
+    CHECK(!parse_request_controls(R"({"temperature":null,"stream":"not a bool"})", controls, err));
+    return true;
+}
+
+bool test_request_controls_seed_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(!controls.seed_set);
+    CHECK(parse_request_controls(R"({"seed":0})", controls, err));
+    CHECK(controls.seed_set && controls.seed == 0);
+    CHECK(parse_request_controls(R"({"seed":42})", controls, err));
+    CHECK(controls.seed_set && controls.seed == 42);
+    CHECK(parse_request_controls(R"({"seed":9007199254740993})", controls, err));  // > 2^53
+    CHECK(controls.seed_set && controls.seed == 9007199254740993ULL);
+    CHECK(!parse_request_controls(R"({"seed":-1})", controls, err));
+    CHECK(!parse_request_controls(R"({"seed":1.5})", controls, err));
+    return true;
+}
+
+bool test_should_reject_dflash_temperature() {
+    CHECK(!should_reject_dflash_temperature(/*dflash_env_on=*/false, /*temperature=*/0.7f));
+    CHECK(!should_reject_dflash_temperature(/*dflash_env_on=*/true, /*temperature=*/0.f));
+    CHECK(should_reject_dflash_temperature(/*dflash_env_on=*/true, /*temperature=*/0.7f));
+    return true;
+}
+
 bool test_plain_answer() {
     ChatRequest request;
     CHECK(parse_request(hermes_request(), request));
@@ -1138,6 +1182,9 @@ int main() {
     if (!test_response_format_text_is_a_prompt_noop()) return 1;
     if (!test_validate_response_format_json_object()) return 1;
     if (!test_validate_response_format_json_schema()) return 1;
+    if (!test_request_controls_temperature_validation()) return 1;
+    if (!test_request_controls_seed_validation()) return 1;
+    if (!test_should_reject_dflash_temperature()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
     if (!test_unsafe_protocol_names()) return 1;

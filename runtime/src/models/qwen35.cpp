@@ -177,6 +177,14 @@ struct Qwen35Model::Impl {
     int *d_scalars, *d_tok, *d_out_id, *d_pos, *d_seqlen, *d_writepos, *d_shared_ids;
     int *d_cap_row = nullptr;   // dflash capture row, packed into d_scalars[4]
     int *h_scalars = nullptr, *h_out_id = nullptr;
+    // Temperature-sampling params, refreshed via cudaMemcpyAsync before every forward_token call
+    // (same pattern as h_scalars/d_scalars above) so a captured decode graph can safely replay
+    // across separate requests/sessions with different temperature/seed -- see fused.h /
+    // launch_temperature_sample's doc comment for why these can't be plain kernel arguments.
+    float* h_sample_temp = nullptr;
+    unsigned long long *h_sample_seed = nullptr, *h_sample_step = nullptr;
+    float* d_sample_temp = nullptr;
+    unsigned long long *d_sample_seed = nullptr, *d_sample_step = nullptr;
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
     // GGUF fused-expert decode scratch (allocated by load_gguf)
@@ -342,6 +350,13 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->d_out_id=p_->alloc<int>(1);
     cu(cudaHostAlloc(&p_->h_scalars, 5 * sizeof(int), cudaHostAllocDefault), "host scalars");
     cu(cudaHostAlloc(&p_->h_out_id, sizeof(int), cudaHostAllocDefault), "host out id");
+    p_->d_sample_temp=p_->alloc<float>(1);
+    p_->d_sample_seed=p_->alloc<unsigned long long>(1);
+    p_->d_sample_step=p_->alloc<unsigned long long>(1);
+    cu(cudaHostAlloc(&p_->h_sample_temp, sizeof(float), cudaHostAllocDefault), "host sample temp");
+    cu(cudaHostAlloc(&p_->h_sample_seed, sizeof(unsigned long long), cudaHostAllocDefault), "host sample seed");
+    cu(cudaHostAlloc(&p_->h_sample_step, sizeof(unsigned long long), cudaHostAllocDefault), "host sample step");
+    *p_->h_sample_temp = 0.f;
     p_->d_shared_ids=p_->alloc<int>(1); p_->d_shared_w=p_->alloc<float>(1);
     int zero=0; float one=1.f;
     cu(cudaMemcpy(p_->d_shared_ids,&zero,sizeof(int),cudaMemcpyHostToDevice),"shared ids");
@@ -465,6 +480,8 @@ Qwen35Model::~Qwen35Model() {
     // main's packed decode scalars (d_tok/d_pos/d_seqlen/d_writepos alias into d_scalars — not freed separately)
     cudaFree(p_->d_scalars); cudaFree(p_->d_out_id);
     cudaFreeHost(p_->h_scalars); cudaFreeHost(p_->h_out_id);
+    cudaFree(p_->d_sample_temp); cudaFree(p_->d_sample_seed); cudaFree(p_->d_sample_step);
+    cudaFreeHost(p_->h_sample_temp); cudaFreeHost(p_->h_sample_seed); cudaFreeHost(p_->h_sample_step);
     cudaFree(p_->d_shared_ids); cudaFree(p_->d_shared_w);
     // Qwen3.6 Gated-DeltaNet buffers (allocated only for the hybrid model)
     cudaFree(p_->qraw); cudaFree(p_->qgate);
@@ -558,7 +575,8 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
     return want;
 }
 
-int Qwen35Model::forward_token(int token_id, int position, bool sample) {
+int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
+                               unsigned long long seed, unsigned long long sample_step) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -608,6 +626,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     s.h_scalars[3] = seqlen;
     s.h_scalars[4] = s.dflash_cap_row;
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 5 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
+    // Refreshed on every call (both capture and replay paths) so the decode graph's sampling
+    // kernel -- always launched unconditionally inside the captured region, see below -- picks
+    // up THIS call's temperature/seed/step rather than whatever was baked in at capture time.
+    *s.h_sample_temp = temperature;
+    *s.h_sample_seed = seed;
+    *s.h_sample_step = sample_step;
+    cu(cudaMemcpyAsync(s.d_sample_temp, s.h_sample_temp, sizeof(float), cudaMemcpyHostToDevice, st), "sample temp");
+    cu(cudaMemcpyAsync(s.d_sample_seed, s.h_sample_seed, sizeof(unsigned long long), cudaMemcpyHostToDevice, st), "sample seed");
+    cu(cudaMemcpyAsync(s.d_sample_step, s.h_sample_step, sizeof(unsigned long long), cudaMemcpyHostToDevice, st), "sample step");
 
     // Depth-adaptive KV-split (see adaptive_nsplits_for() above for the tiers/occupancy math).
     // DFlash DECODE: freeze n_splits once an actual dflash verify graph is captured. Adapting it
@@ -1660,6 +1687,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
     if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
         kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
     dbg_f32(s.logits, c.vocab, 91, -2);   // tag 91: final logits (post logit_scale/softcap)
+    // Always launched, never host-gated on temperature: this call site is inside a CUDA graph
+    // whose node topology is frozen at capture time and may be replayed for a LATER, separate
+    // request (e.g. via use_prefix_session's shared seq_id=0) with a different temperature. The
+    // kernel itself reads temperature from device memory refreshed above and no-ops when <= 0.
+    kernels::launch_temperature_sample(s.logits, 1, c.vocab, s.d_sample_temp, s.d_sample_seed,
+                                       s.d_sample_step, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
@@ -2243,6 +2276,17 @@ void Qwen35Model::activate_session(uint64_t seq_id) {
 
 uint64_t Qwen35Model::active_session() const { return p_->active_seq_id; }
 
+// Greedy-only: this and dflash_generate() are never called from sparkinfer_server (which drives
+// generation through ContinuousBatchEngine::step_job -> forward_token() directly, never through
+// here -- confirmed, see inference_engine.cpp). Temperature sampling is deliberately NOT threaded
+// into generate()/dflash_generate() or their CLI/bench callers (qwen3_gguf_generate,
+// qwen3_gguf_dflash_bench, qwen3_gguf_dflash_check) for exactly this reason -- DFlash's verify
+// step (qwen35_prefill.cpp's dflash_verify_short_run) requires exact greedy-argmax determinism
+// against the draft model's own greedy proposal (see its own comments), and there is currently no
+// guard here against calling this with a temperature-sampling caller. If DFlash is ever wired
+// into step_job() (see inference_engine.h's TODO) or a CLI flag adds temperature/seed to these
+// bench binaries, that future work must add its own guard here -- the HTTP-layer 400 in
+// sparkinfer_server.cpp only protects the path that actually goes through step_job today.
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov,
                                        double* out_ttft_s, double* out_decode_s) {
     Impl& s = *p_;

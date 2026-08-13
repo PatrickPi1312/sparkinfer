@@ -31,6 +31,13 @@ public:
         int priority = 0;
         int prefill_start = 0;          // skip tokens already in a shared prefix cache
         bool use_prefix_session = false; // bind to session 0 (cache_prefix KV)
+        // <= 0 (default) is plain greedy argmax, byte-identical to pre-sampling behavior. > 0
+        // samples via Gumbel-max (Qwen35Model::forward_token). Note: the prefill-phase seed
+        // token (the very first token of the response) is always greedy regardless of this
+        // value -- see step_job()'s PREFILL branch comment; every token from the second onward
+        // respects it.
+        float temperature = 0.f;
+        uint64_t seed = 0;              // only meaningful when temperature > 0
     };
 
     struct Result {

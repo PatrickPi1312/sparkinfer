@@ -326,6 +326,14 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
                                                       chunk_limit, &out_pos);
         job.prefill_pos = out_pos;
         if (job.prefill_pos >= n) {
+            // Known v1 scope limitation for temperature sampling (runtime/src/models/qwen35.cpp's
+            // forward_token doc comment): ingest_prompt_range() is a single funnel shared by
+            // cache_prefix()'s exclusive-session path and several other internal call sites, so
+            // its own argmax seed pick is not made temperature-aware here -- threading it through
+            // would mean changing a widely-shared function for the benefit of exactly one token.
+            // Concretely: the FIRST emitted token of every response is always the greedy/argmax
+            // token regardless of `temperature`; every token from the second one onward (all of
+            // which flow through forward_token() below) correctly respects temperature/seed.
             job.next_token = seed;
             if (job.next_token < 0 && job.req.use_prefix_session)
                 job.next_token = model_->prefix_seed_token();
@@ -378,7 +386,9 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     }
 
     const int prompt_len = (int)job.req.prompt.size();
-    job.next_token = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true);
+    job.next_token = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true,
+                                           job.req.temperature, job.req.seed,
+                                           (uint64_t)job.decode_emitted);
     return false;
 }
 

@@ -181,7 +181,15 @@ public:
     // norm without LM head/argmax and without CUDA-graph capture — teacher-forced ingestion.
     // When sample=true (decode / last prompt token), runs the full path and may capture/replay
     // the decode graph. Returns argmax next-token id when sample=true, else token_id.
-    int forward_token(int token_id, int position, bool sample = true);
+    //
+    // temperature <= 0 (the default) is plain greedy argmax, byte-identical to the pre-sampling
+    // behavior. temperature > 0 draws via Gumbel-max (kernels::launch_temperature_sample) before
+    // the argmax reduction; seed/sample_step select the draw -- sample_step must be a fresh,
+    // request-scoped, 0-based decode-step counter (ContinuousBatchEngine::Job::decode_emitted is
+    // the intended source) so the SAME captured decode graph can be replayed across separate
+    // requests/sessions with different temperature/seed without invalidating reproducibility.
+    int forward_token(int token_id, int position, bool sample = true, float temperature = 0.f,
+                      unsigned long long seed = 0, unsigned long long sample_step = 0);
 
     // Copy the most recent step's logits (vocab floats) to host. Valid after a
     // forward_token() call. Used for teacher-forced scoring (perplexity / KL).

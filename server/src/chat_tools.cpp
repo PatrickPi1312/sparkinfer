@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <re2/re2.h>
 #include <set>
@@ -1034,6 +1035,120 @@ bool validate_response_format(const std::string& content, const ResponseFormat& 
     if (!parse_strict_json(content, parsed, err, "response")) return false;
     if (format.type == ResponseFormatType::kJsonObject) return true;
     return validate_value(parsed, format.schema, "response", err);
+}
+
+bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err) {
+    const auto root = json::parse(body, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) {
+        err = "request body must be a JSON object";
+        return false;
+    }
+    if (root.contains("stream")) {
+        if (!root["stream"].is_boolean()) {
+            err = "stream must be a boolean";
+            return false;
+        }
+        out.stream = root["stream"].get<bool>();
+    }
+    const char* max_key = root.contains("max_completion_tokens") ? "max_completion_tokens" : "max_tokens";
+    if (root.contains(max_key)) {
+        const auto& value = root[max_key];
+        if (!value.is_number_integer() && !value.is_number_unsigned()) {
+            err = std::string(max_key) + " must be a positive integer";
+            return false;
+        }
+        try {
+            const auto requested = value.get<long long>();
+            if (requested <= 0 || requested > std::numeric_limits<int>::max()) {
+                err = std::string(max_key) + " is outside the supported range";
+                return false;
+            }
+            out.max_tokens = static_cast<int>(requested);
+        } catch (const json::exception&) {
+            err = std::string(max_key) + " is outside the supported range";
+            return false;
+        }
+    }
+    if (root.contains("stop") && !root["stop"].is_null()) {
+        const auto& value = root["stop"];
+        std::vector<std::string> stops;
+        if (value.is_string()) {
+            stops.push_back(value.get<std::string>());
+        } else if (value.is_array()) {
+            for (const auto& item : value) {
+                if (!item.is_string()) {
+                    err = "stop entries must be strings";
+                    return false;
+                }
+                stops.push_back(item.get<std::string>());
+            }
+        } else {
+            err = "stop must be a string or an array of strings";
+            return false;
+        }
+        if (stops.size() > 4) {
+            err = "stop supports at most 4 strings";
+            return false;
+        }
+        for (const auto& s : stops) {
+            if (s.empty()) {
+                err = "stop entries must be non-empty strings";
+                return false;
+            }
+        }
+        out.stop = std::move(stops);
+    }
+    if (root.contains("stream_options")) {
+        if (!root["stream_options"].is_object()) {
+            err = "stream_options must be an object";
+            return false;
+        }
+        const auto& opts = root["stream_options"];
+        if (opts.contains("include_usage")) {
+            if (!opts["include_usage"].is_boolean()) {
+                err = "stream_options.include_usage must be a boolean";
+                return false;
+            }
+            out.include_usage = opts["include_usage"].get<bool>();
+        }
+    }
+    if (root.contains("temperature") && !root["temperature"].is_null()) {
+        const auto& value = root["temperature"];
+        if (!value.is_number()) {
+            err = "temperature must be a number";
+            return false;
+        }
+        const double t = value.get<double>();
+        if (!(t >= 0.0) || !(t <= 2.0)) {  // NaN-safe: comparisons against NaN are false either way
+            err = "temperature must be between 0.0 and 2.0";
+            return false;
+        }
+        out.temperature = static_cast<float>(t);
+    }
+    if (root.contains("seed") && !root["seed"].is_null()) {
+        const auto& value = root["seed"];
+        if (!value.is_number_integer() && !value.is_number_unsigned()) {
+            err = "seed must be an integer";
+            return false;
+        }
+        try {
+            const auto requested = value.get<long long>();
+            if (requested < 0) {
+                err = "seed must be non-negative";
+                return false;
+            }
+            out.seed = static_cast<uint64_t>(requested);
+            out.seed_set = true;
+        } catch (const json::exception&) {
+            err = "seed is outside the supported range";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool should_reject_dflash_temperature(bool dflash_env_on, float temperature) {
+    return dflash_env_on && temperature > 0.f;
 }
 
 std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking) {

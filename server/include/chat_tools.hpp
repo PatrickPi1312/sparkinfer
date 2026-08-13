@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,27 @@ struct ParsedToolOutput {
 };
 
 bool parse_chat_request_json(const std::string& body, ChatRequest& request, std::string& err);
+
+// Decode-control fields that don't influence prompt construction (unlike ChatRequest's
+// tools/response_format, which do) -- extracted here rather than kept private to
+// sparkinfer_server.cpp so parsing/validation has a unit-test seam without a running server/GPU.
+struct RequestControls {
+    bool stream = false;
+    bool include_usage = false;
+    int max_tokens = 256;
+    std::vector<std::string> stop;
+    // <= 0 (default) is plain greedy argmax, byte-identical to pre-sampling behavior.
+    float temperature = 0.f;
+    uint64_t seed = 0;       // only meaningful when seed_set
+    bool seed_set = false;   // client explicitly supplied `seed`; false => caller should generate one
+};
+
+bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err);
+
+// Pure decision function for the DFlash+temperature-sampling incompatibility (kept separate from
+// getenv() so it's unit-testable without a process-wide env var): true => the request should be
+// rejected with 400. temperature<=0 is always accepted regardless of dflash_env_on.
+bool should_reject_dflash_temperature(bool dflash_env_on, float temperature);
 
 // Best-effort validation only -- there is no constrained decoding in this backend, so this
 // cannot guarantee the model's output actually conforms; it just checks after the fact.

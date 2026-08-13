@@ -110,90 +110,9 @@ bool encode_messages(const std::string& body, std::vector<int>& ids, bool enable
     return g_tokenizer.encode_chat_request(body, ids, enable_thinking, err, request);
 }
 
-struct RequestControls {
-    bool stream = false;
-    bool include_usage = false;
-    int max_tokens = 256;
-    std::vector<std::string> stop;
-};
-
-bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err) {
-    const auto root = nlohmann::json::parse(body, nullptr, false);
-    if (root.is_discarded() || !root.is_object()) {
-        err = "request body must be a JSON object";
-        return false;
-    }
-    if (root.contains("stream")) {
-        if (!root["stream"].is_boolean()) {
-            err = "stream must be a boolean";
-            return false;
-        }
-        out.stream = root["stream"].get<bool>();
-    }
-    const char* max_key = root.contains("max_completion_tokens") ? "max_completion_tokens" : "max_tokens";
-    if (root.contains(max_key)) {
-        const auto& value = root[max_key];
-        if (!value.is_number_integer() && !value.is_number_unsigned()) {
-            err = std::string(max_key) + " must be a positive integer";
-            return false;
-        }
-        try {
-            const auto requested = value.get<long long>();
-            if (requested <= 0 || requested > std::numeric_limits<int>::max()) {
-                err = std::string(max_key) + " is outside the supported range";
-                return false;
-            }
-            out.max_tokens = static_cast<int>(requested);
-        } catch (const nlohmann::json::exception&) {
-            err = std::string(max_key) + " is outside the supported range";
-            return false;
-        }
-    }
-    if (root.contains("stop") && !root["stop"].is_null()) {
-        const auto& value = root["stop"];
-        std::vector<std::string> stops;
-        if (value.is_string()) {
-            stops.push_back(value.get<std::string>());
-        } else if (value.is_array()) {
-            for (const auto& item : value) {
-                if (!item.is_string()) {
-                    err = "stop entries must be strings";
-                    return false;
-                }
-                stops.push_back(item.get<std::string>());
-            }
-        } else {
-            err = "stop must be a string or an array of strings";
-            return false;
-        }
-        if (stops.size() > 4) {
-            err = "stop supports at most 4 strings";
-            return false;
-        }
-        for (const auto& s : stops) {
-            if (s.empty()) {
-                err = "stop entries must be non-empty strings";
-                return false;
-            }
-        }
-        out.stop = std::move(stops);
-    }
-    if (root.contains("stream_options")) {
-        if (!root["stream_options"].is_object()) {
-            err = "stream_options must be an object";
-            return false;
-        }
-        const auto& opts = root["stream_options"];
-        if (opts.contains("include_usage")) {
-            if (!opts["include_usage"].is_boolean()) {
-                err = "stream_options.include_usage must be a boolean";
-                return false;
-            }
-            out.include_usage = opts["include_usage"].get<bool>();
-        }
-    }
-    return true;
-}
+// RequestControls / parse_request_controls / should_reject_dflash_temperature now live in
+// chat_tools.hpp/.cpp (moved so `stop`/`temperature`/`seed` validation has a unit-test seam via
+// chat_tools_test, same as ChatRequest/parse_chat_request_json already had).
 
 // One-shot scan over a complete decoded string: is there a stop match anywhere, and where.
 // Unlike StopSequenceFilter, this needs no holdback machinery -- it's only ever called once
@@ -536,14 +455,33 @@ int main(int argc, char** argv) {
                  }
 
                  g_requests_total++;
-                 RequestControls controls;
+                 sparkinfer_server::RequestControls controls;
                  std::string err;
-                 if (!parse_request_controls(req.body, controls, err)) {
+                 if (!sparkinfer_server::parse_request_controls(req.body, controls, err)) {
                      g_requests_client_error++;
                      res.status = 400;
                      res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
                                      "application/json");
                      return;
+                 }
+                 // DFlash's verify step requires exact greedy-argmax determinism against the
+                 // draft model's own proposal -- real sampling can't coexist with it. DFlash is
+                 // a process-wide, env-var-gated toggle (not per-request), so this is checked
+                 // once per request against the process env, at validation time, before any
+                 // generation is attempted.
+                 if (sparkinfer_server::should_reject_dflash_temperature(
+                         [] { const char* e = getenv("SPARKINFER_DFLASH"); return e && e[0] == '1'; }(),
+                         controls.temperature)) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"temperature sampling is not supported "
+                                     "while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 if (!controls.seed_set) {
+                     static thread_local std::random_device rd;
+                     controls.seed = ((uint64_t)rd() << 32) | rd();
                  }
                  const bool stream = controls.stream;
                  if (stream) g_requests_streaming++;
@@ -605,7 +543,8 @@ int main(int argc, char** argv) {
                          "text/event-stream",
                          [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
                           chat_request, tool_protocol, json_mode_active,
-                          include_usage = controls.include_usage, stop = controls.stop]
+                          include_usage = controls.include_usage, stop = controls.stop,
+                          temperature = controls.temperature, seed = controls.seed]
                          (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
                                  sink.done();
@@ -651,7 +590,7 @@ int main(int argc, char** argv) {
                                          }
                                          return sink.is_writable();
                                      };
-                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok);
+                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, temperature, seed);
                                      total_prompt_tokens += (long long)cur_prompt_ids.size();
                                      total_completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
@@ -784,7 +723,7 @@ int main(int argc, char** argv) {
                                      ok = write_stream_delta(sink, cid, created, "content", delta.content) && ok;
                                  return ok && sink.is_writable();
                              };
-                             const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok);
+                             const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok, temperature, seed);
                              const int prompt_tokens = (int)prompt_ids.size();
                              const int completion_tokens = (int)stream_ids.size();
                              g_prompt_tokens_total += (uint64_t)prompt_tokens;
@@ -930,7 +869,7 @@ int main(int argc, char** argv) {
                              }
                              return true;
                          };
-                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok);
+                         outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok, controls.temperature, controls.seed);
                          total_prompt_tokens += (long long)cur_prompt_ids.size();
                          total_completion_tokens += (long long)ids.size();
                          if (!outcome.error.empty()) {
@@ -1004,7 +943,7 @@ int main(int argc, char** argv) {
                          }
                          return true;
                      };
-                     outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok);
+                     outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok, controls.temperature, controls.seed);
                      std::string text;
                      if (!outcome.error.empty()) {
                          res.status = record_and_status(outcome);

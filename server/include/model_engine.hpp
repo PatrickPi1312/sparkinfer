@@ -54,8 +54,13 @@ public:
     // Same, but invokes on_token after each generated token (for SSE streaming). on_token
     // returns false to cancel generation early (client disconnected); the result then comes
     // back with .cancelled = true, not an error.
+    //
+    // temperature <= 0 (default) is plain greedy argmax. > 0 samples via Gumbel-max -- see
+    // ContinuousBatchEngine::Request's doc comment for the reproducibility contract and the
+    // known "first token is always greedy" v1 scope limitation.
     CompletionResult complete_streaming(const std::vector<int>& prompt_ids, int max_new_tokens,
-                                        const std::function<bool(int)>& on_token);
+                                        const std::function<bool(int)>& on_token,
+                                        float temperature = 0.f, uint64_t seed = 0);
 
     // Live occupancy, for capacity-reporting endpoints. 0/0 if the model isn't loaded yet.
     int active_requests() const;
