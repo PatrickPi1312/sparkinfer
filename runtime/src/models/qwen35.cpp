@@ -2161,11 +2161,11 @@ int Qwen35Model::session_token_budget(size_t prompt_len, int max_new, int max_se
     return (int)need;
 }
 
-uint64_t Qwen35Model::open_session(int num_tokens) {
+uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
     Impl& s = *p_;
     if (num_tokens <= 0) return 0;
     const uint64_t seq_id = s.next_session_id.fetch_add(1);
-    if (!s.kv->allocate(seq_id, num_tokens)) return 0;
+    if (!s.kv->allocate(seq_id, num_tokens)) return 0;   // pool full -- normal, transient
     if (s.cfg.hybrid) {
         SessionBuffers buf;
         buf.lin_state = s.alloc<float>((size_t)s.cfg.n_layers * s.cfg.linear_v_heads *
@@ -2173,6 +2173,11 @@ uint64_t Qwen35Model::open_session(int num_tokens) {
         buf.lin_conv_state = s.alloc<bf16>((size_t)s.cfg.n_layers *
                                            (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim);
         if (!buf.lin_state || !buf.lin_conv_state) {
+            // A real cudaMalloc failure (already logged by alloc<T>'s cu() wrapper as
+            // "[qwen35] malloc: out of memory") -- not the KV pool being full, which was already
+            // checked above. Surfaced separately so callers can tell "genuinely no capacity right
+            // now" (retry later) apart from "device is out of memory" (permanent until restart).
+            if (alloc_failed) *alloc_failed = true;
             s.kv->free(seq_id);
             if (buf.lin_state) cudaFree(buf.lin_state);
             if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);

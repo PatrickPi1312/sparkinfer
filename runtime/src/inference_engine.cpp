@@ -114,7 +114,10 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
     if (!rid) {
         Result out;
         out.overloaded = (err == EnqueueError::OVERLOADED);
+        out.alloc_failed = (err == EnqueueError::ALLOC_FAILED);
         out.error = out.overloaded ? "server overloaded: no capacity for this request right now"
+                  : out.alloc_failed ? "device out of memory (not a capacity/queue condition -- "
+                                        "requires operator attention)"
                                     : "failed to enqueue request";
         return out;
     }
@@ -158,8 +161,9 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
         model_->activate_session(seq_id);
     } else {
-        seq_id = model_->open_session(budget);
-        if (!seq_id) return fail(EnqueueError::OVERLOADED);
+        bool alloc_failed = false;
+        seq_id = model_->open_session(budget, &alloc_failed);
+        if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
     }
 
     job.request_id = next_req_id_.fetch_add(1);

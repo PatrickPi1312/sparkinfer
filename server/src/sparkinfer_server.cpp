@@ -42,6 +42,7 @@ std::atomic<uint64_t> g_requests_streaming{0};
 std::atomic<uint64_t> g_requests_ok{0};
 std::atomic<uint64_t> g_requests_client_error{0};   // 4xx
 std::atomic<uint64_t> g_requests_overloaded{0};     // 429
+std::atomic<uint64_t> g_requests_alloc_failed{0};   // 503 -- real device OOM, not capacity (#779)
 std::atomic<uint64_t> g_requests_timeout{0};
 std::atomic<uint64_t> g_requests_cancelled{0};
 std::atomic<uint64_t> g_requests_server_error{0};   // 5xx
@@ -307,6 +308,8 @@ int main(int argc, char** argv) {
              << g_requests_client_error.load() << "\n"
              << "sparkinfer_requests_by_outcome_total{outcome=\"overloaded\"} "
              << g_requests_overloaded.load() << "\n"
+             << "sparkinfer_requests_by_outcome_total{outcome=\"alloc_failed\"} "
+             << g_requests_alloc_failed.load() << "\n"
              << "sparkinfer_requests_by_outcome_total{outcome=\"timeout\"} "
              << g_requests_timeout.load() << "\n"
              << "sparkinfer_requests_by_outcome_total{outcome=\"cancelled\"} "
@@ -416,10 +419,15 @@ int main(int argc, char** argv) {
 
                  // Maps an engine outcome to the metrics bucket + HTTP status a non-2xx response
                  // should use. Overloaded -> 429 (retry elsewhere / later, not a bad request).
+                 // Alloc failed -> 503 (real device OOM -- permanent until restart, never imply
+                 // "retry shortly" like 429 does; #779, where this used to fall through to the
+                 // same 429 as a full queue and sent operators chasing SPARKINFER_MAX_QUEUE_DEPTH
+                 // for nothing while the actual queue sat empty).
                  // Timed out -> 504 (the request was valid, the server just didn't finish in time).
                  auto record_and_status = [](const sparkinfer_server::CompletionResult& o) -> int {
-                     if (o.overloaded) { g_requests_overloaded++; return 429; }
-                     if (o.timed_out)  { g_requests_timeout++;    return 504; }
+                     if (o.overloaded)    { g_requests_overloaded++;   return 429; }
+                     if (o.alloc_failed)  { g_requests_alloc_failed++; return 503; }
+                     if (o.timed_out)     { g_requests_timeout++;      return 504; }
                      g_requests_server_error++;
                      return 400;
                  };
@@ -466,6 +474,7 @@ int main(int argc, char** argv) {
                              write_stream_delta(sink, cid, created, "content", flush.content);
                              if (!outcome.error.empty()) {
                                  if (outcome.overloaded) g_requests_overloaded++;
+                                 else if (outcome.alloc_failed) g_requests_alloc_failed++;
                                  else if (outcome.timed_out) g_requests_timeout++;
                                  else g_requests_server_error++;
                                  std::ostringstream err_chunk;

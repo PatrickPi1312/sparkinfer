@@ -15,6 +15,8 @@ struct CompletionResult {
     std::vector<int> tokens;
     std::string error;  // empty on success
     bool overloaded = false;  // true => caller should return 429, not a generic 4xx
+    bool alloc_failed = false;  // true => real device OOM, not capacity -- caller should return
+                                 // 503 (permanent until restart), never 429 (implies transient/retry)
     bool timed_out = false;   // true => a per-request deadline was exceeded
     bool cancelled = false;   // true => on_token returned false; not an error
     double ttft_ms = -1.0;

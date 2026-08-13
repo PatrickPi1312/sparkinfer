@@ -222,7 +222,12 @@ public:
     // Per-request session lifecycle for continuous batching / serving.
     // open_session() allocates right-sized KV blocks (+ hybrid recurrent state when needed).
     // activate_session() binds forward_token / prefill to that seq_id. Returns 0 on OOM.
-    uint64_t open_session(int num_tokens);
+    // alloc_failed, when non-null, is set true only when a real device allocation failed (a
+    // cudaMalloc for the hybrid recurrent-state buffers) -- distinct from the KV block pool
+    // simply being full, which is a normal, transient "no capacity right now" and leaves
+    // *alloc_failed untouched. Callers that care about this distinction (ContinuousBatchEngine,
+    // to report 503 instead of 429 -- #779) should zero-init their bool before passing it in.
+    uint64_t open_session(int num_tokens, bool* alloc_failed = nullptr);
     // store_tokens, when non-null and an LMCache bridge is attached, stores this session's KV
     // for [0, store_tokens->size()) to the bridge (chunk-aligned, see lmcache_maybe_store in
     // qwen35.cpp) before freeing it -- the "session close" eviction point. Most callers don't

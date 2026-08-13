@@ -39,6 +39,12 @@ public:
         // true => caller should surface 429 (no capacity right now), not a generic 4xx —
         // the request itself was fine, there was just nowhere to run it.
         bool overloaded = false;
+        // true => a real device allocation failed (distinct from the KV pool being full, which
+        // sets `overloaded` instead) -- caller should surface 503, not 429: this condition is
+        // permanent until the process restarts, not a transient "try again shortly" (#779, where
+        // a leak eventually exhausted VRAM and every subsequent request got a misleading 429
+        // "overloaded" even though the queue was empty and the KV pool had free blocks).
+        bool alloc_failed = false;
         // true => a per-request deadline (SPARKINFER_REQUEST_TIMEOUT_S) was exceeded.
         bool timed_out = false;
         // true => on_token returned false (client went away mid-stream); not an error.
@@ -73,7 +79,7 @@ public:
 
 private:
     struct Job;
-    enum class EnqueueError { NONE, BAD_REQUEST, OVERLOADED };
+    enum class EnqueueError { NONE, BAD_REQUEST, OVERLOADED, ALLOC_FAILED };
     uint64_t submit_locked(Job job, const std::function<bool(int)>& on_token, EnqueueError* err_out);
     Result wait_locked(uint64_t request_id);
     void worker_loop();

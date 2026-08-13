@@ -207,8 +207,19 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     kvc.head_dim = impl_->cfg.head_dim;
     kvc.block_size = 16;
     { const char* e = getenv("SPARKINFER_KV_INT8");
+      // Muse Glimmer: int8 KV cache is a confirmed correctness bug, not a precision tradeoff --
+      // incoherent output from the very first decode token (#779), root-caused to its per-layer
+      // sliding-window/NoPE alternation + sandwich-norm activations not matching what the int8
+      // quantize/dequantize kernels were tuned against (Qwen3.6, same cfg.hybrid=true, is
+      // unaffected). The CLI tools never caught this because their short eval prompts (<4096
+      // tokens) always fell under the bf16 threshold below; the server activates int8 off its
+      // configured max_seq (there's no per-request length at KV-pool-init time), and the default
+      // max_seq (4096) satisfies ">=4096" unconditionally, so every default-config Muse Glimmer
+      // server silently served garbage. Default to bf16 until the kernel bug itself is fixed;
+      // SPARKINFER_KV_INT8=1 still force-enables it for anyone debugging that fix.
       kvc.int8_kv = e ? (e[0] != '0')
-                      : (impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
+                      : (impl_->cfg.muse_glimmer ? false
+                         : impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
     const size_t epb = (size_t)16 * impl_->cfg.n_kv_heads * impl_->cfg.head_dim;
     const size_t blocks = (size_t)impl_->cfg.max_seq / 16 + 8;
     impl_->kv = std::make_unique<sparkinfer::KVCacheManager>(
@@ -421,6 +432,7 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
 
     std::lock_guard<std::mutex> lock(mu_);
     out.overloaded = result.overloaded;
+    out.alloc_failed = result.alloc_failed;
     out.timed_out = result.timed_out;
     out.cancelled = result.cancelled;
     out.ttft_ms = result.ttft_ms;

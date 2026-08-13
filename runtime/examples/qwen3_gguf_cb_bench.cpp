@@ -86,8 +86,12 @@ int main(int argc, char** argv) {
     kvc.head_dim = cfg.head_dim;
     kvc.block_size = 16;
     {
+        // Same Muse Glimmer int8-KV correctness carve-out as server/src/model_engine.cpp (#779)
+        // -- this tool exercises the same ContinuousBatchEngine/KV-pool path, so it would hit the
+        // identical bug otherwise.
         const char* e = getenv("SPARKINFER_KV_INT8");
-        kvc.int8_kv = e ? (e[0] != '0') : (cfg.hybrid ? (cfg.max_seq >= 4096) : true);
+        kvc.int8_kv = e ? (e[0] != '0')
+                        : (cfg.muse_glimmer ? false : cfg.hybrid ? (cfg.max_seq >= 4096) : true);
     }
     const size_t epb = (size_t)16 * cfg.n_kv_heads * cfg.head_dim;
     // Pool for concurrency streams + one long prefill.
