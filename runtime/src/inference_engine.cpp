@@ -56,6 +56,14 @@ struct ContinuousBatchEngine::Job {
     std::vector<int> output;
     std::string error;
     std::function<bool(int)> on_token;  // false return = cancel
+    // Optional. Delivered one step_job() call AFTER forward_token() actually computed it -- see
+    // step_job()'s implementation for why (worker_loop() interleaves step_job() across jobs
+    // sharing one Qwen35Model instance, so the logprobs data must be read out of the model's
+    // shared decode scratch synchronously, within the SAME step_job() call that produced it,
+    // before any other job's forward_token() can overwrite that scratch).
+    std::function<void(const Qwen35Model::TokenLogprob&)> on_token_logprob;
+    Qwen35Model::TokenLogprob pending_logprob;
+    bool have_pending_logprob = false;
     bool done = false;
     bool overloaded = false;
     bool timed_out = false;
@@ -102,7 +110,8 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete(const Request& req
 }
 
 ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
-    const Request& req, const std::function<bool(int)>& on_token) {
+    const Request& req, const std::function<bool(int)>& on_token,
+    const std::function<void(const Qwen35Model::TokenLogprob&)>& on_token_logprob) {
     uint64_t rid = 0;
     EnqueueError err = EnqueueError::NONE;
     {
@@ -110,7 +119,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
         Job job;
         job.req = req;
         job.prefill_pos = req.prefill_start;
-        rid = submit_locked(std::move(job), on_token, &err);
+        rid = submit_locked(std::move(job), on_token, on_token_logprob, &err);
     }
     if (!rid) {
         Result out;
@@ -137,6 +146,7 @@ int ContinuousBatchEngine::num_free_kv_blocks() const { return kv_->num_free_blo
 int ContinuousBatchEngine::max_queue_depth() const { return max_queue_depth_config(); }
 
 uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(int)>& on_token,
+                                              const std::function<void(const Qwen35Model::TokenLogprob&)>& on_token_logprob,
                                               EnqueueError* err_out) {
     EnqueueError err = EnqueueError::BAD_REQUEST;
     auto fail = [&](EnqueueError e) { if (err_out) *err_out = e; return uint64_t{0}; };
@@ -170,6 +180,7 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
     job.request_id = next_req_id_.fetch_add(1);
     job.seq_id = seq_id;
     job.on_token = on_token;
+    job.on_token_logprob = on_token_logprob;
     job.prefill_pos = job.req.prefill_start;
     job.t_submit = std::chrono::steady_clock::now();
     auto ptr = std::make_unique<Job>(std::move(job));
@@ -360,6 +371,13 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     }
     job.output.push_back(job.next_token);
     job.decode_emitted++;
+    // Delivered one step_job() call after forward_token() computed it (see Job::on_token_logprob's
+    // doc comment) -- must fire BEFORE on_token below, since job.next_token is exactly the token
+    // this pending_logprob describes.
+    if (job.on_token_logprob && job.have_pending_logprob) {
+        job.on_token_logprob(job.pending_logprob);
+        job.have_pending_logprob = false;
+    }
     // false => caller (e.g. the HTTP layer, when the client disconnected mid-stream) wants
     // generation stopped now. Not an error -- free resources same as a normal finish.
     if (job.on_token && !job.on_token(job.next_token)) {
@@ -390,6 +408,13 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
                                            job.req.temperature, job.req.seed,
                                            (uint64_t)job.decode_emitted,
                                            job.req.top_k, job.req.top_p);
+    // Must run in THIS step_job() call, synchronously, before any OTHER job's forward_token()
+    // (worker_loop() interleaves jobs sharing one Qwen35Model instance) can overwrite the shared
+    // decode scratch last_token_logprobs() reads from. See Job::on_token_logprob's doc comment.
+    if (job.req.logprobs && job.on_token_logprob) {
+        job.pending_logprob = model_->last_token_logprobs(job.req.top_logprobs);
+        job.have_pending_logprob = true;
+    }
     return false;
 }
 

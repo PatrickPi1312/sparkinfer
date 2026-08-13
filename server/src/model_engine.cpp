@@ -366,7 +366,10 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
                                                  int max_new_tokens,
                                                  const std::function<bool(int)>& on_token,
                                                  float temperature, uint64_t seed,
-                                                 int top_k, float top_p) {
+                                                 int top_k, float top_p,
+                                                 bool logprobs, int top_logprobs,
+                                                 const std::function<void(const TokenLogprob&)>&
+                                                     on_token_logprob) {
     CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
@@ -375,6 +378,8 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     req.seed = seed;
     req.top_k = top_k;
     req.top_p = top_p;
+    req.logprobs = logprobs;
+    req.top_logprobs = top_logprobs;
 
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -434,7 +439,22 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     // complete_streaming releases the engine mutex above so other HTTP workers can enqueue.
     // Errors must travel with this stack frame — a shared last_error_ slot would let one
     // request clear or observe another request's failure under concurrency.
-    auto result = impl_->batch_engine->complete_streaming(req, on_token);
+    //
+    // Pass nullptr straight through (not a lambda that internally no-ops) when the caller didn't
+    // ask for logprobs -- ContinuousBatchEngine::step_job()'s cost gate is
+    // `req.logprobs && on_token_logprob`, so an always-non-null glue lambda here would defeat the
+    // "logprobs=false costs nothing extra" property this whole design depends on.
+    std::function<void(const sparkinfer::Qwen35Model::TokenLogprob&)> glue_logprob;
+    if (on_token_logprob) {
+        glue_logprob = [&on_token_logprob](const sparkinfer::Qwen35Model::TokenLogprob& tl) {
+            TokenLogprob mirrored;
+            mirrored.token_id = tl.token_id;
+            mirrored.logprob = tl.logprob;
+            mirrored.top_alternatives = tl.top_alternatives;
+            on_token_logprob(mirrored);
+        };
+    }
+    auto result = impl_->batch_engine->complete_streaming(req, on_token, glue_logprob);
 
     std::lock_guard<std::mutex> lock(mu_);
     out.overloaded = result.overloaded;

@@ -85,6 +85,12 @@ struct RequestControls {
     // ContinuousBatchEngine::Request's doc comment for the inertness proof.
     int top_k = 0;
     float top_p = 1.0f;
+    // logprobs=false (default) attaches no logprobs field anywhere in the response. top_logprobs
+    // is only meaningful when logprobs is true -- unlike top_k/top_p, this IS cross-validated
+    // against a sibling field: parse_request_controls rejects top_logprobs supplied without
+    // logprobs=true (matches OpenAI's own documented constraint).
+    bool logprobs = false;
+    int top_logprobs = 0;   // 0-20 when logprobs=true
 };
 
 bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err);

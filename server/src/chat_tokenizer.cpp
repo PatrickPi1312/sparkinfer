@@ -4,14 +4,115 @@
 #include <tokenizers_cpp.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 
 namespace sparkinfer_server {
 namespace {
+
+// Standard GPT-2/ByteLevel-BPE byte<->unicode table (the same fixed 256-entry mapping used by
+// every ByteLevel BPE tokenizer, e.g. HuggingFace's bytes_to_unicode()): printable ASCII (! .. ~)
+// and printable Latin-1 supplement ranges map to themselves; the remaining ~68 byte values
+// (control chars, space, DEL, C1 controls -- ones that would collide with whitespace/invisible
+// characters if used as literal vocab-piece text) get remapped to codepoints starting at 0x100,
+// in ascending byte order.
+std::array<uint32_t, 256> gpt2_byte_to_unicode_table() {
+    std::array<uint32_t, 256> table{};
+    std::array<bool, 256> nice{};
+    auto mark_range = [&](int lo, int hi) {
+        for (int b = lo; b <= hi; b++) { table[b] = (uint32_t)b; nice[b] = true; }
+    };
+    mark_range(0x21, 0x7E);   // '!' .. '~'
+    mark_range(0xA1, 0xAC);   // inverted-! .. not-sign
+    mark_range(0xAE, 0xFF);   // registered-sign .. y-diaeresis
+    uint32_t n = 0;
+    for (int b = 0; b < 256; b++) {
+        if (!nice[b]) { table[b] = 256 + n; n++; }
+    }
+    return table;
+}
+
+const std::unordered_map<uint32_t, uint8_t>& gpt2_unicode_to_byte_table() {
+    static const std::unordered_map<uint32_t, uint8_t> inv = [] {
+        std::unordered_map<uint32_t, uint8_t> m;
+        const auto b2u = gpt2_byte_to_unicode_table();
+        m.reserve(256);
+        for (int b = 0; b < 256; b++) m[b2u[b]] = (uint8_t)b;
+        return m;
+    }();
+    return inv;
+}
+
+// Permissive UTF-8 decode of a (trusted, tokenizer-vocab-derived) string into codepoints.
+// Malformed leads/continuations are simply skipped -- vocab pieces are always well-formed UTF-8
+// in practice, this is defensive, not a general-purpose decoder.
+std::vector<uint32_t> utf8_decode(const std::string& s) {
+    std::vector<uint32_t> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c0 = (unsigned char)s[i];
+        uint32_t cp;
+        int len;
+        if (c0 < 0x80) { cp = c0; len = 1; }
+        else if ((c0 & 0xE0) == 0xC0) { cp = c0 & 0x1F; len = 2; }
+        else if ((c0 & 0xF0) == 0xE0) { cp = c0 & 0x0F; len = 3; }
+        else if ((c0 & 0xF8) == 0xF0) { cp = c0 & 0x07; len = 4; }
+        else { i++; continue; }
+        if (i + (size_t)len > s.size()) break;
+        bool ok = true;
+        for (int k = 1; k < len; k++) {
+            const unsigned char ck = (unsigned char)s[i + k];
+            if ((ck & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (ck & 0x3F);
+        }
+        if (!ok) { i++; continue; }
+        out.push_back(cp);
+        i += (size_t)len;
+    }
+    return out;
+}
+
+// Interprets raw bytes AS UTF-8, substituting U+FFFD (its own UTF-8 encoding, 0xEF 0xBF 0xBD)
+// for any byte(s) that don't form a valid standalone sequence -- matches real OpenAI's behavior
+// for byte-level-BPE tokens that split a multi-byte character across two token ids.
+std::string utf8_lossy_from_bytes(const std::vector<uint8_t>& bytes) {
+    std::string out;
+    out.reserve(bytes.size());
+    size_t i = 0;
+    const size_t n = bytes.size();
+    auto emit_replacement = [&] { out += "\xEF\xBF\xBD"; };
+    while (i < n) {
+        const uint8_t c0 = bytes[i];
+        if (c0 < 0x80) { out.push_back((char)c0); i++; continue; }
+        int len;
+        uint32_t cp, min_cp;
+        if ((c0 & 0xE0) == 0xC0) { len = 2; cp = c0 & 0x1F; min_cp = 0x80; }
+        else if ((c0 & 0xF0) == 0xE0) { len = 3; cp = c0 & 0x0F; min_cp = 0x800; }
+        else if ((c0 & 0xF8) == 0xF0) { len = 4; cp = c0 & 0x07; min_cp = 0x10000; }
+        else { emit_replacement(); i++; continue; }
+        if (i + (size_t)len > n) { emit_replacement(); i++; continue; }
+        bool ok = true;
+        for (int k = 1; k < len; k++) {
+            const uint8_t ck = bytes[i + k];
+            if ((ck & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (ck & 0x3F);
+        }
+        if (!ok || cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            emit_replacement();
+            i++;
+            continue;
+        }
+        out.append((const char*)&bytes[i], (size_t)len);
+        i += (size_t)len;
+    }
+    return out;
+}
 
 std::string read_file(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
@@ -105,6 +206,22 @@ std::string filter_answer_chunk(std::string& carry, const std::string& piece) {
 }
 
 }  // namespace
+
+RawTokenPiece gpt2_bytelevel_decode(const std::string& raw_piece) {
+    RawTokenPiece out;
+    if (raw_piece.empty()) return out;
+    const auto& unicode_to_byte = gpt2_unicode_to_byte_table();
+    const auto codepoints = utf8_decode(raw_piece);
+    out.bytes.reserve(codepoints.size());
+    for (uint32_t cp : codepoints) {
+        auto it = unicode_to_byte.find(cp);
+        // A codepoint absent from the table shouldn't happen for a well-formed ByteLevel BPE
+        // vocab piece -- skip rather than corrupt output if it ever does.
+        if (it != unicode_to_byte.end()) out.bytes.push_back(it->second);
+    }
+    out.display = utf8_lossy_from_bytes(out.bytes);
+    return out;
+}
 
 struct ChatTokenizer::Impl {
     std::unique_ptr<tokenizers::Tokenizer> tok;
@@ -659,6 +776,12 @@ std::string ChatTokenizer::decode_delta(std::vector<int>& acc, int new_id) const
            (static_cast<unsigned char>(full[i]) & 0xC0) == 0x80)
         --i;
     return full.substr(i);
+}
+
+RawTokenPiece ChatTokenizer::id_to_raw_piece(int id) const {
+    if (!impl_->tok) return {};
+    const std::string raw = impl_->tok->IdToToken(static_cast<int32_t>(id));
+    return gpt2_bytelevel_decode(raw);
 }
 
 }  // namespace sparkinfer_server

@@ -22,12 +22,22 @@ __global__ void vocab_iota_kernel(int* vocab_iota, int vocab) {
 
 // sorted_exp[i] = exp(sorted_logits[i] - sorted_logits[0]) -- sorted_logits[0] is the row max
 // (descending sort), so this is a numerically-stable softmax numerator with no separate
-// max-reduction pass needed.
+// max-reduction pass needed. Also scatters the inverse permutation rank_by_id[sorted_idx[i]] = i
+// -- free, since this loop already touches every rank exactly once and sorted_idx is a bijection
+// over [0,vocab) after a full sort (every entry of rank_by_id is written exactly once per call,
+// so no memset/stale-entry hazard is possible). Used by extract_chosen_logit_kernel below to find
+// the raw (pre-mask, pre-temperature-noise) logit of whichever token launch_argmax later picks --
+// needed for logprobs/top_logprobs, since the sampled token is not necessarily rank 0 once real
+// temperature sampling is active.
 __global__ void topk_topp_exp_kernel(const float* __restrict__ sorted_logits,
-                                     float* __restrict__ sorted_exp, int vocab) {
+                                     const int* __restrict__ sorted_idx,
+                                     float* __restrict__ sorted_exp,
+                                     int* __restrict__ rank_by_id, int vocab) {
     const float row_max = sorted_logits[0];
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vocab; i += gridDim.x * blockDim.x)
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vocab; i += gridDim.x * blockDim.x) {
         sorted_exp[i] = __expf(sorted_logits[i] - row_max);
+        rank_by_id[sorted_idx[i]] = i;
+    }
 }
 
 // One block; grid-stride over sorted rank. Reads the per-call top_k/top_p device scalars and
@@ -59,6 +69,16 @@ __global__ void topk_topp_mask_kernel(float* __restrict__ logits,
     }
 }
 
+// Single-thread lookup of the chosen token's raw (pre-mask, pre-temperature-noise) logit via the
+// inverse permutation topk_topp_exp_kernel already scattered. Always launched, negligible cost --
+// see fused.h for why this must run unconditionally regardless of whether logprobs was requested.
+__global__ void extract_chosen_logit_kernel(const int* __restrict__ out_id,
+                                            const int* __restrict__ rank_by_id,
+                                            const float* __restrict__ sorted_logits,
+                                            float* __restrict__ chosen_logit) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) *chosen_logit = sorted_logits[rank_by_id[*out_id]];
+}
+
 }  // namespace
 
 size_t topk_sort_temp_storage_bytes(int vocab) {
@@ -86,6 +106,7 @@ void launch_topk_topp_mask(float* logits, int vocab,
                            void* sort_temp, size_t sort_temp_bytes,
                            void* scan_temp, size_t scan_temp_bytes,
                            const int* top_k_i32, const float* top_p_f32,
+                           int* rank_by_id,
                            cudaStream_t stream) {
     size_t sort_bytes = sort_temp_bytes;
     cub::DeviceRadixSort::SortPairsDescending<float, int>(
@@ -93,13 +114,20 @@ void launch_topk_topp_mask(float* logits, int vocab,
         sizeof(float) * 8, stream);
 
     const int bx = (vocab + 255) / 256 > 1024 ? 1024 : (vocab + 255) / 256;
-    topk_topp_exp_kernel<<<bx < 1 ? 1 : bx, 256, 0, stream>>>(sorted_logits, topk_exp, vocab);
+    topk_topp_exp_kernel<<<bx < 1 ? 1 : bx, 256, 0, stream>>>(sorted_logits, sorted_idx, topk_exp,
+                                                              rank_by_id, vocab);
 
     size_t scan_bytes = scan_temp_bytes;
     cub::DeviceScan::InclusiveSum(scan_temp, scan_bytes, topk_exp, topk_cumsum, vocab, stream);
 
     topk_topp_mask_kernel<<<bx < 1 ? 1 : bx, 256, 0, stream>>>(
         logits, sorted_idx, topk_cumsum, vocab, top_k_i32, top_p_f32);
+}
+
+void launch_extract_chosen_logit(const int* out_id, const int* rank_by_id,
+                                 const float* sorted_logits, float* chosen_logit,
+                                 cudaStream_t stream) {
+    extract_chosen_logit_kernel<<<1, 1, 0, stream>>>(out_id, rank_by_id, sorted_logits, chosen_logit);
 }
 
 }  // namespace kernels

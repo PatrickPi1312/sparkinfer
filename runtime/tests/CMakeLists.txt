@@ -55,6 +55,10 @@ add_executable(topk_topp_sample_gpu_test topk_topp_sample_gpu_test.cpp)
 target_link_libraries(topk_topp_sample_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME topk_topp_sample_gpu_test COMMAND topk_topp_sample_gpu_test)
 
+add_executable(logprob_extract_gpu_test logprob_extract_gpu_test.cpp)
+target_link_libraries(logprob_extract_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME logprob_extract_gpu_test COMMAND logprob_extract_gpu_test)
+
 # Real sidecar subprocess + real KV cache + a small synthetic model on real hardware -- the one
 # place both halves of the LMCache bridge run together against the real model code path. Skips
 # (not fails) unless SPARKINFER_LMCACHE_PYTHON/_BRIDGE_SCRIPT point at a real lmcache+torch venv

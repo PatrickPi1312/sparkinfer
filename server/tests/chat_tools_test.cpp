@@ -1003,6 +1003,33 @@ bool test_request_controls_top_k_validation() {
     return true;
 }
 
+bool test_request_controls_logprobs_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(!controls.logprobs && controls.top_logprobs == 0);
+    CHECK(parse_request_controls(R"({"logprobs":true})", controls, err));
+    CHECK(controls.logprobs && controls.top_logprobs == 0);
+    CHECK(parse_request_controls(R"({"logprobs":true,"top_logprobs":5})", controls, err));
+    CHECK(controls.top_logprobs == 5);
+    CHECK(parse_request_controls(R"({"logprobs":true,"top_logprobs":20})", controls, err));
+    CHECK(controls.top_logprobs == 20);
+    CHECK(parse_request_controls(R"({"logprobs":true,"top_logprobs":0})", controls, err));
+    CHECK(controls.top_logprobs == 0);
+    CHECK(!parse_request_controls(R"({"logprobs":true,"top_logprobs":21})", controls, err));
+    CHECK(!parse_request_controls(R"({"logprobs":true,"top_logprobs":-1})", controls, err));
+    CHECK(!parse_request_controls(R"({"logprobs":"yes"})", controls, err));
+    CHECK(!parse_request_controls(R"({"logprobs":true,"top_logprobs":1.5})", controls, err));
+    // Cross-field rule: fresh controls each time, since `controls` above already has
+    // logprobs=true persisted from earlier calls in this test (parse_request_controls only sets
+    // fields present in the JSON, it never resets) -- reusing it here would trivially pass.
+    RequestControls fresh1;
+    CHECK(!parse_request_controls(R"({"top_logprobs":5})", fresh1, err));           // no logprobs:true
+    RequestControls fresh2;
+    CHECK(!parse_request_controls(R"({"logprobs":false,"top_logprobs":5})", fresh2, err));
+    return true;
+}
+
 bool test_should_reject_dflash_temperature() {
     CHECK(!should_reject_dflash_temperature(/*dflash_env_on=*/false, /*temperature=*/0.7f));
     CHECK(!should_reject_dflash_temperature(/*dflash_env_on=*/true, /*temperature=*/0.f));
@@ -1227,6 +1254,7 @@ int main() {
     if (!test_request_controls_seed_validation()) return 1;
     if (!test_request_controls_top_p_validation()) return 1;
     if (!test_request_controls_top_k_validation()) return 1;
+    if (!test_request_controls_logprobs_validation()) return 1;
     if (!test_should_reject_dflash_temperature()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;

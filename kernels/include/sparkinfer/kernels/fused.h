@@ -126,19 +126,40 @@ void launch_temperature_sample(float* logits, int n_rows, int vocab,
 // rationale as launch_temperature_sample's temp/seed/step -- ALWAYS launch this unconditionally
 // on a CUDA-graph-captured decode path, never host-gate on top_k/top_p being set.
 //
-// scratch (vocab_iota/sorted_logits/sorted_idx/topk_exp/topk_cumsum, all length `vocab`; sort_temp/
-// scan_temp sized via topk_sort_temp_storage_bytes()/topk_scan_temp_storage_bytes()) must be
-// allocated ONCE at load time with a fixed address -- CUB's num_items argument is a host constant
-// (here, `vocab`) that cannot vary per call, so this always processes the full vocab regardless of
-// top_k/top_p, unlike launch_temperature_sample's near-free no-op when disabled. vocab_iota must be
-// filled once via launch_vocab_iota_init() before the first call and never mutated afterward.
+// scratch (vocab_iota/sorted_logits/sorted_idx/topk_exp/topk_cumsum/rank_by_id, all length `vocab`;
+// sort_temp/scan_temp sized via topk_sort_temp_storage_bytes()/topk_scan_temp_storage_bytes())
+// must be allocated ONCE at load time with a fixed address -- CUB's num_items argument is a host
+// constant (here, `vocab`) that cannot vary per call, so this always processes the full vocab
+// regardless of top_k/top_p, unlike launch_temperature_sample's near-free no-op when disabled.
+// vocab_iota must be filled once via launch_vocab_iota_init() before the first call and never
+// mutated afterward.
+//
+// rank_by_id[id] = the sorted rank of vocab entry `id` (an inverse permutation of sorted_idx,
+// scattered as a side effect of the internal exp kernel -- free, no extra launch). Used by
+// launch_extract_chosen_logit() below to recover the RAW (pre-mask, pre-temperature-noise) logit
+// of whichever token is ultimately sampled, for logprobs/top_logprobs -- see that function's doc
+// comment. Always populated regardless of whether the caller wants logprobs (same graph-safety
+// discipline as everything else on this path); the cost is one extra int write inside a kernel
+// that's already memory-bound and already touches every rank once.
 void launch_topk_topp_mask(float* logits, int vocab,
                            const int* vocab_iota, float* sorted_logits, int* sorted_idx,
                            float* topk_exp, float* topk_cumsum,
                            void* sort_temp, size_t sort_temp_bytes,
                            void* scan_temp, size_t scan_temp_bytes,
                            const int* top_k_i32, const float* top_p_f32,
+                           int* rank_by_id,
                            cudaStream_t stream = nullptr);
+
+// Looks up the raw (pre-mask, pre-temperature-noise) logit of *out_id (whatever launch_argmax
+// picked, downstream of launch_temperature_sample -- not necessarily rank 0 once real temperature
+// sampling is active) via rank_by_id + sorted_logits from the launch_topk_topp_mask call that
+// preceded it in the same decode step. <<<1,1>>>, negligible cost. Always launched
+// unconditionally, same rationale as launch_topk_topp_mask -- the caller (qwen35.cpp) does not
+// know at capture time whether THIS particular replay's request wants logprobs, since the graph
+// may be replayed for a later, different request via use_prefix_session.
+void launch_extract_chosen_logit(const int* out_id, const int* rank_by_id,
+                                 const float* sorted_logits, float* chosen_logit,
+                                 cudaStream_t stream = nullptr);
 
 // Load-time-only helpers (no kernel launch involved beyond a one-time iota fill) -- call once per
 // model load, never on the decode hot path.

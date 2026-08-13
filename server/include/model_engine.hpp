@@ -5,9 +5,19 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sparkinfer_server {
+
+// Hand-mirrored server-layer copy of sparkinfer::Qwen35Model::TokenLogprob -- model_engine.hpp
+// deliberately never re-exposes runtime types in its public API, matching CompletionResult's
+// existing field-by-field-copy convention below.
+struct TokenLogprob {
+    int token_id = -1;
+    float logprob = 0.f;
+    std::vector<std::pair<int, float>> top_alternatives;
+};
 
 // Outcome of one complete()/complete_streaming() call. Returned by value so concurrent
 // HTTP worker threads cannot observe or clear each other's failure state.
@@ -60,10 +70,19 @@ public:
     // known "first token is always greedy" v1 scope limitation. top_k/top_p truncate the
     // candidate set before the Gumbel draw; neither requires temperature > 0 (see
     // ContinuousBatchEngine::Request's doc comment for the inertness proof).
+    //
+    // on_token_logprob (optional) fires once per token, immediately before on_token for that same
+    // token, only when logprobs is true AND this callback is non-null -- pass nullptr (not a
+    // no-op lambda) when logprobs aren't wanted; see ContinuousBatchEngine::complete_streaming's
+    // doc comment for why an always-non-null callback would defeat the "costs nothing extra when
+    // unused" property. Same "first token has no logprobs" v1 gap as above.
     CompletionResult complete_streaming(const std::vector<int>& prompt_ids, int max_new_tokens,
                                         const std::function<bool(int)>& on_token,
                                         float temperature = 0.f, uint64_t seed = 0,
-                                        int top_k = 0, float top_p = 1.0f);
+                                        int top_k = 0, float top_p = 1.0f,
+                                        bool logprobs = false, int top_logprobs = 0,
+                                        const std::function<void(const TokenLogprob&)>&
+                                            on_token_logprob = nullptr);
 
     // Live occupancy, for capacity-reporting endpoints. 0/0 if the model isn't loaded yet.
     int active_requests() const;

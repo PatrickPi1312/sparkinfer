@@ -232,6 +232,41 @@ bool test_tool_choice_none_still_uses_strict_output_parser() {
 
 }  // namespace
 
+// GPT-2/ByteLevel-BPE byte-table round-trip -- pure function, no loaded tokenizer needed. "Ġ" is
+// U+0120 (UTF-8 0xC4 0xA0), the standard byte-level-BPE stand-in for the space byte 0x20.
+bool test_gpt2_bytelevel_decode_space_marker() {
+    const auto piece = sparkinfer_server::gpt2_bytelevel_decode("\xC4\xA0hello");
+    CHECK(!piece.bytes.empty());
+    CHECK(piece.bytes[0] == 0x20);
+    CHECK(piece.display == " hello");
+    return true;
+}
+
+// U+0122 (UTF-8 0xC4 0xA2) is the byte-level-BPE stand-in for raw byte 0x80 -- a lone UTF-8
+// continuation byte, not valid standalone text. display must show a replacement character
+// (matches real OpenAI's behavior for tokens that split a multi-byte character).
+bool test_gpt2_bytelevel_decode_invalid_utf8_shows_replacement() {
+    const auto piece = sparkinfer_server::gpt2_bytelevel_decode("\xC4\xA2");
+    CHECK(piece.bytes.size() == 1 && piece.bytes[0] == 0x80);
+    CHECK(piece.display.find("\xEF\xBF\xBD") != std::string::npos);
+    return true;
+}
+
+bool test_gpt2_bytelevel_decode_empty_piece() {
+    const auto piece = sparkinfer_server::gpt2_bytelevel_decode("");
+    CHECK(piece.bytes.empty());
+    CHECK(piece.display.empty());
+    return true;
+}
+
+// Printable ASCII maps to itself under the byte-level table -- a plain word round-trips exactly.
+bool test_gpt2_bytelevel_decode_printable_ascii_roundtrip() {
+    const auto piece = sparkinfer_server::gpt2_bytelevel_decode("hello");
+    CHECK(piece.bytes.size() == 5);
+    CHECK(piece.display == "hello");
+    return true;
+}
+
 int main() {
     if (!test_thinking_prompt_and_nonstream_parser()) return 1;
     if (!test_thinking_stream_boundaries()) return 1;
@@ -246,6 +281,10 @@ int main() {
     if (!test_stop_filter_marker_with_embedded_nul()) return 1;
     if (!test_muse_rejects_all_tool_protocol_history()) return 1;
     if (!test_tool_choice_none_still_uses_strict_output_parser()) return 1;
+    if (!test_gpt2_bytelevel_decode_space_marker()) return 1;
+    if (!test_gpt2_bytelevel_decode_invalid_utf8_shows_replacement()) return 1;
+    if (!test_gpt2_bytelevel_decode_empty_piece()) return 1;
+    if (!test_gpt2_bytelevel_decode_printable_ascii_roundtrip()) return 1;
     std::printf("chat_tokenizer_test: OK\n");
     return 0;
 }

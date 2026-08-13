@@ -44,6 +44,17 @@ public:
         // inertness proof. Same prefill-phase-seed-token caveat as temperature applies unchanged.
         int top_k = 0;
         float top_p = 1.0f;
+        // top_logprobs is only meaningful when logprobs is true. Delivery is via the separate
+        // on_token_logprob callback (complete_streaming's new trailing param), not this struct --
+        // pure data here, same as every other sampling control.
+        //
+        // KNOWN v1 GAP: the prefill-phase seed token (this response's very first token) never
+        // gets a last_token_logprobs() call -- same root cause as temperature's "first token is
+        // always greedy" gap above (ingest_prompt_range() is a funnel shared by other callers,
+        // not worth threading through for one token). Callers should expect one fewer logprobs
+        // entry than emitted tokens.
+        bool logprobs = false;
+        int top_logprobs = 0;   // 0-20; only meaningful when logprobs is true
     };
 
     struct Result {
@@ -86,7 +97,15 @@ public:
     // Streaming completion: on_token is invoked on the worker thread as tokens are produced.
     // on_token returns false to cancel generation early (e.g. the client disconnected) --
     // the request then finishes with Result::cancelled = true, not an error.
-    Result complete_streaming(const Request& req, const std::function<bool(int)>& on_token);
+    //
+    // on_token_logprob (optional) is invoked once per token, immediately BEFORE on_token fires
+    // for that same token, only when req.logprobs is true AND this callback is non-null -- pass
+    // nullptr (not a no-op lambda) when logprobs aren't wanted, since step_job()'s cost gate is
+    // `req.logprobs && on_token_logprob`; an always-non-null callback would defeat the
+    // "logprobs=false costs nothing extra" property.
+    Result complete_streaming(const Request& req, const std::function<bool(int)>& on_token,
+                              const std::function<void(const Qwen35Model::TokenLogprob&)>&
+                                  on_token_logprob = nullptr);
 
     int num_active() const;
     int num_free_kv_blocks() const;
@@ -97,7 +116,9 @@ public:
 private:
     struct Job;
     enum class EnqueueError { NONE, BAD_REQUEST, OVERLOADED, ALLOC_FAILED };
-    uint64_t submit_locked(Job job, const std::function<bool(int)>& on_token, EnqueueError* err_out);
+    uint64_t submit_locked(Job job, const std::function<bool(int)>& on_token,
+                           const std::function<void(const Qwen35Model::TokenLogprob&)>& on_token_logprob,
+                           EnqueueError* err_out);
     Result wait_locked(uint64_t request_id);
     void worker_loop();
     bool step_job(Job& job, bool chunked = false);

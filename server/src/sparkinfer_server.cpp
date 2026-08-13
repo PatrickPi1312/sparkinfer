@@ -6,9 +6,11 @@
 // Do not define CPPHTTPLIB_OPENSSL_SUPPORT — even `= 0` enables OpenSSL in httplib.
 #include "../third_party/httplib.h"
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -144,17 +146,19 @@ bool write_stream_role(httplib::DataSink& sink, const std::string& cid, long lon
     chunk["choices"] = nlohmann::json::array({{{"index", 0},
                                                 {"delta", {{"role", "assistant"},
                                                            {"content", nullptr}}},
-                                                {"finish_reason", nullptr}}});
+                                                {"finish_reason", nullptr},
+                                                {"logprobs", nullptr}}});
     return write_sse_json(sink, chunk);
 }
 
 bool write_stream_delta(httplib::DataSink& sink, const std::string& cid, long long created, const std::string& field,
-                        const std::string& piece) {
+                        const std::string& piece, const nlohmann::json& logprobs = nullptr) {
     if (piece.empty()) return true;
     auto chunk = stream_chunk_base(cid, created);
     chunk["choices"] = nlohmann::json::array({{{"index", 0},
                                                 {"delta", {{field, piece}}},
-                                                {"finish_reason", nullptr}}});
+                                                {"finish_reason", nullptr},
+                                                {"logprobs", logprobs}}});
     return write_sse_json(sink, chunk);
 }
 
@@ -167,7 +171,8 @@ bool write_stream_tool_call(httplib::DataSink& sink, const std::string& cid, lon
     chunk["choices"] = nlohmann::json::array({{{"index", 0},
                                                 {"delta", {{"tool_calls",
                                                             nlohmann::json::array({delta_call})}}},
-                                                {"finish_reason", nullptr}}});
+                                                {"finish_reason", nullptr},
+                                                {"logprobs", nullptr}}});
     return write_sse_json(sink, chunk);
 }
 
@@ -176,7 +181,8 @@ bool write_stream_finish(httplib::DataSink& sink, const std::string& cid, long l
     auto chunk = stream_chunk_base(cid, created);
     chunk["choices"] = nlohmann::json::array({{{"index", 0},
                                                 {"delta", nlohmann::json::object()},
-                                                {"finish_reason", reason}}});
+                                                {"finish_reason", reason},
+                                                {"logprobs", nullptr}}});
     return write_sse_json(sink, chunk);
 }
 
@@ -193,6 +199,31 @@ bool write_stream_usage(httplib::DataSink& sink, const std::string& cid, long lo
     if (decode_tps >= 0.0) usage["decode_tps"] = decode_tps;
     chunk["usage"] = std::move(usage);
     return write_sse_json(sink, chunk);
+}
+
+nlohmann::json token_logprob_entry_json(int token_id, float logprob) {
+    const auto piece = g_tokenizer.id_to_raw_piece(token_id);
+    nlohmann::json bytes = nlohmann::json::array();
+    for (uint8_t b : piece.bytes) bytes.push_back((int)b);
+    return {{"token", piece.display}, {"logprob", logprob}, {"bytes", bytes}};
+}
+
+// Builds the OpenAI-shaped logprobs.content array from a flat, generation-ordered list of
+// per-token entries. Each entry's own top_alternatives list is truncated to top_logprobs_n
+// (the request's requested top_logprobs value) regardless of how many were captured on-device.
+nlohmann::json build_logprobs_content_json(const std::vector<sparkinfer_server::TokenLogprob>& entries,
+                                           int top_logprobs_n) {
+    nlohmann::json content = nlohmann::json::array();
+    for (const auto& e : entries) {
+        nlohmann::json item = token_logprob_entry_json(e.token_id, e.logprob);
+        nlohmann::json alts = nlohmann::json::array();
+        const int n = std::min((int)e.top_alternatives.size(), top_logprobs_n);
+        for (int i = 0; i < n; i++)
+            alts.push_back(token_logprob_entry_json(e.top_alternatives[i].first, e.top_alternatives[i].second));
+        item["top_logprobs"] = alts;
+        content.push_back(item);
+    }
+    return content;
 }
 
 bool write_stream_done(httplib::DataSink& sink) {
@@ -475,6 +506,8 @@ int main(int argc, char** argv) {
                  // at temperature > 0 -- already rejected below regardless of top_k/top_p. A
                  // top_k=5, temperature=0 request under DFlash is safe (masking is provably
                  // inert at temperature<=0 -- see ContinuousBatchEngine::Request's doc comment).
+                 // logprobs needs no check either -- it's pure output reporting, never touches
+                 // the sampling path at all.
                  if (sparkinfer_server::should_reject_dflash_temperature(
                          [] { const char* e = getenv("SPARKINFER_DFLASH"); return e && e[0] == '1'; }(),
                          controls.temperature)) {
@@ -551,7 +584,8 @@ int main(int argc, char** argv) {
                           chat_request, tool_protocol, json_mode_active,
                           include_usage = controls.include_usage, stop = controls.stop,
                           temperature = controls.temperature, seed = controls.seed,
-                          top_k = controls.top_k, top_p = controls.top_p]
+                          top_k = controls.top_k, top_p = controls.top_p,
+                          logprobs = controls.logprobs, top_logprobs = controls.top_logprobs]
                          (size_t offset, httplib::DataSink& sink) {
                              if (offset > 0) {
                                  sink.done();
@@ -684,6 +718,19 @@ int main(int argc, char** argv) {
                              // since both now collapse to the same engine-level cancelled flag, but
                              // only a real disconnect means "the client is gone, send nothing".
                              bool stopped_by_sequence = false;
+                             // Scoped out of tool-calling responses (buffered, no live content
+                             // emission at all -- see the DFlash-check comment above for the
+                             // parallel "logprobs never touches sampling" note).
+                             const bool want_logprobs = logprobs && !tool_protocol;
+                             // Accumulates since the last CONTENT delta actually flushed (not
+                             // cleared on reasoning-only rounds -- see build_logprobs_content_json
+                             // call sites below for where attach-and-clear happens). Entries never
+                             // claimed by a content flush (reasoning-only tail, text swallowed by
+                             // a stop match) are simply never emitted.
+                             std::vector<sparkinfer_server::TokenLogprob> pending_logprobs;
+                             auto on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
+                                 pending_logprobs.push_back(tl);
+                             };
                              // Returning false cancels generation -- the client is gone, so there
                              // is no point spending GPU time finishing the response.
                              auto on_tok = [&](int tid) -> bool {
@@ -715,8 +762,15 @@ int main(int argc, char** argv) {
                                          if (!delta.reasoning_content.empty())
                                              write_stream_delta(sink, cid, created, "reasoning_content",
                                                                 delta.reasoning_content);
-                                         if (!delta.content.empty())
-                                             write_stream_delta(sink, cid, created, "content", delta.content);
+                                         if (!delta.content.empty()) {
+                                             nlohmann::json lp = nullptr;
+                                             if (want_logprobs) {
+                                                 lp = nlohmann::json{{"content",
+                                                     build_logprobs_content_json(pending_logprobs, top_logprobs)}};
+                                                 pending_logprobs.clear();
+                                             }
+                                             write_stream_delta(sink, cid, created, "content", delta.content, lp);
+                                         }
                                      }
                                      stopped_by_sequence = true;
                                      return false;
@@ -726,11 +780,22 @@ int main(int argc, char** argv) {
                                  if (!delta.reasoning_content.empty())
                                      ok = write_stream_delta(sink, cid, created, "reasoning_content",
                                                               delta.reasoning_content) && ok;
-                                 if (!delta.content.empty())
-                                     ok = write_stream_delta(sink, cid, created, "content", delta.content) && ok;
+                                 if (!delta.content.empty()) {
+                                     nlohmann::json lp = nullptr;
+                                     if (want_logprobs) {
+                                         lp = nlohmann::json{{"content",
+                                             build_logprobs_content_json(pending_logprobs, top_logprobs)}};
+                                         pending_logprobs.clear();
+                                     }
+                                     ok = write_stream_delta(sink, cid, created, "content", delta.content, lp) && ok;
+                                 }
                                  return ok && sink.is_writable();
                              };
-                             const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok, temperature, seed, top_k, top_p);
+                             const std::function<void(const sparkinfer_server::TokenLogprob&)> maybe_on_tok_logprob =
+                                 want_logprobs ? std::function<void(const sparkinfer_server::TokenLogprob&)>(on_tok_logprob)
+                                              : nullptr;
+                             const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
+                                 temperature, seed, top_k, top_p, logprobs, top_logprobs, maybe_on_tok_logprob);
                              const int prompt_tokens = (int)prompt_ids.size();
                              const int completion_tokens = (int)stream_ids.size();
                              g_prompt_tokens_total += (uint64_t)prompt_tokens;
@@ -844,6 +909,11 @@ int main(int argc, char** argv) {
                  sparkinfer_server::CompletionResult outcome;
                  sparkinfer_server::ParsedAssistantOutput parsed;
                  std::string finish_reason;
+                 // Populated only in the plain (non-json_mode, non-tool_protocol) branch below --
+                 // see the DFlash-check comment above for why tool-calling/response_format
+                 // responses are scoped out of logprobs entirely for v1.
+                 std::vector<sparkinfer_server::TokenLogprob> logprob_entries;
+                 const bool want_logprobs = controls.logprobs && !tool_protocol;
 
                  if (json_mode_active) {
                      // response_format validation needs the complete output; a truncated or
@@ -937,6 +1007,9 @@ int main(int argc, char** argv) {
                      std::vector<int> nonstream_ids;
                      std::string nonstream_stop_text;
                      bool stopped_by_sequence = false;
+                     auto nonstream_on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
+                         logprob_entries.push_back(tl);
+                     };
                      auto nonstream_on_tok = [&](int tid) -> bool {
                          if (controls.stop.empty()) {
                              nonstream_ids.push_back(tid);
@@ -946,11 +1019,26 @@ int main(int argc, char** argv) {
                          size_t pos;
                          if (find_stop_match(nonstream_stop_text, controls.stop, pos)) {
                              stopped_by_sequence = true;
+                             // The match-triggering token's text got truncated below (a stop
+                             // match can land mid-token) -- drop its logprobs entry too, no
+                             // partial-credit modeling for v1. Fires after nonstream_on_tok_logprob
+                             // (delivered before on_token for the same token, see step_job()'s
+                             // ordering contract), so this correctly removes THIS token's entry.
+                             if (want_logprobs && !logprob_entries.empty()) logprob_entries.pop_back();
                              return false;
                          }
                          return true;
                      };
-                     outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok, controls.temperature, controls.seed, controls.top_k, controls.top_p);
+                     const std::function<void(const sparkinfer_server::TokenLogprob&)> maybe_nonstream_on_tok_logprob =
+                         want_logprobs ? std::function<void(const sparkinfer_server::TokenLogprob&)>(nonstream_on_tok_logprob)
+                                      : nullptr;
+                     outcome = engine.complete_streaming(prompt_ids, max_tokens, nonstream_on_tok,
+                         controls.temperature, controls.seed, controls.top_k, controls.top_p,
+                         controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob);
+                     // Defensive clamp -- should already hold, cheap insurance against any
+                     // subtle off-by-one between the two accumulation paths above.
+                     if (logprob_entries.size() > outcome.tokens.size())
+                         logprob_entries.resize(outcome.tokens.size());
                      std::string text;
                      if (!outcome.error.empty()) {
                          res.status = record_and_status(outcome);
@@ -1021,11 +1109,15 @@ int main(int argc, char** argv) {
                  if (outcome.ttft_ms >= 0.0) usage["ttft_ms"] = outcome.ttft_ms;
                  if (outcome.generation_ms >= 0.0) usage["generation_ms"] = outcome.generation_ms;
                  if (outcome.decode_tps >= 0.0) usage["decode_tps"] = outcome.decode_tps;
+                 const nlohmann::json logprobs_json = want_logprobs
+                     ? nlohmann::json{{"content", build_logprobs_content_json(logprob_entries, controls.top_logprobs)}}
+                     : nlohmann::json(nullptr);
                  const nlohmann::json body = {
                      {"id", cid}, {"object", "chat.completion"}, {"created", created},
                      {"model", g_model_name},
                      {"choices", nlohmann::json::array({{{"index", 0},
                                                           {"message", message},
+                                                          {"logprobs", logprobs_json},
                                                           {"finish_reason", finish_reason}}})},
                      {"usage", usage}};
                  g_requests_ok++;

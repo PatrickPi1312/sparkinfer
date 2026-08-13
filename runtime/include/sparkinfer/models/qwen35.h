@@ -204,6 +204,35 @@ public:
     // forward_token() call. Used for teacher-forced scoring (perplexity / KL).
     void copy_logits(float* host_logits) const;
 
+    // Minimal, string-free (tokenization is a server-layer concern) -- the chosen token's own
+    // logprob plus its top `top_alternatives.size()` alternatives by raw logit, sorted descending.
+    struct TokenLogprob {
+        int token_id = -1;
+        float logprob = 0.f;
+        std::vector<std::pair<int, float>> top_alternatives;
+    };
+    static constexpr int kMaxTopLogprobs = 20;   // OpenAI's own top_logprobs ceiling
+
+    // Reads the RAW (post-softcap, pre-truncation, pre-temperature-noise) model distribution
+    // behind the token the IMMEDIATELY PRECEDING forward_token() call produced: that token's own
+    // logprob plus its top `top_n` (clamped to [0, kMaxTopLogprobs]) alternatives. "Raw" here means
+    // this reports the model's true confidence, not an artifact of the caller's own
+    // temperature/top_k/top_p choices -- matches real-world OpenAI/vLLM logprobs semantics.
+    //
+    // Valid under the same "forward_token() syncs its stream before returning" contract as
+    // copy_logits() above -- NOT valid on the DFlash deferred-collect early return
+    // (s.defer_decode_sync == true, forward_token() returns kDFlashDeferred without syncing);
+    // unexercised in practice since ContinuousBatchEngine (the sole caller behind
+    // /v1/chat/completions) never sets dflash_cap.
+    //
+    // Deliberately NOT baked into forward_token()'s own D2H tail (unlike h_out_id): this does its
+    // own on-demand cudaMemcpy(s), so calling (or never calling) it costs nothing extra on the
+    // decode hot path for logprobs=false requests -- the only always-on cost logprobs adds to
+    // every decode step is the two small device-side kernel changes documented on
+    // kernels::launch_topk_topp_mask/launch_extract_chosen_logit (both correctness-critical for
+    // graph replay safety regardless of whether THIS request wants logprobs).
+    TokenLogprob last_token_logprobs(int top_n = kMaxTopLogprobs) const;
+
     struct BenchDecodeResult {
         double decode_tps = 0;
         double prefill_pp = 0;

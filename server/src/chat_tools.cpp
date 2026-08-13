@@ -1170,6 +1170,30 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
         }
         out.top_k = static_cast<int>(std::min<long long>(k, std::numeric_limits<int>::max()));
     }
+    if (root.contains("logprobs") && !root["logprobs"].is_null()) {
+        if (!root["logprobs"].is_boolean()) {
+            err = "logprobs must be a boolean";
+            return false;
+        }
+        out.logprobs = root["logprobs"].get<bool>();
+    }
+    if (root.contains("top_logprobs") && !root["top_logprobs"].is_null()) {
+        const auto& value = root["top_logprobs"];
+        if (!value.is_number_integer()) {
+            err = "top_logprobs must be an integer";
+            return false;
+        }
+        const long long n = value.get<long long>();
+        if (n < 0 || n > 20) {
+            err = "top_logprobs must be between 0 and 20";
+            return false;
+        }
+        if (!out.logprobs) {
+            err = "top_logprobs requires logprobs to be true";
+            return false;
+        }
+        out.top_logprobs = static_cast<int>(n);
+    }
     return true;
 }
 

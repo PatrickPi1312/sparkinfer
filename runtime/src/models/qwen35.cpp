@@ -203,6 +203,12 @@ struct Qwen35Model::Impl {
     size_t sort_temp_bytes = 0;
     void* d_scan_temp = nullptr;
     size_t scan_temp_bytes = 0;
+    // logprobs/top_logprobs scratch -- same alloc-once-at-load-time discipline as the topk/topp
+    // block above. d_rank_by_id[id] = sorted rank of vocab entry `id` (inverse permutation,
+    // scattered by topk_topp_exp_kernel); d_chosen_logit = the winning token's raw logit, written
+    // by launch_extract_chosen_logit. See Qwen35Model::last_token_logprobs's doc comment.
+    int* d_rank_by_id = nullptr;
+    float* d_chosen_logit = nullptr;
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
     // GGUF fused-expert decode scratch (allocated by load_gguf)
@@ -394,6 +400,10 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->scan_temp_bytes = kernels::topk_scan_temp_storage_bytes(cfg.vocab);
     cu(cudaMalloc(&p_->d_sort_temp, p_->sort_temp_bytes), "topk sort temp");
     cu(cudaMalloc(&p_->d_scan_temp, p_->scan_temp_bytes), "topk scan temp");
+    // logprobs/top_logprobs scratch, same discipline as above. d_rank_by_id needs no memset --
+    // topk_topp_exp_kernel fully overwrites it every decode step before it is ever read.
+    p_->d_rank_by_id=p_->alloc<int>(cfg.vocab);
+    p_->d_chosen_logit=p_->alloc<float>(1);
     p_->d_shared_ids=p_->alloc<int>(1); p_->d_shared_w=p_->alloc<float>(1);
     int zero=0; float one=1.f;
     cu(cudaMemcpy(p_->d_shared_ids,&zero,sizeof(int),cudaMemcpyHostToDevice),"shared ids");
@@ -524,6 +534,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->d_vocab_iota); cudaFree(p_->d_sorted_logits); cudaFree(p_->d_sorted_idx);
     cudaFree(p_->d_topk_exp); cudaFree(p_->d_topk_cumsum);
     cudaFree(p_->d_sort_temp); cudaFree(p_->d_scan_temp);
+    cudaFree(p_->d_rank_by_id); cudaFree(p_->d_chosen_logit);
     cudaFree(p_->d_shared_ids); cudaFree(p_->d_shared_w);
     // Qwen3.6 Gated-DeltaNet buffers (allocated only for the hybrid model)
     cudaFree(p_->qraw); cudaFree(p_->qgate);
@@ -570,6 +581,37 @@ void Qwen35Model::copy_logits(float* host_logits) const {
     // p_->logits holds the last step's lm-head output; forward_token() syncs the
     // stream before returning, so it is valid to read here.
     cudaMemcpy(host_logits, p_->logits, (size_t)p_->cfg.vocab * sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+Qwen35Model::TokenLogprob Qwen35Model::last_token_logprobs(int top_n) const {
+    Impl& s = *p_;
+    top_n = std::max(0, std::min(top_n, kMaxTopLogprobs));
+
+    TokenLogprob out;
+    out.token_id = *s.h_out_id;   // already synced by forward_token() before it returned
+
+    float denom = 1.f, chosen_logit = 0.f;
+    cudaMemcpy(&denom, s.d_topk_cumsum + (s.cfg.vocab - 1), sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&chosen_logit, s.d_chosen_logit, sizeof(float), cudaMemcpyDeviceToHost);
+
+    float row_max = 0.f;
+    std::vector<int> ids;
+    std::vector<float> logits;
+    if (top_n > 0) {
+        ids.resize(top_n);
+        logits.resize(top_n);
+        cudaMemcpy(ids.data(), s.d_sorted_idx, (size_t)top_n * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(logits.data(), s.d_sorted_logits, (size_t)top_n * sizeof(float), cudaMemcpyDeviceToHost);
+        row_max = logits[0];   // rank 0 is always the row max, free from the descending sort
+    } else {
+        cudaMemcpy(&row_max, s.d_sorted_logits, sizeof(float), cudaMemcpyDeviceToHost);
+    }
+
+    const float logsumexp = row_max + logf(denom);
+    out.logprob = chosen_logit - logsumexp;
+    out.top_alternatives.reserve((size_t)top_n);
+    for (int i = 0; i < top_n; i++) out.top_alternatives.emplace_back(ids[i], logits[i] - logsumexp);
+    return out;
 }
 
 void Qwen35Model::dflash_maybe_capture_layer(int layer) {
@@ -1742,10 +1784,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     kernels::launch_topk_topp_mask(s.logits, c.vocab, s.d_vocab_iota, s.d_sorted_logits, s.d_sorted_idx,
                                    s.d_topk_exp, s.d_topk_cumsum, s.d_sort_temp, s.sort_temp_bytes,
                                    s.d_scan_temp, s.scan_temp_bytes,
-                                   s.d_sample_top_k, s.d_sample_top_p, st);
+                                   s.d_sample_top_k, s.d_sample_top_p, s.d_rank_by_id, st);
     kernels::launch_temperature_sample(s.logits, 1, c.vocab, s.d_sample_temp, s.d_sample_seed,
                                        s.d_sample_step, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+    // Always launched, never host-gated on logprobs: same CUDA-graph-captured-region rationale as
+    // launch_topk_topp_mask/launch_temperature_sample above -- this call site may replay for a
+    // LATER, different request whose logprobs setting differs. Negligible cost (single thread).
+    kernels::launch_extract_chosen_logit(s.d_out_id, s.d_rank_by_id, s.d_sorted_logits,
+                                         s.d_chosen_logit, st);
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
     if (capturing_graph && dflash_cap) {

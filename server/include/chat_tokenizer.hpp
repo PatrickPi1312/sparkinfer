@@ -2,11 +2,28 @@
 
 #include "chat_tools.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace sparkinfer_server {
+
+// One token's raw byte-level-BPE bytes + a UTF-8-safe display rendering of them, for
+// logprobs/top_logprobs' `token`/`bytes` fields. See gpt2_bytelevel_decode's doc comment.
+struct RawTokenPiece {
+    std::vector<uint8_t> bytes;
+    std::string display;
+};
+
+// Reverses the standard GPT-2/ByteLevel-BPE byte<->unicode mapping (the same fixed 256-entry
+// table used by every ByteLevel BPE tokenizer -- both models this server supports use
+// decoder.type: "ByteLevel") to recover a single vocab piece's true raw UTF-8 bytes, then builds
+// a display string via a lossy UTF-8 re-encode of those bytes (U+FFFD substitution for any
+// sequence that doesn't form valid UTF-8 on its own -- real OpenAI shows the same kind of
+// replacement-character artifacts for tokens that split a multi-byte character). Pure function,
+// no tokenizer object needed -- exposed directly for unit testing without a loaded tokenizer.json.
+RawTokenPiece gpt2_bytelevel_decode(const std::string& raw_piece);
 
 // HuggingFace tokenizer.json + Qwen3.6 chat template.
 class ChatTokenizer {
@@ -30,6 +47,15 @@ public:
     std::vector<int> encode_augmented(const ChatRequest& request, bool enable_thinking) const;
     std::string decode(const std::vector<int>& ids) const;
     std::string decode_delta(std::vector<int>& acc, int new_id) const;
+
+    // Raw single-id vocab lookup + ByteLevel decode, for logprobs/top_logprobs -- see
+    // gpt2_bytelevel_decode. Deliberately NOT built on decode()/decode_delta() (which are
+    // context-sensitive, designed around incremental multi-token diffing): this is a pure,
+    // stable, single-id lookup. Ids past the tokenizer's real vocab range (GGUF embedding-table
+    // padding -- e.g. 248,320 vs 248,070 real ids for Qwen3.6) return an empty RawTokenPiece
+    // (empty bytes, empty display) -- essentially never realistically selected, not specially
+    // handled beyond that.
+    RawTokenPiece id_to_raw_piece(int id) const;
 
 private:
     struct Impl;

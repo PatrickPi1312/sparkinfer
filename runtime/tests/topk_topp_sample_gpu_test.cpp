@@ -35,6 +35,7 @@ struct Scratch {
     size_t scan_temp_bytes = 0;
     int* d_top_k = nullptr;
     float* d_top_p = nullptr;
+    int* rank_by_id = nullptr;
 
     explicit Scratch(int v) : vocab(v) {
         cudaMalloc(&vocab_iota, vocab * sizeof(int));
@@ -44,6 +45,7 @@ struct Scratch {
         cudaMalloc(&topk_cumsum, vocab * sizeof(float));
         cudaMalloc(&d_top_k, sizeof(int));
         cudaMalloc(&d_top_p, sizeof(float));
+        cudaMalloc(&rank_by_id, vocab * sizeof(int));
         launch_vocab_iota_init(vocab_iota, vocab);
         sort_temp_bytes = topk_sort_temp_storage_bytes(vocab);
         scan_temp_bytes = topk_scan_temp_storage_bytes(vocab);
@@ -56,6 +58,7 @@ struct Scratch {
         cudaFree(topk_exp); cudaFree(topk_cumsum);
         cudaFree(sort_temp); cudaFree(scan_temp);
         cudaFree(d_top_k); cudaFree(d_top_p);
+        cudaFree(rank_by_id);
     }
     Scratch(const Scratch&) = delete;
     Scratch& operator=(const Scratch&) = delete;
@@ -71,7 +74,7 @@ std::vector<float> masked_logits(Scratch& s, std::vector<float> logits, int top_
     cudaMemcpy(s.d_top_p, &top_p, sizeof(float), cudaMemcpyHostToDevice);
     launch_topk_topp_mask(d_logits, vocab, s.vocab_iota, s.sorted_logits, s.sorted_idx,
                           s.topk_exp, s.topk_cumsum, s.sort_temp, s.sort_temp_bytes,
-                          s.scan_temp, s.scan_temp_bytes, s.d_top_k, s.d_top_p);
+                          s.scan_temp, s.scan_temp_bytes, s.d_top_k, s.d_top_p, s.rank_by_id);
     cudaMemcpy(logits.data(), d_logits, vocab * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(d_logits);
     return logits;
@@ -97,7 +100,7 @@ int sample_one(Scratch& s, const std::vector<float>& logits, int top_k, float to
 
     launch_topk_topp_mask(d_logits, vocab, s.vocab_iota, s.sorted_logits, s.sorted_idx,
                           s.topk_exp, s.topk_cumsum, s.sort_temp, s.sort_temp_bytes,
-                          s.scan_temp, s.scan_temp_bytes, s.d_top_k, s.d_top_p);
+                          s.scan_temp, s.scan_temp_bytes, s.d_top_k, s.d_top_p, s.rank_by_id);
     launch_temperature_sample(d_logits, 1, vocab, d_temp, d_seed, d_step);
     launch_argmax(d_logits, d_out, 1, vocab);
     int out = -1;
