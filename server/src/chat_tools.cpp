@@ -22,6 +22,12 @@ using json = nlohmann::json;
 // lives, so the client learns about the limit instead of silently having extra entries dropped.
 constexpr int kMaxLogitBiasEntries = 1024;
 
+// sparkinfer's own bound on `n` (OpenAI's API documents no fixed upper limit) -- each unit of n
+// costs a full redundant prefill+decode session against the shared ContinuousBatchEngine queue
+// (see ContinuousBatchEngine::submit_locked / max_queue_depth in sparkinfer_server.cpp); this
+// caps how much queue footprint one HTTP request can claim via n-fanout.
+constexpr int kMaxN = 8;
+
 constexpr const char* kImStart = "<|im_start|>";
 constexpr const char* kImEnd = "<|im_end|>";
 constexpr const char* kThinkOpen = "<think>";
@@ -1267,6 +1273,19 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
             bias.emplace_back(id, static_cast<float>(b));
         }
         out.logit_bias = std::move(bias);
+    }
+    if (root.contains("n") && !root["n"].is_null()) {
+        const auto& value = root["n"];
+        if (!value.is_number_integer()) {
+            err = "n must be an integer";
+            return false;
+        }
+        const long long n = value.get<long long>();
+        if (n < 1 || n > (long long)kMaxN) {
+            err = "n must be between 1 and " + std::to_string(kMaxN);
+            return false;
+        }
+        out.n = (int)n;
     }
     return true;
 }

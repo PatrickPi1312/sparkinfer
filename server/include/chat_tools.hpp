@@ -104,6 +104,12 @@ struct RequestControls {
     // through every complete_streaming call site, including the json_mode/tool-calling retry
     // loops.
     std::vector<std::pair<int, float>> logit_bias;
+    // OpenAI's n: number of independent completions ("choices") to return for this request.
+    // Default 1 (today's only behavior). Validated against kMaxN (chat_tools.cpp) -- sparkinfer's
+    // own bound, not an OpenAI-documented limit; see sparkinfer_server.cpp for the fan-out
+    // machinery this drives (n>1 runs n fully independent prefill+decode sessions concurrently,
+    // no shared-prefill optimization in v1).
+    int n = 1;
 };
 
 // vocab, when > 0, additionally rejects any logit_bias token id >= vocab with a real validation

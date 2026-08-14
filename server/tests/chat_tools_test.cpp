@@ -1151,6 +1151,27 @@ bool test_should_reject_dflash_logit_bias() {
     return true;
 }
 
+bool test_request_controls_n_validation() {
+    RequestControls controls;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", controls, err));
+    CHECK(controls.n == 1);
+    CHECK(parse_request_controls(R"({"n":1})", controls, err));
+    CHECK(controls.n == 1);
+    CHECK(parse_request_controls(R"({"n":8})", controls, err));
+    CHECK(controls.n == 8);
+    CHECK(!parse_request_controls(R"({"n":0})", controls, err));
+    CHECK(!parse_request_controls(R"({"n":-1})", controls, err));
+    CHECK(!parse_request_controls(R"({"n":9})", controls, err));
+    CHECK(!parse_request_controls(R"({"n":1.5})", controls, err));
+    CHECK(!parse_request_controls(R"({"n":"3"})", controls, err));
+    // Does not require temperature/seed to be set.
+    CHECK(parse_request_controls(R"({"n":3})", controls, err));
+    CHECK(controls.temperature == 0.f);
+    CHECK(!controls.seed_set);
+    return true;
+}
+
 bool test_plain_answer() {
     ChatRequest request;
     CHECK(parse_request(hermes_request(), request));
@@ -1375,6 +1396,7 @@ int main() {
     if (!test_should_reject_dflash_penalty()) return 1;
     if (!test_request_controls_logit_bias_validation()) return 1;
     if (!test_should_reject_dflash_logit_bias()) return 1;
+    if (!test_request_controls_n_validation()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
     if (!test_unsafe_protocol_names()) return 1;
