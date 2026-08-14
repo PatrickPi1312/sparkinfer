@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -962,9 +963,31 @@ int main(int argc, char** argv) {
                                  write_stream_finish(gs, cid, created, ci, out->finish_reason);
                              };
 
+                             // Wrapped in try/catch: for n>1 this body runs on a spawned
+                             // std::thread (see the fan-out below), not inside httplib's own
+                             // request-dispatch call stack -- an exception escaping a std::thread
+                             // callable is outside httplib's exception handling and calls
+                             // std::terminate(), crashing the WHOLE server for every concurrent
+                             // client rather than failing just this one request. Converting any
+                             // exception into the existing server_error path keeps that blast
+                             // radius scoped to one branch.
                              auto run_one = [&](int ci, uint64_t branch_seed, BranchOutcome* out) {
-                                 if (json_mode_active) run_json_mode_branch(ci, branch_seed, out);
-                                 else run_plain_or_tool_branch(ci, branch_seed, out);
+                                 try {
+                                     if (json_mode_active) run_json_mode_branch(ci, branch_seed, out);
+                                     else run_plain_or_tool_branch(ci, branch_seed, out);
+                                 } catch (const std::exception& e) {
+                                     // ok may already be true if the throw happened inside the
+                                     // final emit call (after the branch's own generation/parsing
+                                     // succeeded) -- force it back to false so the post-join
+                                     // aggregation's `!results[ci].ok` scan actually catches this.
+                                     out->ok = false;
+                                     out->fail = BranchOutcome::Fail::server_error;
+                                     out->fail_message = e.what();
+                                 } catch (...) {
+                                     out->ok = false;
+                                     out->fail = BranchOutcome::Fail::server_error;
+                                     out->fail_message = "unknown exception";
+                                 }
                              };
 
                              std::vector<BranchOutcome> results(n);
@@ -1094,7 +1117,13 @@ int main(int argc, char** argv) {
                      double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                  };
 
+                 // Wrapped in try/catch: for n>1 this body runs on a spawned std::thread (see
+                 // the fan-out below), outside httplib's own exception handling -- an escaping
+                 // exception would call std::terminate() and crash the whole server, not just
+                 // fail this one request. Converting any exception into the existing
+                 // server_error path keeps the blast radius scoped to one branch.
                  auto run_nonstream_branch = [&](uint64_t branch_seed) -> NonStreamBranchOutcome {
+                   try {
                      NonStreamBranchOutcome out;
                      sparkinfer_server::CompletionResult outcome;
                      sparkinfer_server::ParsedAssistantOutput parsed;
@@ -1304,6 +1333,19 @@ int main(int argc, char** argv) {
                      out.decode_tps = outcome.decode_tps;
                      out.ok = true;
                      return out;
+                   } catch (const std::exception& e) {
+                     NonStreamBranchOutcome out;
+                     out.http_status = 500;
+                     out.fail = NonStreamBranchOutcome::Fail::server_error;
+                     out.http_error = e.what();
+                     return out;
+                   } catch (...) {
+                     NonStreamBranchOutcome out;
+                     out.http_status = 500;
+                     out.fail = NonStreamBranchOutcome::Fail::server_error;
+                     out.http_error = "unknown exception";
+                     return out;
+                   }
                  };
 
                  std::vector<uint64_t> branch_seeds(controls.n);
@@ -1553,7 +1595,14 @@ int main(int argc, char** argv) {
                              // deduping it would need recording and replaying the whole delta
                              // sequence (same carve-out as chat completions' plain streaming
                              // path), deferred to a follow-up.
+                             // Wrapped in try/catch: for n>1 this body runs on a spawned
+                             // std::thread (see the fan-out below), outside httplib's own
+                             // exception handling -- an escaping exception would call
+                             // std::terminate() and crash the whole server, not just fail this
+                             // one request. Converting any exception into the existing
+                             // server_error path keeps the blast radius scoped to one branch.
                              auto run_branch = [&](int ci, uint64_t branch_seed, BranchOutcome* out) {
+                               try {
                                  sparkinfer_server::StopSequenceFilter stop_filter(stop);
                                  std::vector<int> stream_ids;
                                  stream_ids.reserve((size_t)max_tokens);
@@ -1620,6 +1669,18 @@ int main(int argc, char** argv) {
                                  write_stream_finish(gs, cid, created, ci,
                                                      outcome.reached_token_limit ? "length" : "stop",
                                                      "text_completion");
+                               } catch (const std::exception& e) {
+                                 // ok may already be true if the throw happened inside the final
+                                 // write_stream_finish call -- force it back to false so the
+                                 // post-join aggregation's `!results[ci].ok` scan catches this.
+                                 out->ok = false;
+                                 out->fail = BranchOutcome::Fail::server_error;
+                                 out->fail_message = e.what();
+                               } catch (...) {
+                                 out->ok = false;
+                                 out->fail = BranchOutcome::Fail::server_error;
+                                 out->fail_message = "unknown exception";
+                               }
                              };
 
                              std::vector<BranchOutcome> results(n);
@@ -1706,7 +1767,13 @@ int main(int argc, char** argv) {
                      double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
                  };
 
+                 // Wrapped in try/catch: for n>1 this body runs on a spawned std::thread (see
+                 // the fan-out below), outside httplib's own exception handling -- an escaping
+                 // exception would call std::terminate() and crash the whole server, not just
+                 // fail this one request. Converting any exception into the existing
+                 // server_error path keeps the blast radius scoped to one branch.
                  auto run_nonstream_branch = [&](uint64_t branch_seed) -> NonStreamLegacyResult {
+                   try {
                      NonStreamLegacyResult out;
                      std::vector<int> ids;
                      std::string stop_text;
@@ -1772,6 +1839,19 @@ int main(int argc, char** argv) {
                      out.decode_tps = outcome.decode_tps;
                      out.ok = true;
                      return out;
+                   } catch (const std::exception& e) {
+                     NonStreamLegacyResult out;
+                     out.http_status = 500;
+                     out.fail = NonStreamLegacyResult::Fail::server_error;
+                     out.http_error = e.what();
+                     return out;
+                   } catch (...) {
+                     NonStreamLegacyResult out;
+                     out.http_status = 500;
+                     out.fail = NonStreamLegacyResult::Fail::server_error;
+                     out.http_error = "unknown exception";
+                     return out;
+                   }
                  };
 
                  std::vector<uint64_t> branch_seeds(controls.n);

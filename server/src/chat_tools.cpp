@@ -1347,7 +1347,14 @@ bool parse_legacy_completion_request(const std::string& body, std::string& promp
             err = "best_of must be an integer";
             return false;
         }
-        if (root["best_of"].get<long long>() > 1) {
+        const long long bo = root["best_of"].get<long long>();
+        // OpenAI defines best_of as a positive integer (default 1); 0/negative are never valid
+        // regardless of the >1-is-unsupported restriction below.
+        if (bo < 1) {
+            err = "best_of must be a positive integer";
+            return false;
+        }
+        if (bo > 1) {
             err = "best_of > 1 is not supported";
             return false;
         }

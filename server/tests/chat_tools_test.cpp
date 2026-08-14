@@ -1199,10 +1199,12 @@ bool test_parse_legacy_completion_request() {
     CHECK(!parse_legacy_completion_request(R"({"prompt":"x","suffix":"y"})", prompt, echo, err));
     CHECK(parse_legacy_completion_request(R"({"prompt":"x","suffix":null})", prompt, echo, err));
 
-    // best_of: default/1 accepted (no-op), >1 rejected (unsupported).
+    // best_of: default/1 accepted (no-op), >1 rejected (unsupported), <1 rejected (never valid).
     CHECK(parse_legacy_completion_request(R"({"prompt":"x","best_of":1})", prompt, echo, err));
     CHECK(!parse_legacy_completion_request(R"({"prompt":"x","best_of":2})", prompt, echo, err));
     CHECK(!parse_legacy_completion_request(R"({"prompt":"x","best_of":1.5})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":"x","best_of":0})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":"x","best_of":-1})", prompt, echo, err));
     return true;
 }
 
