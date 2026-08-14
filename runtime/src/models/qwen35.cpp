@@ -4027,6 +4027,23 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const int ut = lw.prefill_up_q ? lw.prefill_up_qtype : lw.up_qtype;
             ok = convert(g, gt, c.moe_ffn, H, &lw.gate_fp4, &lw.gate_fp4_sf) &&
                  convert(u, ut, c.moe_ffn, H, &lw.up_fp4, &lw.up_fp4_sf);
+            // ffn_down too: same block-scaled format, [H rows, ffn cols]. #810/#813 stopped at
+            // gate/up; down passes the same shape gate (6656 %128, 19968 %128) and its input is
+            // the SwiGLU output this path already materializes as bf16. SPARKINFER_MUSE_NVFP4_DOWN=0
+            // keeps the shipped int8 down for A/B.
+            static const bool dn_on = [] {
+                const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN");
+                return !(e && e[0] == '0');
+            }();
+            if (ok && dn_on)
+                ok = convert(lw.down_q, lw.down_qtype, H, c.moe_ffn, &lw.down_fp4, &lw.down_fp4_sf);
+            // wo [H, qdim]: the other fat projection. SPARKINFER_MUSE_NVFP4_WO=0 disables.
+            static const bool wo_on = [] {
+                const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO");
+                return !(e && e[0] == '0');
+            }();
+            if (ok && wo_on && lw.wo)
+                ok = convert(lw.wo, lw.wo_type, H, s.qdim, &lw.wo_fp4, &lw.wo_fp4_sf);
             if (ok) {
                 release_prefill_copy(lw.prefill_gate_q, lw.gate_q);
                 release_prefill_copy(lw.prefill_up_q, lw.up_q);
