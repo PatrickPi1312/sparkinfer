@@ -1014,6 +1014,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // are already done. Only the prime norm above still needs the standalone quant (layer 0).
     const bool fnq = s.gguf && s.use_fnq && s.use_pq && s.use_llama;
 
+    // Muse Glimmer's sandwich tail can now emit the Q8_1 its consumer needs, the way
+    // add_rmsnorm2_q8 does for every other architecture. Both flags record what the tail
+    // ACTUALLY did (it declines on shapes its register path cannot serve), never what this
+    // architecture is assumed to do -- a wrong assumption here is the stale-aq81 failure the
+    // comments at the FFN and QKV call sites describe, and it degrades silently.
+    // muse_xn_q8 crosses the layer boundary: layer L's post-FFN tail feeds layer L+1's Q/K/V.
+    bool muse_hn_q8 = false, muse_xn_q8 = false;
+
     // ---- L2 weight prefetch into the sandwich-norm tail's idle window ----
     // Decode is DRAM-bound but only ~86% bus-utilized; the gap is time the bus idles inside a
     // latency-bound kernel. Muse Glimmer's two single-CTA sandwich tails per layer are the largest
@@ -1095,7 +1103,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         // L=1..n_layers-1 (both wk_type=12 Q4_K and wv_type=14 Q6_K route through proj_xn's
         // mmvq_q4k/mmvq_q6k branches, which read s.aq81 unconditionally) ran against the wrong
         // layer's quantized activation. Force a fresh quantize every layer for muse_glimmer.
-        bool xn_q8_ready = fnq && L > 0 && !c.muse_glimmer;
+        bool xn_q8_ready = (fnq && L > 0 && !c.muse_glimmer) || muse_xn_q8;
+        // Both flags are re-earned every layer by the tail that actually ran; consumed here, so
+        // a layer whose tail declines falls back to its own quantize instead of inheriting.
+        muse_hn_q8 = false;
+        muse_xn_q8 = false;
         auto prepare_xn_quant = [&](bool any_q4k, bool any_q6k, bool any_q80) {
             if (!s.gguf || !s.use_pq) return;
             if (xn_q8_ready) return;
@@ -1547,8 +1559,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // Cover it with the FFN gate/up matrices, which are streamed immediately after it.
             if (pf_win & 2) pf_fork(w.gate_q, w.up_q);
             if (muse_fuse_tail())
-                kernels::launch_muse_sandwich_tail(s.x, s.ao, w.post_attn_norm, w.ffn_norm,
-                                                   s.h, s.hn, 1, H, 1e-8f, c.rms_eps, st);
+                // hn is the FFN's input; let the tail hand it over already quantized. Nothing
+                // between here and the dense FFN touches aq81 on this architecture (n_shared=0,
+                // no router), so the buffer still holds Q8_1(hn) when gate/up read it.
+                muse_hn_q8 = kernels::launch_muse_sandwich_tail(s.x, s.ao, w.post_attn_norm,
+                                                   w.ffn_norm, s.h, s.hn,
+                                                   fnq ? s.aq81 : nullptr, 1, H, 1e-8f,
+                                                   c.rms_eps, st);
             else {
             kernels::launch_norm_then_add(s.x, s.ao, w.post_attn_norm, s.h, 1, H, 1e-8f, st);
             dbg_bf16(s.h, H, 50, L);   // tag 50: h = x + sandwich_norm(ao)  (post-attn residual)
@@ -1654,7 +1671,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
                                                1, c.top_k, H, c.moe_ffn,
-                                               (fnq && !c.muse_glimmer) ? s.aq81 : nullptr, st);
+                                               (muse_hn_q8 || (fnq && !c.muse_glimmer))
+                                                   ? s.aq81 : nullptr, st);
         } else if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
             // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
@@ -1796,8 +1814,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 }
             }
             if (muse_fuse_tail())
-                kernels::launch_muse_sandwich_tail(s.h, s.routed, w.post_ffn_norm, nextnorm,
-                                                   s.x, s.xn, 1, H, 1e-8f, c.rms_eps, st);
+                // xn is the NEXT layer's Q/K/V input; emitting Q8_1(xn) here is what finally
+                // lets muse_glimmer take the xn_q8_ready path other architectures already get
+                // from add_rmsnorm2_q8 / add_rmsnorm3_q8.
+                muse_xn_q8 = kernels::launch_muse_sandwich_tail(s.h, s.routed, w.post_ffn_norm,
+                                                   nextnorm, s.x, s.xn,
+                                                   fnq ? s.aq81 : nullptr, 1, H, 1e-8f,
+                                                   c.rms_eps, st);
             else {
             kernels::launch_norm_then_add(s.h, s.routed, w.post_ffn_norm, s.x, 1, H, 1e-8f, st);
             dbg_bf16(s.x, H, 70, L);   // tag 70: x = h + sandwich_norm(routed)  (layer output)
@@ -4002,6 +4025,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         const char* fp4q_env = getenv("SPARKINFER_MUSE_PREFILL_NVFP4_QKV");
         const bool qkvg_fp4_on = (!fp4q_env || fp4q_env[0] != '0') &&
                                  kernels::prefill_nvfp4_supported(128, 2 * qdim_a + 2 * kvdim_a, H);
+        int down_ready = 0;
         auto convert = [&](const void* src, int qtype, int rows, int cols,
                            const void** data, const void** sf) -> bool {
             void *d = nullptr, *scale = nullptr;
@@ -4059,6 +4083,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         int wo_ready = 0;
         const char* fp4_wo_env = getenv("SPARKINFER_MUSE_NVFP4_WO");
         bool wo_fp4_on = (!fp4_wo_env || fp4_wo_env[0] != '0');
+        const char* fp4o_env = getenv("SPARKINFER_MUSE_NVFP4_OUTPUTS");
+        size_t fp4_free = 0, fp4_total = 0;
+        cudaMemGetInfo(&fp4_free, &fp4_total);
+        (void)fp4_free;
+        bool down_fp4_on = c.max_seq <= 2048;
+        if (fp4o_env)
+            down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
+        // On a 32-GB card short prefill gets substantially more from down, while down+wo leaves no
+        // safe allocation margin. Long sessions use neither because these kernels require N=128.
+        wo_fp4_on = wo_fp4_on && c.max_seq <= 2048 && fp4_total >= (40ull << 30);
         {
             const size_t reserve = [] {
                 const char* e = getenv("SPARKINFER_MUSE_NVFP4_RESERVE_MB");
@@ -4120,6 +4154,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 ++ready;
                 if (lw.qkvg_fp4) ++qkvg_ready;
             }
+            // Output projections retain their compact GGUF tensors for decode; these FP4 copies
+            // are optional and failure-isolated, so a tight-memory card can still use gate/up.
+            if (ok && down_fp4_on &&
+                convert(lw.down_q, lw.down_qtype, H, c.moe_ffn,
+                        &lw.down_fp4, &lw.down_fp4_sf)) ++down_ready;
         }
         if (tmp) cudaFree(tmp);
         fprintf(stderr, "[prefill-muse] SM120 NVFP4 o-proj weights ready: %d/%d layers\n", wo_ready, c.n_layers);
@@ -4127,6 +4166,8 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                         " (qkv-gate %d/%d)\n",
                 ready, c.n_layers, ok ? "" : " (remaining layers use GGUF fallback)",
                 qkvg_ready, c.n_layers);
+        fprintf(stderr, "[prefill-muse] SM120 NVFP4 down weights ready: %d/%d layers\n",
+                down_ready, c.n_layers);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
     return true;
