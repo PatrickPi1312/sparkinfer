@@ -132,8 +132,9 @@ bool find_stop_match(const std::string& text, const std::vector<std::string>& st
     return found;
 }
 
-nlohmann::json stream_chunk_base(const std::string& cid, long long created) {
-    return {{"id", cid}, {"object", "chat.completion.chunk"}, {"created", created},
+nlohmann::json stream_chunk_base(const std::string& cid, long long created,
+                                 const char* object = "chat.completion.chunk") {
+    return {{"id", cid}, {"object", object}, {"created", created},
             {"model", g_model_name}};
 }
 
@@ -168,9 +169,10 @@ bool write_stream_role(GuardedSink& gs, const std::string& cid, long long create
 }
 
 bool write_stream_delta(GuardedSink& gs, const std::string& cid, long long created, const std::string& field,
-                        const std::string& piece, int choice_index, const nlohmann::json& logprobs = nullptr) {
+                        const std::string& piece, int choice_index, const nlohmann::json& logprobs = nullptr,
+                        const char* object = "chat.completion.chunk") {
     if (piece.empty()) return true;
-    auto chunk = stream_chunk_base(cid, created);
+    auto chunk = stream_chunk_base(cid, created, object);
     chunk["choices"] = nlohmann::json::array({{{"index", choice_index},
                                                 {"delta", {{field, piece}}},
                                                 {"finish_reason", nullptr},
@@ -193,8 +195,9 @@ bool write_stream_tool_call(GuardedSink& gs, const std::string& cid, long long c
 }
 
 bool write_stream_finish(GuardedSink& gs, const std::string& cid, long long created,
-                         int choice_index, const std::string& reason) {
-    auto chunk = stream_chunk_base(cid, created);
+                         int choice_index, const std::string& reason,
+                         const char* object = "chat.completion.chunk") {
+    auto chunk = stream_chunk_base(cid, created, object);
     chunk["choices"] = nlohmann::json::array({{{"index", choice_index},
                                                 {"delta", nlohmann::json::object()},
                                                 {"finish_reason", reason},
@@ -208,8 +211,9 @@ bool write_stream_finish(GuardedSink& gs, const std::string& cid, long long crea
 // across choices -- see the n-fanout aggregation code below.
 bool write_stream_usage(GuardedSink& gs, const std::string& cid, long long created,
                         int prompt_tokens, int completion_tokens, double ttft_ms,
-                        double generation_ms, double decode_tps) {
-    auto chunk = stream_chunk_base(cid, created);
+                        double generation_ms, double decode_tps,
+                        const char* object = "chat.completion.chunk") {
+    auto chunk = stream_chunk_base(cid, created, object);
     chunk["choices"] = nlohmann::json::array();
     nlohmann::json usage = {{"prompt_tokens", prompt_tokens},
                             {"completion_tokens", completion_tokens},
@@ -244,6 +248,34 @@ nlohmann::json build_logprobs_content_json(const std::vector<sparkinfer_server::
         content.push_back(item);
     }
     return content;
+}
+
+// Legacy /v1/completions logprobs shape: parallel arrays, not chat completions' array-of-objects
+// (build_logprobs_content_json above). text_offset is a running byte offset into the OWN choice's
+// text, starting at text_offset_base (0 normally; past the echoed prompt's length when echo=true
+// -- this runtime doesn't compute logprobs for echoed prompt tokens, only the generated
+// continuation, see the parse_legacy_completion_request doc comment).
+nlohmann::json build_legacy_logprobs_json(const std::vector<sparkinfer_server::TokenLogprob>& entries,
+                                          int top_logprobs_n, size_t text_offset_base) {
+    nlohmann::json tokens = nlohmann::json::array(), token_logprobs = nlohmann::json::array(),
+                   top_logprobs = nlohmann::json::array(), text_offset = nlohmann::json::array();
+    size_t offset = text_offset_base;
+    for (const auto& e : entries) {
+        const auto piece = g_tokenizer.id_to_raw_piece(e.token_id);
+        tokens.push_back(piece.display);
+        token_logprobs.push_back(e.logprob);
+        text_offset.push_back(offset);
+        offset += piece.display.size();
+        nlohmann::json alts = nlohmann::json::object();
+        const int k = std::min((int)e.top_alternatives.size(), top_logprobs_n);
+        for (int i = 0; i < k; i++) {
+            const auto ap = g_tokenizer.id_to_raw_piece(e.top_alternatives[i].first);
+            alts[ap.display] = e.top_alternatives[i].second;
+        }
+        top_logprobs.push_back(alts);
+    }
+    return {{"tokens", tokens}, {"token_logprobs", token_logprobs},
+            {"top_logprobs", top_logprobs}, {"text_offset", text_offset}};
 }
 
 // Only ever called once, single-threaded, after every branch has joined -- still routed through
@@ -1367,6 +1399,454 @@ int main(int argc, char** argv) {
                  }
                  const nlohmann::json body = {
                      {"id", cid}, {"object", "chat.completion"}, {"created", created},
+                     {"model", g_model_name}, {"choices", choices}, {"usage", usage}};
+                 g_requests_ok++;
+                 res.set_content(body.dump(), "application/json");
+             });
+
+    // Legacy pre-chat API: raw prompt string in, plain text out. No messages array, no chat
+    // template, no tool-calling, no response_format, no reasoning split -- RequestControls/
+    // parse_request_controls (temperature/top_p/top_k/penalties/logit_bias/n/seed/stop/stream/
+    // logprobs) and the GuardedSink/write_stream_* SSE helpers are fully generic and reused as-is
+    // from /v1/chat/completions above; ThinkingStreamSplitter/tool_protocol/json_mode_active have
+    // no equivalent here and are deliberately not dragged in -- there is exactly ONE per-branch
+    // shape, not a dispatcher between two.
+    svr.Post("/v1/completions",
+             [&engine](const httplib::Request& req, httplib::Response& res) {
+                 if (!auth_ok(req)) {
+                     res.status = 401;
+                     res.set_content("{\"error\":{\"message\":\"unauthorized\"}}", "application/json");
+                     return;
+                 }
+                 if (g_shutdown_requested.load()) {
+                     res.status = 503;
+                     res.set_content("{\"error\":{\"message\":\"server is shutting down\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 if (!engine.loaded()) {
+                     res.status = 503;
+                     res.set_content("{\"error\":{\"message\":\"model not loaded\"}}", "application/json");
+                     return;
+                 }
+
+                 g_requests_total++;
+                 std::string prompt;
+                 bool echo = false;
+                 std::string err;
+                 if (!sparkinfer_server::parse_legacy_completion_request(req.body, prompt, echo, err)) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 sparkinfer_server::RequestControls controls;
+                 if (!sparkinfer_server::parse_request_controls(req.body, controls, err, engine.vocab(),
+                                                                 /*legacy_logprobs=*/true)) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"" + json_escape(err) + "\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 const bool dflash_env_on =
+                     [] { const char* e = getenv("SPARKINFER_DFLASH"); return e && e[0] == '1'; }();
+                 if (sparkinfer_server::should_reject_dflash_temperature(dflash_env_on, controls.temperature)) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"temperature sampling is not supported "
+                                     "while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 if (sparkinfer_server::should_reject_dflash_penalty(
+                         dflash_env_on, controls.presence_penalty, controls.frequency_penalty)) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"presence_penalty/frequency_penalty are not "
+                                     "supported while SPARKINFER_DFLASH=1 is active on this server instance\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 if (sparkinfer_server::should_reject_dflash_logit_bias(
+                         dflash_env_on, !controls.logit_bias.empty())) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"logit_bias is not supported while "
+                                     "SPARKINFER_DFLASH=1 is active on this server instance\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 if (!controls.seed_set) {
+                     static thread_local std::random_device rd;
+                     controls.seed = ((uint64_t)rd() << 32) | rd();
+                 }
+                 const bool stream = controls.stream;
+                 if (stream) g_requests_streaming++;
+                 int max_tokens = controls.max_tokens;
+                 if (max_tokens <= 0) max_tokens = 256;
+                 if (max_tokens > max_output_tokens()) max_tokens = max_output_tokens();
+
+                 const std::vector<int> prompt_ids = g_tokenizer.encode_raw(prompt);
+                 if (prompt_ids.empty()) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"tokenize returned no ids\"}}",
+                                     "application/json");
+                     return;
+                 }
+                 if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content(
+                         "{\"error\":{\"message\":\"context overflow: prompt=" +
+                         std::to_string(prompt_ids.size()) + " max_tokens=" + std::to_string(max_tokens) +
+                         " exceeds server ctx=" + std::to_string(engine.max_seq()) + "\"}}",
+                         "application/json");
+                     return;
+                 }
+
+                 const std::string cid = random_id("cmpl-");
+                 const auto created = (long long)std::chrono::duration_cast<std::chrono::seconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                 auto status_for_outcome = [](const sparkinfer_server::CompletionResult& o) -> int {
+                     if (o.overloaded)   return 429;
+                     if (o.alloc_failed) return 503;
+                     if (o.timed_out)    return 504;
+                     return 400;
+                 };
+
+                 if (stream) {
+                     res.set_chunked_content_provider(
+                         "text/event-stream",
+                         [&engine, prompt_ids, prompt, echo, max_tokens, cid, created,
+                          include_usage = controls.include_usage, stop = controls.stop,
+                          temperature = controls.temperature, seed = controls.seed,
+                          top_k = controls.top_k, top_p = controls.top_p,
+                          presence_penalty = controls.presence_penalty,
+                          frequency_penalty = controls.frequency_penalty,
+                          logit_bias = controls.logit_bias,
+                          logprobs = controls.logprobs, top_logprobs = controls.top_logprobs,
+                          n = controls.n]
+                         (size_t offset, httplib::DataSink& sink) {
+                             if (offset > 0) {
+                                 sink.done();
+                                 return true;
+                             }
+
+                             std::mutex sink_mu;
+                             GuardedSink gs{sink, sink_mu};
+
+                             struct BranchOutcome {
+                                 bool ok = false;
+                                 enum class Fail { none, cancelled, overloaded, alloc_failed, timeout,
+                                                    server_error } fail = Fail::none;
+                                 std::string fail_message;
+                                 long long prompt_tokens = 0, completion_tokens = 0;
+                                 double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
+                             };
+
+                             // Never deduped at temperature<=0, unlike the non-streaming path
+                             // below -- this emits incrementally, live, as tokens generate;
+                             // deduping it would need recording and replaying the whole delta
+                             // sequence (same carve-out as chat completions' plain streaming
+                             // path), deferred to a follow-up.
+                             auto run_branch = [&](int ci, uint64_t branch_seed, BranchOutcome* out) {
+                                 sparkinfer_server::StopSequenceFilter stop_filter(stop);
+                                 std::vector<int> stream_ids;
+                                 stream_ids.reserve((size_t)max_tokens);
+                                 bool stopped_by_sequence = false;
+                                 size_t offset_so_far = echo ? prompt.size() : 0;
+                                 std::vector<sparkinfer_server::TokenLogprob> pending_logprobs;
+                                 auto on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
+                                     pending_logprobs.push_back(tl);
+                                 };
+                                 if (echo) write_stream_delta(gs, cid, created, "text", prompt, ci, nullptr,
+                                                              "text_completion");
+                                 auto on_tok = [&](int tid) -> bool {
+                                     std::string piece = g_tokenizer.decode_delta(stream_ids, tid);
+                                     std::string safe = stop_filter.feed(piece);
+                                     if (stop_filter.matched()) {
+                                         if (!safe.empty()) {
+                                             nlohmann::json lp = nullptr;
+                                             if (logprobs) {
+                                                 lp = build_legacy_logprobs_json(pending_logprobs, top_logprobs,
+                                                                                 offset_so_far);
+                                                 offset_so_far += safe.size();
+                                                 pending_logprobs.clear();
+                                             }
+                                             write_stream_delta(gs, cid, created, "text", safe, ci, lp,
+                                                                "text_completion");
+                                         }
+                                         stopped_by_sequence = true;
+                                         return false;
+                                     }
+                                     nlohmann::json lp = nullptr;
+                                     if (logprobs && !safe.empty()) {
+                                         lp = build_legacy_logprobs_json(pending_logprobs, top_logprobs, offset_so_far);
+                                         offset_so_far += safe.size();
+                                         pending_logprobs.clear();
+                                     }
+                                     bool ok = write_stream_delta(gs, cid, created, "text", safe, ci, lp,
+                                                                  "text_completion");
+                                     return ok && sink.is_writable();
+                                 };
+                                 const std::function<void(const sparkinfer_server::TokenLogprob&)> maybe_on_tok_logprob =
+                                     logprobs ? std::function<void(const sparkinfer_server::TokenLogprob&)>(on_tok_logprob)
+                                              : nullptr;
+                                 const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
+                                     temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
+                                     logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob);
+                                 out->prompt_tokens = (long long)prompt_ids.size();
+                                 out->completion_tokens = (long long)stream_ids.size();
+                                 if (outcome.cancelled && !stopped_by_sequence) {
+                                     out->fail = BranchOutcome::Fail::cancelled;
+                                     return;
+                                 }
+                                 if (!outcome.error.empty()) {
+                                     out->fail = outcome.overloaded ? BranchOutcome::Fail::overloaded
+                                               : outcome.alloc_failed ? BranchOutcome::Fail::alloc_failed
+                                               : outcome.timed_out ? BranchOutcome::Fail::timeout
+                                                                    : BranchOutcome::Fail::server_error;
+                                     out->fail_message = outcome.error;
+                                     return;
+                                 }
+                                 out->ttft_ms = outcome.ttft_ms;
+                                 out->generation_ms = outcome.generation_ms;
+                                 out->decode_tps = outcome.decode_tps;
+                                 out->ok = true;
+                                 write_stream_finish(gs, cid, created, ci,
+                                                     outcome.reached_token_limit ? "length" : "stop",
+                                                     "text_completion");
+                             };
+
+                             std::vector<BranchOutcome> results(n);
+                             std::vector<uint64_t> branch_seeds(n);
+                             for (int i = 0; i < n; i++) branch_seeds[i] = seed + (uint64_t)i;
+
+                             if (n == 1) {
+                                 run_branch(0, branch_seeds[0], &results[0]);
+                             } else {
+                                 std::vector<std::thread> threads;
+                                 threads.reserve(n);
+                                 for (int ci = 0; ci < n; ci++)
+                                     threads.emplace_back(run_branch, ci, branch_seeds[ci], &results[ci]);
+                                 for (auto& t : threads) t.join();
+                             }
+
+                             int first_fail = -1;
+                             for (int ci = 0; ci < n; ci++) {
+                                 if (!results[ci].ok) { first_fail = ci; break; }
+                             }
+                             long long agg_prompt = 0, agg_completion = 0;
+                             for (const auto& r : results) {
+                                 agg_prompt += r.prompt_tokens;
+                                 agg_completion += r.completion_tokens;
+                             }
+                             g_prompt_tokens_total += (uint64_t)agg_prompt;
+                             g_completion_tokens_total += (uint64_t)agg_completion;
+
+                             if (first_fail >= 0) {
+                                 const auto& f = results[first_fail];
+                                 switch (f.fail) {
+                                     case BranchOutcome::Fail::cancelled:    g_requests_cancelled++; break;
+                                     case BranchOutcome::Fail::overloaded:   g_requests_overloaded++; break;
+                                     case BranchOutcome::Fail::alloc_failed: g_requests_alloc_failed++; break;
+                                     case BranchOutcome::Fail::timeout:      g_requests_timeout++; break;
+                                     default:                                g_requests_server_error++; break;
+                                 }
+                                 if (f.fail == BranchOutcome::Fail::cancelled) {
+                                     sink.done();
+                                     return true;
+                                 }
+                                 write_sse_json(gs, {{"error", {{"message", f.fail_message}}}});
+                                 if (include_usage)
+                                     write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
+                                                        (int)agg_completion, -1.0, -1.0, -1.0,
+                                                        "text_completion");
+                                 write_stream_done(gs);
+                                 sink.done();
+                                 return true;
+                             }
+
+                             g_requests_ok++;
+                             double ttft_min = -1.0, gen_max = -1.0;
+                             for (const auto& r : results) {
+                                 if (r.ttft_ms >= 0.0 && (ttft_min < 0.0 || r.ttft_ms < ttft_min)) ttft_min = r.ttft_ms;
+                                 if (r.generation_ms >= 0.0 && r.generation_ms > gen_max) gen_max = r.generation_ms;
+                             }
+                             const double decode_tps_agg =
+                                 gen_max > 0.0 ? (double)agg_completion / (gen_max / 1000.0) : -1.0;
+                             if (include_usage)
+                                 write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
+                                                    (int)agg_completion, ttft_min, gen_max, decode_tps_agg,
+                                                    "text_completion");
+                             write_stream_done(gs);
+                             sink.done();
+                             return true;
+                         });
+                     return;
+                 }
+
+                 // Non-streaming: unlike the streaming path above, every sub-case already fully
+                 // buffers its output before this function returns, so a duplicate choice can
+                 // just reuse branch 0's already-built result at temperature<=0 instead of
+                 // re-running generation -- no incrementally-emitted carve-out needed here.
+                 struct NonStreamLegacyResult {
+                     bool ok = false;
+                     enum class Fail { none, overloaded, alloc_failed, timeout, server_error } fail = Fail::none;
+                     int http_status = 200;
+                     std::string http_error;
+                     std::string text;
+                     std::string finish_reason;
+                     nlohmann::json logprobs_json = nullptr;
+                     long long prompt_tokens = 0, completion_tokens = 0;
+                     double ttft_ms = -1.0, generation_ms = -1.0, decode_tps = -1.0;
+                 };
+
+                 auto run_nonstream_branch = [&](uint64_t branch_seed) -> NonStreamLegacyResult {
+                     NonStreamLegacyResult out;
+                     std::vector<int> ids;
+                     std::string stop_text;
+                     bool stopped_by_sequence = false;
+                     std::vector<sparkinfer_server::TokenLogprob> logprob_entries;
+                     auto on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
+                         logprob_entries.push_back(tl);
+                     };
+                     auto on_tok = [&](int tid) -> bool {
+                         if (controls.stop.empty()) {
+                             ids.push_back(tid);
+                             return true;
+                         }
+                         stop_text += g_tokenizer.decode_delta(ids, tid);
+                         size_t pos;
+                         if (find_stop_match(stop_text, controls.stop, pos)) {
+                             stopped_by_sequence = true;
+                             if (controls.logprobs && !logprob_entries.empty()) logprob_entries.pop_back();
+                             return false;
+                         }
+                         return true;
+                     };
+                     const std::function<void(const sparkinfer_server::TokenLogprob&)> maybe_on_tok_logprob =
+                         controls.logprobs ? std::function<void(const sparkinfer_server::TokenLogprob&)>(on_tok_logprob)
+                                          : nullptr;
+                     const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
+                         controls.temperature, branch_seed, controls.top_k, controls.top_p,
+                         controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
+                         controls.logprobs, controls.top_logprobs, maybe_on_tok_logprob);
+                     if (logprob_entries.size() > outcome.tokens.size())
+                         logprob_entries.resize(outcome.tokens.size());
+                     out.prompt_tokens = (long long)prompt_ids.size();
+                     out.completion_tokens = (long long)outcome.tokens.size();
+                     if (!outcome.error.empty()) {
+                         out.http_status = status_for_outcome(outcome);
+                         out.fail = outcome.overloaded ? NonStreamLegacyResult::Fail::overloaded
+                                  : outcome.alloc_failed ? NonStreamLegacyResult::Fail::alloc_failed
+                                  : outcome.timed_out ? NonStreamLegacyResult::Fail::timeout
+                                                       : NonStreamLegacyResult::Fail::server_error;
+                         out.http_error = outcome.error;
+                         return out;
+                     }
+                     std::string text;
+                     std::string decode_err;
+                     if (!decode_ids(outcome.tokens, text, decode_err)) {
+                         out.http_status = 500;
+                         out.fail = NonStreamLegacyResult::Fail::server_error;
+                         out.http_error = decode_err;
+                         return out;
+                     }
+                     if (stopped_by_sequence) {
+                         size_t pos;
+                         if (find_stop_match(text, controls.stop, pos)) text.resize(pos);
+                     }
+                     out.text = echo ? (prompt + text) : text;
+                     out.finish_reason = outcome.reached_token_limit ? "length" : "stop";
+                     out.logprobs_json = controls.logprobs
+                         ? build_legacy_logprobs_json(logprob_entries, controls.top_logprobs,
+                                                      echo ? prompt.size() : 0)
+                         : nlohmann::json(nullptr);
+                     out.ttft_ms = outcome.ttft_ms;
+                     out.generation_ms = outcome.generation_ms;
+                     out.decode_tps = outcome.decode_tps;
+                     out.ok = true;
+                     return out;
+                 };
+
+                 std::vector<uint64_t> branch_seeds(controls.n);
+                 for (int i = 0; i < controls.n; i++) branch_seeds[i] = controls.seed + (uint64_t)i;
+                 std::vector<NonStreamLegacyResult> results(controls.n);
+                 const bool can_dedup = controls.temperature <= 0.f;
+                 if (controls.n == 1) {
+                     results[0] = run_nonstream_branch(branch_seeds[0]);
+                 } else if (can_dedup) {
+                     results[0] = run_nonstream_branch(branch_seeds[0]);
+                     if (results[0].ok) {
+                         for (int i = 1; i < controls.n; i++) {
+                             results[i] = results[0];
+                             results[i].prompt_tokens = 0;
+                             results[i].completion_tokens = 0;
+                         }
+                     }
+                 } else {
+                     std::vector<std::thread> threads;
+                     threads.reserve(controls.n);
+                     for (int i = 0; i < controls.n; i++)
+                         threads.emplace_back([&, i] { results[i] = run_nonstream_branch(branch_seeds[i]); });
+                     for (auto& t : threads) t.join();
+                 }
+
+                 int first_fail = -1;
+                 for (int i = 0; i < controls.n; i++) {
+                     if (!results[i].ok) { first_fail = i; break; }
+                 }
+                 long long agg_prompt = 0, agg_completion = 0;
+                 for (const auto& r : results) {
+                     agg_prompt += r.prompt_tokens;
+                     agg_completion += r.completion_tokens;
+                 }
+                 g_prompt_tokens_total += (uint64_t)agg_prompt;
+                 g_completion_tokens_total += (uint64_t)agg_completion;
+
+                 if (first_fail >= 0) {
+                     const auto& f = results[first_fail];
+                     switch (f.fail) {
+                         case NonStreamLegacyResult::Fail::overloaded:   g_requests_overloaded++; break;
+                         case NonStreamLegacyResult::Fail::alloc_failed: g_requests_alloc_failed++; break;
+                         case NonStreamLegacyResult::Fail::timeout:      g_requests_timeout++; break;
+                         default:                                       g_requests_server_error++; break;
+                     }
+                     res.status = f.http_status;
+                     res.set_content("{\"error\":{\"message\":\"" + json_escape(f.http_error) + "\"}}",
+                                     "application/json");
+                     return;
+                 }
+
+                 double ttft_min = -1.0, gen_max = -1.0;
+                 for (const auto& r : results) {
+                     if (r.ttft_ms >= 0.0 && (ttft_min < 0.0 || r.ttft_ms < ttft_min)) ttft_min = r.ttft_ms;
+                     if (r.generation_ms >= 0.0 && r.generation_ms > gen_max) gen_max = r.generation_ms;
+                 }
+                 const double decode_tps_agg =
+                     gen_max > 0.0 ? (double)agg_completion / (gen_max / 1000.0) : -1.0;
+
+                 nlohmann::json usage = {
+                     {"prompt_tokens", (int)results[0].prompt_tokens},
+                     {"completion_tokens", (int)agg_completion},
+                     {"total_tokens", (int)(results[0].prompt_tokens + agg_completion)}};
+                 if (ttft_min >= 0.0) usage["ttft_ms"] = ttft_min;
+                 if (gen_max >= 0.0) usage["generation_ms"] = gen_max;
+                 if (decode_tps_agg >= 0.0) usage["decode_tps"] = decode_tps_agg;
+
+                 nlohmann::json choices = nlohmann::json::array();
+                 for (int i = 0; i < controls.n; i++) {
+                     choices.push_back({{"text", results[i].text}, {"index", i},
+                                        {"logprobs", results[i].logprobs_json},
+                                        {"finish_reason", results[i].finish_reason}});
+                 }
+                 const nlohmann::json body = {
+                     {"id", cid}, {"object", "text_completion"}, {"created", created},
                      {"model", g_model_name}, {"choices", choices}, {"usage", usage}};
                  g_requests_ok++;
                  res.set_content(body.dump(), "application/json");

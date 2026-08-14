@@ -708,6 +708,12 @@ std::vector<int> ChatTokenizer::encode_augmented(const ChatRequest& request, boo
     return std::vector<int>(enc.begin(), enc.end());
 }
 
+std::vector<int> ChatTokenizer::encode_raw(const std::string& text) const {
+    if (!impl_->tok) return {};
+    const std::vector<int32_t> enc = impl_->tok->Encode(text);
+    return std::vector<int>(enc.begin(), enc.end());
+}
+
 std::string ChatTokenizer::decode(const std::vector<int>& ids) const {
     if (!impl_->tok || ids.empty()) return {};
     std::vector<int32_t> v(ids.begin(), ids.end());

@@ -1050,7 +1050,7 @@ bool validate_response_format(const std::string& content, const ResponseFormat& 
 }
 
 bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err,
-                            int vocab) {
+                            int vocab, bool legacy_logprobs) {
     const auto root = json::parse(body, nullptr, false);
     if (root.is_discarded() || !root.is_object()) {
         err = "request body must be a JSON object";
@@ -1210,13 +1210,29 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
         out.frequency_penalty = static_cast<float>(f);
     }
     if (root.contains("logprobs") && !root["logprobs"].is_null()) {
-        if (!root["logprobs"].is_boolean()) {
-            err = "logprobs must be a boolean";
-            return false;
+        if (legacy_logprobs) {
+            // Legacy /v1/completions: logprobs itself is an integer ("how many top logprobs per
+            // token"), not a boolean -- there is no separate top_logprobs field in this mode.
+            if (!root["logprobs"].is_number_integer()) {
+                err = "logprobs must be an integer";
+                return false;
+            }
+            const long long lp = root["logprobs"].get<long long>();
+            if (lp < 0 || lp > 20) {
+                err = "logprobs must be between 0 and 20";
+                return false;
+            }
+            out.logprobs = lp > 0;
+            out.top_logprobs = static_cast<int>(lp);
+        } else {
+            if (!root["logprobs"].is_boolean()) {
+                err = "logprobs must be a boolean";
+                return false;
+            }
+            out.logprobs = root["logprobs"].get<bool>();
         }
-        out.logprobs = root["logprobs"].get<bool>();
     }
-    if (root.contains("top_logprobs") && !root["top_logprobs"].is_null()) {
+    if (!legacy_logprobs && root.contains("top_logprobs") && !root["top_logprobs"].is_null()) {
         const auto& value = root["top_logprobs"];
         if (!value.is_number_integer()) {
             err = "top_logprobs must be an integer";
@@ -1287,6 +1303,56 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
         }
         out.n = (int)n;
     }
+    return true;
+}
+
+bool parse_legacy_completion_request(const std::string& body, std::string& prompt_out,
+                                     bool& echo_out, std::string& err) {
+    prompt_out.clear();
+    echo_out = false;
+    const auto root = json::parse(body, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) {
+        err = "request body must be a JSON object";
+        return false;
+    }
+    if (!root.contains("prompt") || root["prompt"].is_null()) {
+        err = "prompt is required";
+        return false;
+    }
+    if (!root["prompt"].is_string()) {
+        // OpenAI's own API also accepts an array of strings (batched independent prompts) or
+        // pre-tokenized integer arrays -- both out of scope for v1, rejected explicitly rather
+        // than silently only handling the first entry.
+        err = "prompt must be a string";
+        return false;
+    }
+    const std::string prompt = root["prompt"].get<std::string>();
+    if (prompt.empty()) {
+        err = "prompt must not be empty";
+        return false;
+    }
+    if (root.contains("echo") && !root["echo"].is_null()) {
+        if (!root["echo"].is_boolean()) {
+            err = "echo must be a boolean";
+            return false;
+        }
+        echo_out = root["echo"].get<bool>();
+    }
+    if (root.contains("suffix") && !root["suffix"].is_null()) {
+        err = "suffix is not supported";
+        return false;
+    }
+    if (root.contains("best_of") && !root["best_of"].is_null()) {
+        if (!root["best_of"].is_number_integer()) {
+            err = "best_of must be an integer";
+            return false;
+        }
+        if (root["best_of"].get<long long>() > 1) {
+            err = "best_of > 1 is not supported";
+            return false;
+        }
+    }
+    prompt_out = prompt;
     return true;
 }
 

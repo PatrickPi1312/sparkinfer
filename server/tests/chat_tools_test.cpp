@@ -21,6 +21,7 @@ using sparkinfer_server::ToolCall;
 using sparkinfer_server::RequestControls;
 using sparkinfer_server::apply_qwen36_tools_template;
 using sparkinfer_server::parse_chat_request_json;
+using sparkinfer_server::parse_legacy_completion_request;
 using sparkinfer_server::parse_qwen36_tool_output;
 using sparkinfer_server::parse_request_controls;
 using sparkinfer_server::should_reject_dflash_logit_bias;
@@ -1172,6 +1173,66 @@ bool test_request_controls_n_validation() {
     return true;
 }
 
+bool test_parse_legacy_completion_request() {
+    std::string prompt, err;
+    bool echo = false;
+
+    CHECK(parse_legacy_completion_request(R"({"prompt":"Say hi."})", prompt, echo, err));
+    CHECK(prompt == "Say hi.");
+    CHECK(!echo);
+
+    CHECK(parse_legacy_completion_request(R"({"prompt":"Say hi.","echo":true})", prompt, echo, err));
+    CHECK(echo);
+    CHECK(parse_legacy_completion_request(R"({"prompt":"Say hi.","echo":false})", prompt, echo, err));
+    CHECK(!echo);
+    CHECK(!parse_legacy_completion_request(R"({"prompt":"Say hi.","echo":"yes"})", prompt, echo, err));
+
+    // prompt required, must be a non-empty string -- arrays/ints/missing all rejected (v1 scope).
+    CHECK(!parse_legacy_completion_request(R"({})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":null})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":123})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":["a","b"]})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":[1,2,3]})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":""})", prompt, echo, err));
+
+    // suffix (fill-in-the-middle) unsupported, always rejected when set.
+    CHECK(!parse_legacy_completion_request(R"({"prompt":"x","suffix":"y"})", prompt, echo, err));
+    CHECK(parse_legacy_completion_request(R"({"prompt":"x","suffix":null})", prompt, echo, err));
+
+    // best_of: default/1 accepted (no-op), >1 rejected (unsupported).
+    CHECK(parse_legacy_completion_request(R"({"prompt":"x","best_of":1})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":"x","best_of":2})", prompt, echo, err));
+    CHECK(!parse_legacy_completion_request(R"({"prompt":"x","best_of":1.5})", prompt, echo, err));
+    return true;
+}
+
+bool test_request_controls_legacy_logprobs_validation() {
+    RequestControls controls;
+    std::string err;
+
+    // Legacy mode: logprobs is an integer (how many top logprobs), no separate top_logprobs field.
+    CHECK(parse_request_controls(R"({})", controls, err, 0, /*legacy_logprobs=*/true));
+    CHECK(!controls.logprobs);
+    CHECK(parse_request_controls(R"({"logprobs":0})", controls, err, 0, true));
+    CHECK(!controls.logprobs);
+    CHECK(parse_request_controls(R"({"logprobs":3})", controls, err, 0, true));
+    CHECK(controls.logprobs);
+    CHECK(controls.top_logprobs == 3);
+    CHECK(parse_request_controls(R"({"logprobs":20})", controls, err, 0, true));
+    CHECK(controls.top_logprobs == 20);
+    CHECK(!parse_request_controls(R"({"logprobs":21})", controls, err, 0, true));
+    CHECK(!parse_request_controls(R"({"logprobs":-1})", controls, err, 0, true));
+    CHECK(!parse_request_controls(R"({"logprobs":1.5})", controls, err, 0, true));
+    // Wrong shape for this mode: a boolean (chat's shape) is rejected in legacy mode.
+    CHECK(!parse_request_controls(R"({"logprobs":true})", controls, err, 0, true));
+
+    // Chat (default) mode: an integer (legacy's shape) is rejected.
+    CHECK(!parse_request_controls(R"({"logprobs":3})", controls, err));
+    CHECK(parse_request_controls(R"({"logprobs":true})", controls, err));
+    CHECK(controls.logprobs);
+    return true;
+}
+
 bool test_plain_answer() {
     ChatRequest request;
     CHECK(parse_request(hermes_request(), request));
@@ -1397,6 +1458,8 @@ int main() {
     if (!test_request_controls_logit_bias_validation()) return 1;
     if (!test_should_reject_dflash_logit_bias()) return 1;
     if (!test_request_controls_n_validation()) return 1;
+    if (!test_parse_legacy_completion_request()) return 1;
+    if (!test_request_controls_legacy_logprobs_validation()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
     if (!test_unsafe_protocol_names()) return 1;

@@ -45,6 +45,11 @@ public:
     // response_format correction turn appended to the original request) without round-tripping
     // through a serialized JSON body. Returns an empty vector if the tokenizer isn't loaded.
     std::vector<int> encode_augmented(const ChatRequest& request, bool enable_thinking) const;
+    // Plain string -> ids, no chat template applied -- for the legacy /v1/completions endpoint's
+    // raw prompt (unlike encode_chat_request/encode_augmented, which both wrap the input in the
+    // Qwen3.6/Muse Glimmer chat template first). Returns an empty vector if the tokenizer isn't
+    // loaded.
+    std::vector<int> encode_raw(const std::string& text) const;
     std::string decode(const std::vector<int>& ids) const;
     std::string decode_delta(std::vector<int>& acc, int new_id) const;
 

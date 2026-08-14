@@ -116,8 +116,29 @@ struct RequestControls {
 // error (400) instead of silently letting it through -- 0 (the default) skips that upper-bound
 // check, so existing callers that don't have a vocab size handy are unaffected. Negative token
 // ids and malformed keys are always rejected regardless of vocab.
+//
+// legacy_logprobs switches the `logprobs` field's wire shape: false (default, chat completions)
+// requires a boolean, paired with a separate `top_logprobs` integer field; true (the legacy
+// /v1/completions endpoint) requires `logprobs` itself to be an integer in [0,20] ("how many top
+// logprobs per token"), mapped onto out.logprobs = (value > 0) and out.top_logprobs = value --
+// there is no separate top_logprobs field in legacy mode. The two modes deliberately do not
+// accept each other's shape (a boolean is rejected in legacy mode, an integer is rejected in
+// chat mode).
 bool parse_request_controls(const std::string& body, RequestControls& out, std::string& err,
-                            int vocab = 0);
+                            int vocab = 0, bool legacy_logprobs = false);
+
+// Parses the legacy-completions-only fields (prompt/echo/suffix/best_of) that have no
+// chat-completions equivalent -- call this AND parse_request_controls against the same request
+// body for the /v1/completions endpoint. prompt_out/echo_out are left at their default (empty
+// string, false) on any validation failure.
+//
+// v1 scope: prompt must be a single string (an array of strings/pre-tokenized ids -- both valid
+// in OpenAI's own API -- is rejected with a clear error rather than silently only handling one).
+// suffix (fill-in-the-middle) is rejected if set -- unsupported. best_of is rejected if set to
+// anything other than its default (1) -- ranking multiple server-side completions by cumulative
+// logprob has no existing scoring primitive in this runtime, out of scope for v1.
+bool parse_legacy_completion_request(const std::string& body, std::string& prompt_out,
+                                     bool& echo_out, std::string& err);
 
 // Pure decision function for the DFlash+temperature-sampling incompatibility (kept separate from
 // getenv() so it's unit-testable without a process-wide env var): true => the request should be
