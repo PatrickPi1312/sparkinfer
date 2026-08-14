@@ -103,6 +103,13 @@ jobs:
           ls -laR "${BUNDLE}"
 
       - name: Generate artifact attestation
+        # GitHub strips id-token/attestations back to read-only for pull_request runs whose head
+        # is a fork, regardless of the job-level permissions block above -- every external
+        # contributor's PR build (i.e. nearly all of them, this repo takes PRs from forks) would
+        # otherwise fail here even though the binary built and packaged fine. Attestation only
+        # matters for provenance of what actually ships, so it's scoped to push (main/tags) where
+        # the token is unrestricted; PR runs still get the full build+package+smoke-test gate.
+        if: github.event_name != 'pull_request'
         uses: actions/attest@v4
         with:
           subject-path: "${{ env.BUNDLE }}/**/*"
@@ -141,9 +148,18 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
+          # SPARKINFER_NVFP4=OFF: the si_nvfp4 target (default ON since #813) pulls in CUTLASS
+          # SM100/SM103 headers that MSVC's constexpr diagnostics reject (e.g. "a constexpr
+          # function cannot have a nonliteral return type 'dim3'" in
+          # sm100_gemm_array_tma_warpspecialized_mma_transform.hpp and friends) -- a CUTLASS/MSVC
+          # incompatibility, not anything specific to sparkinfer's own kernels. This Windows job
+          # only builds qwen3_gguf_bench for CI signal; production inference runs on Linux/RTX
+          # 5090, where NVFP4 stays on by default. Revisit once upstream CUTLASS fixes MSVC support
+          # for these headers.
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCH }}" `
             -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared `
+            -DSPARKINFER_NVFP4=OFF `
             -DBUILD_TESTS=OFF `
             -DBUILD_EXAMPLES=ON
 
@@ -186,6 +202,8 @@ jobs:
           Get-ChildItem -Recurse $env:BUNDLE | Select-Object FullName
 
       - name: Generate artifact attestation
+        # Same fork/pull_request id-token restriction as build-linux -- see that job's comment.
+        if: github.event_name != 'pull_request'
         uses: actions/attest@v4
         with:
           subject-path: "${{ env.BUNDLE }}/**/*"
