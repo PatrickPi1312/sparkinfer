@@ -115,6 +115,14 @@ REMOTE_REPO = os.environ.get("QWEN38_REMOTE_REPO", "/root/sparkinfer_qwen38")
 # actually serves, so it is what gets benchmarked; qwen3_gguf_bench/qwen3_gguf_score grew
 # directory support for exactly this (runtime/examples/qwen_checkpoint.h).
 MODEL_DIR = os.environ.get("QWEN38_MODEL_DIR", "/root/workspace/models_qwen38")
+# The single weight blob inside MODEL_DIR, for the Polaris attestation ONLY. The sibling bots pass
+# their .gguf here; the analogue for a compressed-tensors checkout is the safetensors file, not the
+# directory -- receipt.model_sha256() returns "" for anything that is not a regular file, so
+# passing MODEL_DIR would mint a receipt whose model_sha256 pins nothing while still looking valid.
+# If a future checkpoint is sharded (model-00001-of-0000N.safetensors) this path stops existing and
+# the sha degrades to "" rather than crashing; override QWEN38_MODEL_WEIGHT_FILE if that happens.
+MODEL_WEIGHT_FILE = os.environ.get("QWEN38_MODEL_WEIGHT_FILE",
+                                   os.path.join(MODEL_DIR, "model.safetensors"))
 BENCH_TOKENS = int(os.environ.get("QWEN38_BENCH_TOKENS", "128"))
 ACC_TOPK = int(os.environ.get("QWEN38_ACC_TOPK", "128"))
 # Score dumps for the differential accuracy gate. main's is written once per round by
@@ -763,12 +771,15 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
         f"cd {shlex.quote(REMOTE_REPO)} && "
         f"SPARKINFER_EVAL_MODE=qwen38-128 SPARKINFER_DECODE_TOKENS={BENCH_TOKENS} "
         f"SPARKINFER_EVAL_SEED={shlex.quote(eval_seed)} python3 eval/polaris/judge.py --from-stdin "
-        f"--model-file {shlex.quote(DEFAULT_GGUF)} "
+        f"--model-file {shlex.quote(MODEL_WEIGHT_FILE)} "
         f"--build-dir {shlex.quote(REMOTE_REPO)}/build/runtime "
         f"--sparkinfer-root {shlex.quote(REMOTE_REPO)}"
     )
     try:
-        r = ssh_run(host, port, cmd, timeout=60, stdin_data=stdin_payload)
+        # 180s, not the siblings' 60s: judge.py sha256s --model-file, and this checkpoint's weight
+        # blob is 21 GiB -- measured 32.7s on the pinned box with a warm cache, before judge.py
+        # signs the receipt and calls the Polaris API. 60s left almost no margin for a cold read.
+        r = ssh_run(host, port, cmd, timeout=180, stdin_data=stdin_payload)
     except Exception as e:
         print(f">> Polaris judge SSH failed: {e}")
         return None
@@ -898,9 +909,20 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
     }
-    polaris = collect_polaris_attestation(host, port, res, pr_ref)
-    if polaris:
-        res["polaris"] = polaris
+    # Attestation is a RECEIPT for a measurement that has already happened, not a gate on it, so it
+    # must never be able to void one. collect_polaris_attestation() already returns None on ssh
+    # failure / non-zero rc, but anything raised OUTSIDE its internal try -- building the command,
+    # a bad constant, an env lookup -- propagated all the way out of this function and cost the
+    # caller the fully-populated `res` above. Observed for real on PR #832 (2026-08-15): a NameError
+    # on a leftover DEFAULT_GGUF discarded a measured +27.7% decode speedup with top1=1.0/kl=0.0 and
+    # published eval-qwen38:REJECT with every metric None. A REJECT is close to the most expensive
+    # verdict this bot can emit, so it must be reachable only from real measurements.
+    try:
+        polaris = collect_polaris_attestation(host, port, res, pr_ref)
+        if polaris:
+            res["polaris"] = polaris
+    except Exception as e:
+        print(f">> Polaris attestation failed ({type(e).__name__}: {e}) — keeping the measurement")
     return res
 
 
