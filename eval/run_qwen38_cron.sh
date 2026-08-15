@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 # Cron wrapper for the sparkinfer Qwen3.8-27B PR eval bot:
 #
-#   0 * * * * /home/autotiny/Desktop/sparkinfer/eval/run_qwen38_cron.sh >> /tmp/sparkinfer_qwen38_bot.log 2>&1
+#   */30 * * * * /home/autotiny/Desktop/sparkinfer/eval/run_qwen38_cron.sh >> /tmp/sparkinfer_qwen38_bot.log 2>&1
 #
-#   Takes the :00 slot that run_museglimmer_cron.sh used to hold — Qwen3.8-27B replaces Muse
-#   Glimmer as the scored model (eval/README.md), so the two are NOT meant to run together. If you
-#   ever reinstate the Muse Glimmer or DFlash cron alongside this one, give it a different slot
-#   (e.g. :30) rather than letting two multi-minute full-GPU eval runs race for the shared lock
-#   every tick — flock's 120s wait is meant for short overlaps, not that.
+#   Every 30 minutes, replacing the :00-only slot run_museglimmer_cron.sh used to hold —
+#   Qwen3.8-27B replaces Muse Glimmer as the scored model (eval/README.md), so the two are NOT
+#   meant to run together. If you ever reinstate the Muse Glimmer or DFlash cron alongside this
+#   one, this schedule leaves no free slot: give this one back a single hourly slot first, rather
+#   than letting two multi-hour full-GPU eval runs race for the shared lock.
+#
+#   30 minutes comfortably fits a round. Measured on the pinned RTX 5090 (2026-08-15), per ref:
+#     build   1s no-op / 9s after a runtime/ source change / 18s after a CUDA kernel change
+#     GPU     26s decode@128 (reps=5) + 6s score dump + 29s Qwen3.6 guard (5 ctx x reps=5) = 61s
+#   so ~80s worst case per ref. A round is 1 main baseline + 1 run per pending PR, i.e. roughly
+#   3 min with one PR and ~15 min with ten. The model loads are far cheaper than they look because
+#   the bot benches decode@128, not long context: the 32k guard point dominates and still only
+#   costs seconds.
+#
+#   If a round ever DOES overrun the interval (a large PR backlog), the flock below makes the
+#   overlapping tick exit 0 after 120s rather than piling up — the effect is a skipped tick, not a
+#   queue. Do NOT raise flock's -w to try to queue ticks: that would serialize a backlog of stale
+#   rounds against one GPU.
 #
 # Policy (same as the sibling bots):
 #   • Pinned eval box only; never rent / never start from cron when down.

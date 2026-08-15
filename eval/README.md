@@ -179,7 +179,9 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 ## Qwen3.8-27B PR auto-evaluation bot (the scored path)
 
 > **Status: scoring is Qwen3.8-27B-only.** `pr_qwen38_bot.py` is the bot on cron
-> (`eval/run_qwen38_cron.sh`, hourly at `:00`). The Muse Glimmer bot (`pr_museglimmer_bot.py`) and
+> (`eval/run_qwen38_cron.sh`, every 30 min). A round costs ~80s per ref measured end-to-end
+> (~3 min with one pending PR), so the interval is not a bottleneck — see that file's header for
+> the stage-by-stage timings. The Muse Glimmer bot (`pr_museglimmer_bot.py`) and
 > the DFlash bot (`pr_dflash_bot.py`) are **retired from cron** — their code is kept for reference
 > and both still work if run by hand, but neither is scheduled. Only one bot may hold the shared
 > `/tmp/sparkinfer_bot.lock` at a time, and they all drive the same single pinned GPU.
