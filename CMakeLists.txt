@@ -20,6 +20,22 @@ option(BUILD_EXAMPLES "Build example programs"          ON)
 
 find_package(CUDAToolkit REQUIRED)
 
+# Declared here, not in server/, because runtime/ is configured BEFORE server/ (see the
+# superbuild ordering below) and runtime/examples/qwen3_gguf_bench needs this target to read a
+# HuggingFace compressed-tensors checkpoint's config.json via qwen38_hf_config.h -- the same
+# header the server uses, so the benchmark and the server can never disagree about how a
+# checkpoint is configured. This links JSON into that one EXAMPLE EXECUTABLE only; the
+# sparkinfer_runtime library itself still links no JSON dependency (runtime/src/safetensors.cpp
+# keeps its own hand-rolled parser for exactly that reason). server/CMakeLists.txt reuses this
+# target rather than re-declaring it.
+include(FetchContent)
+FetchContent_Declare(
+    nlohmann_json
+    URL      https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+    URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
 enable_testing()   # so `ctest` at the build root discovers the subdirs' add_test() registrations
 
 # Superbuild. moe/ and runtime/ guard their sibling add_subdirectory(../kernels)

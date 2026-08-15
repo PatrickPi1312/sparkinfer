@@ -108,6 +108,13 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
         return;
     }
     cfg.n_layers   = (int)qwen3_meta_int(g, "block_count", cfg.n_layers);
+    // A trailing MTP (multi-token-prediction) block ships as one extra full transformer
+    // layer plus its own blk.{n}.nextn.* projection/norm tensors (Qwen3.8-27B: block_count=65,
+    // nextn_predict_layers=1 -- the real hybrid stack is 64 layers). MTP is out of scope for
+    // this runtime -- shrinking n_layers here is enough to keep the per-layer load loop
+    // (0..n_layers-1) from ever touching the extra block; no separate skip logic needed. No-op
+    // when the key is absent (every GGUF without an MTP head, including the current Qwythos one).
+    cfg.n_layers  -= (int)qwen3_meta_int(g, "nextn_predict_layers", 0);
     cfg.hidden     = (int)qwen3_meta_int(g, "embedding_length", cfg.hidden);
     cfg.n_q_heads  = (int)qwen3_meta_int(g, "attention.head_count", cfg.n_q_heads);
     cfg.n_kv_heads = (int)qwen3_meta_int(g, "attention.head_count_kv", cfg.n_kv_heads);
@@ -133,16 +140,36 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
         cfg.moe_ffn = (int)qwen3_meta_int(g, "feed_forward_length", cfg.moe_ffn);
         cfg.full_attn_interval = (int)qwen3_meta_int(g, "full_attention_interval", 4);
         cfg.rope_dim = (int)qwen3_meta_int(g, "rope.dimension_count", 64);
-        cfg.linear_q_heads = cfg.n_q_heads;
-        cfg.linear_v_heads = (int)qwen3_meta_int(g, "ssm.group_count", cfg.linear_v_heads);
+        // linear_q_heads must NOT be assumed equal to n_q_heads -- that happens to hold for
+        // the original Qwythos/Qwen3.5-9B export (both 16) but is false for e.g. Qwen3.8-27B
+        // (24 full-attention heads vs. 16 linear-attention heads). ssm.group_count is the
+        // linear-attention QK head count in every hybrid GGUF export seen so far (confirmed
+        // against Qwen3.8-27B's own metadata: group_count=16, matching its HF config's
+        // linear_num_key_heads); fall back to n_q_heads only when the key is absent, which
+        // preserves the exact prior behavior for any GGUF that doesn't export it.
+        cfg.linear_q_heads = (int)qwen3_meta_int(g, "ssm.group_count", cfg.n_q_heads);
         cfg.linear_head_dim = (int)qwen3_meta_int(g, "ssm.state_size", cfg.linear_head_dim);
         cfg.linear_conv_kernel = (int)qwen3_meta_int(g, "ssm.conv_kernel", cfg.linear_conv_kernel);
+        // linear_v_heads is derived from blk.0.attn_qkv.weight's real shape below, not read
+        // from metadata directly -- no single GGUF key reliably holds it across exports (this
+        // model's own v-head count lives under ssm.time_step_rank, a key the derivation below
+        // makes redundant once linear_q_heads is correct).
         if (const sparkinfer::GGUFTensor* qkv = g.tensor("blk.0.attn_qkv.weight")) {
             const int qkv_out = qkv->n_dims >= 2 ? (int)qkv->dims[1] : 0;
             const int q_dim = cfg.linear_q_heads * cfg.linear_head_dim;
             const int v_dim = qkv_out - 2 * q_dim;
             if (v_dim > 0 && v_dim % cfg.linear_head_dim == 0)
                 cfg.linear_v_heads = v_dim / cfg.linear_head_dim;
+        }
+        // Qwen3.8-27B's GGUF (unsloth conversion) only carries one EOS id in
+        // tokenizer.ggml.eos_token_id (248046); the model's own generation_config.json lists a
+        // second (248044) that GGUF metadata drops entirely. nextn_predict_layers presence is
+        // used as the detection signal for "this is the MTP-capable Qwen3.8-27B family" rather
+        // than a raw architecture/name string match, since it's the same signal already read
+        // above and is specific to this family (Qwythos has no MTP head).
+        if (qwen3_meta_int(g, "nextn_predict_layers", 0) > 0) {
+            cfg.eos_id2 = 248044;
+            cfg.qwen38 = true;
         }
         return;
     }
@@ -170,6 +197,6 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
 
 static const char* qwen3_model_label(const sparkinfer::Qwen35Config& cfg) {
     if (cfg.muse_glimmer) return "Muse Glimmer 30B";
-    if (cfg.dense_ffn) return "Qwen3.5-9B dense hybrid";
+    if (cfg.dense_ffn) return cfg.eos_id2 == 248044 ? "Qwen3.8-27B dense hybrid" : "Qwen3.5-9B dense hybrid";
     return cfg.hybrid ? "Qwen3.5/Qwen3.6-35B-A3B hybrid" : "Qwen3-MoE";
 }

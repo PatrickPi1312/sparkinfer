@@ -56,4 +56,16 @@ gh label create "museglimmer-merge-first" -R "$REPO" --color "0E8A16" \
 gh label create "museglimmer-needs-rebase" -R "$REPO" --color "FBCA04" \
    --description "verified Muse Glimmer speedup but not this round's museglimmer-merge-first" --force >/dev/null
 
-echo "eval:*, eval-dflash:*, eval-museglimmer:*, area:*, *-context, regression-*, dflash-merge-*, museglimmer-merge-* labels ready on $REPO"
+# Qwen3.8-27B bot (eval/pr_qwen38_bot.py) — decode@128 on the NVFP4 checkpoint, differential
+# accuracy gate, Qwen3.6 no-regression guard. Mirrors its tier to eval:* (SN74 scoring reads
+# eval:*), unlike the Muse Glimmer labels above.
+for k in "${!C[@]}"; do
+  gh label create "eval-qwen38:$k" -R "$REPO" --color "${C[$k]}" \
+     --description "sparkinfer Qwen3.8-27B decode@128 vs-main speed tier: $k" --force >/dev/null
+done
+gh label create "qwen38-merge-first" -R "$REPO" --color "0E8A16" \
+   --description "round winner: biggest verified Qwen3.8-27B decode@128 speedup — auto-merge candidate" --force >/dev/null
+gh label create "qwen38-needs-rebase" -R "$REPO" --color "FBCA04" \
+   --description "verified Qwen3.8-27B speedup but not this round's qwen38-merge-first" --force >/dev/null
+
+echo "eval:*, eval-dflash:*, eval-museglimmer:*, eval-qwen38:*, area:*, *-context, regression-*, dflash-merge-*, museglimmer-merge-*, qwen38-merge-* labels ready on $REPO"

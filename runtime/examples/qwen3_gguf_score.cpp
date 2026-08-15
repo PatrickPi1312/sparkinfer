@@ -13,6 +13,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
 #include "qwen3_gguf_config.h"
+#include "qwen_checkpoint.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -23,7 +24,7 @@
 #include <algorithm>
 
 int main(int argc, char** argv) {
-    if (argc < 4) { printf("usage: %s <model.gguf> <topk> <id0> <id1> ...\n", argv[0]); return 2; }
+    if (argc < 4) { printf("usage: %s <model.gguf|compressed-tensors dir> <topk> <id0> <id1> ...\n", argv[0]); return 2; }
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
 
@@ -40,9 +41,17 @@ int main(int argc, char** argv) {
     if ((int)toks.size() < 2) { printf("[FAIL] need >= 2 tokens\n"); return 1; }
 
     sparkinfer::GGUF g;
-    if (!g.open(path)) { printf("[FAIL] cannot open %s\n", path.c_str()); return 1; }
     sparkinfer::Qwen35Config cfg;
-    qwen3_config_from_gguf(g, cfg);
+    QwenCheckpointKind ckind = QwenCheckpointKind::Gguf;
+    std::string cperr;
+    if (!qwen_checkpoint_open(path, cfg, g, ckind, cperr)) {
+        printf("[FAIL] %s\n", cperr.c_str());
+        return 1;
+    }
+    if (ckind == QwenCheckpointKind::LegacyWeightDir) {
+        printf("[FAIL] legacy weight dirs are not scoreable (no config.txt reader here)\n");
+        return 1;
+    }
     cfg.max_seq    = 2048;
     if (const char* e = getenv("SPARKINFER_SCORE_MAX_SEQ")) {
         int v = atoi(e);
@@ -76,7 +85,10 @@ int main(int argc, char** argv) {
     mc.ffn_dim = cfg.moe_ffn; mc.num_layers = cfg.n_layers;
     auto engine = sparkinfer::moe::MoEEngine::create(mc);
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
-    if (!model.load_gguf(path)) { printf("[FAIL] load_gguf\n"); return 1; }
+    if (!qwen_checkpoint_load(model, path, ckind)) {
+        printf("[FAIL] load (%s)\n", qwen_checkpoint_kind_label(ckind));
+        return 1;
+    }
     // forward_token() reads the KV block table for seq 0 (the model's default
     // seq_id); generate() allocates it — do the same here before scoring.
     if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] KV allocate\n"); return 1; }

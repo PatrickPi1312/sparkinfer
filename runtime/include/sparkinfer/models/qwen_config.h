@@ -35,6 +35,17 @@ struct Qwen35Config {
     int   linear_v_heads = 32;
     int   linear_head_dim = 128;
     int   linear_conv_kernel = 4;
+    // "This is a Qwen3.8-27B-family checkpoint" -- drives server-side chat-template behaviour only
+    // (ModelEngine::is_qwen38: reasoning-effort system message, enable_thinking default). Its
+    // full-attention output gate is a plain sigmoid like every other model here, despite the HF
+    // config's output_gate_type: "swish" -- see qwen38_hf_config.h for why that string is a trap.
+    bool  qwen38 = false;
+    // GDN's v-head -> q/k-head broadcast convention (kernels::launch_qwen36_gdn_ar). false =
+    // cyclic (vh % linear_q_heads), validated for Qwythos/Qwen3.6-35B-A3B (v/q ratio 2). true =
+    // block (vh / (linear_v_heads/linear_q_heads)), which Qwen3.8-27B's checkpoint needs instead
+    // (ratio 3) -- the two checkpoints' own v-head layout conventions differ despite the shared
+    // architecture family, confirmed empirically against a real reference implementation.
+    bool  gdn_qh_block = false;
 
     // Qwythos / Qwen3.5-9B dense hybrid GGUFs use a single SwiGLU FFN per layer
     // (ffn_gate/up/down) instead of routed experts.

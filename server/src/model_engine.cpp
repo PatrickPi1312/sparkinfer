@@ -9,6 +9,7 @@
 #include "sparkinfer/runtime.h"
 
 #include "../../runtime/examples/qwen3_gguf_config.h"
+#include "../../runtime/examples/qwen38_hf_config.h"
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -18,6 +19,9 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <fstream>
+#include <sys/stat.h>
+#include <nlohmann/json.hpp>
 
 namespace sparkinfer_server {
 
@@ -183,14 +187,50 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         return false;
     }
 
-    sparkinfer::GGUF g;
-    if (!g.open(gguf_path)) {
-        fprintf(stderr, "[sparkinfer-server] cannot open %s\n", gguf_path.c_str());
-        return false;
+    // Three-way dispatch on what `-m` actually points at: a .gguf file (every model shipped so
+    // far), or a directory -- which is either a HuggingFace "compressed-tensors" mixed FP8/NVFP4
+    // checkpoint (config.json has a quantization_config block, e.g. unsloth/Qwen3.8-27B-NVFP4) or
+    // a plain (unquantized) safetensors checkpoint. Same "auto-detect from what's actually there"
+    // pattern the GGUF path already uses (general.architecture sniffing) -- no new CLI flag.
+    struct stat path_st{};
+    const bool is_dir = stat(gguf_path.c_str(), &path_st) == 0 && S_ISDIR(path_st.st_mode);
+    enum class LoadKind { Gguf, CompressedTensors, PlainSafetensors };
+    LoadKind kind = LoadKind::Gguf;
+    if (is_dir) {
+        std::ifstream cf(gguf_path + "/config.json");
+        if (!cf) {
+            fprintf(stderr, "[sparkinfer-server] %s is a directory but has no config.json\n",
+                    gguf_path.c_str());
+            return false;
+        }
+        nlohmann::json root;
+        try { cf >> root; } catch (const std::exception& e) {
+            fprintf(stderr, "[sparkinfer-server] %s/config.json parse error: %s\n",
+                    gguf_path.c_str(), e.what());
+            return false;
+        }
+        kind = root.contains("quantization_config") ? LoadKind::CompressedTensors
+                                                      : LoadKind::PlainSafetensors;
     }
 
+    sparkinfer::GGUF g;
     impl_->cfg = sparkinfer::Qwen35Config{};
-    qwen3_config_from_gguf(g, impl_->cfg);
+    if (kind == LoadKind::Gguf) {
+        if (!g.open(gguf_path)) {
+            fprintf(stderr, "[sparkinfer-server] cannot open %s\n", gguf_path.c_str());
+            return false;
+        }
+        qwen3_config_from_gguf(g, impl_->cfg);
+    } else {
+        // Both directory kinds share the same base HF config.json shape (text_config block) --
+        // quantization_config only changes how load() below reads the actual weight bytes, not
+        // the architecture/hyperparameter population.
+        std::string err;
+        if (!qwen38_config_from_hf_json(gguf_path, impl_->cfg, err)) {
+            fprintf(stderr, "[sparkinfer-server] %s: %s\n", gguf_path.c_str(), err.c_str());
+            return false;
+        }
+    }
     if (max_seq > 0) impl_->cfg.max_seq = max_seq;
     else if (impl_->cfg.max_seq < 2048) impl_->cfg.max_seq = 2048;
 
@@ -240,9 +280,26 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     impl_->model = std::make_unique<sparkinfer::Qwen35Model>(
         impl_->cfg, impl_->kv.get(), impl_->engine.get());
 
-    fprintf(stderr, "[sparkinfer-server] loading GGUF ...\n");
-    if (!impl_->model->load_gguf(gguf_path)) {
-        fprintf(stderr, "[sparkinfer-server] load_gguf failed\n");
+    if (kind == LoadKind::Gguf) {
+        fprintf(stderr, "[sparkinfer-server] loading GGUF ...\n");
+        if (!impl_->model->load_gguf(gguf_path)) {
+            fprintf(stderr, "[sparkinfer-server] load_gguf failed\n");
+            return false;
+        }
+    } else if (kind == LoadKind::CompressedTensors) {
+        fprintf(stderr, "[sparkinfer-server] loading compressed-tensors checkpoint ...\n");
+        if (!impl_->model->load_compressed_tensors(gguf_path)) {
+            fprintf(stderr, "[sparkinfer-server] load_compressed_tensors failed\n");
+            return false;
+        }
+    } else {
+        // Qwen35Model::load_weights() reads a directory of already-converted flat .bin files
+        // (runtime/tools/convert_qwen35.py's own offline output format), not a safetensors
+        // directory directly -- no C++ loader for plain (unquantized) safetensors exists yet, this
+        // config-detection branch was written ahead of that loader rather than left undetectable.
+        fprintf(stderr, "[sparkinfer-server] %s: plain safetensors directories are not yet "
+                        "supported directly -- convert with runtime/tools/convert_qwen35.py first "
+                        "and pass the .bin output directory instead\n", gguf_path.c_str());
         return false;
     }
 
@@ -321,6 +378,11 @@ int ModelEngine::max_seq() const {
 bool ModelEngine::is_museglimmer() const {
     std::lock_guard<std::mutex> lock(mu_);
     return impl_->ready && impl_->cfg.muse_glimmer;
+}
+
+bool ModelEngine::is_qwen38() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return impl_->ready && impl_->cfg.qwen38;
 }
 
 void ModelEngine::set_prefix_tokens(const std::vector<int>& tokens) {

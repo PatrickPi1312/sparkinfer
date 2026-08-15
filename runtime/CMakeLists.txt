@@ -69,7 +69,12 @@ if(BUILD_EXAMPLES)
     target_link_libraries(qwen3_gguf_generate PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
     add_executable(qwen3_gguf_bench examples/qwen3_gguf_bench.cpp)
     target_include_directories(qwen3_gguf_bench PRIVATE include)
-    target_link_libraries(qwen3_gguf_bench PRIVATE sparkinfer_runtime CUDA::cudart)
+    # nlohmann_json: qwen_checkpoint.h reads an HF compressed-tensors (NVFP4) config.json via
+    # qwen38_hf_config.h, so the PR eval bot can benchmark the SAME checkpoint the server serves.
+    # Declared at the top level (see the root CMakeLists) because runtime/ is configured before
+    # server/. Links into this executable only -- sparkinfer_runtime stays JSON-free.
+    target_link_libraries(qwen3_gguf_bench PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     # TTFT benchmark: LMCache cache-hit vs. full-recompute baseline on a synthetic model (see
     # lmcache_bench.cpp's header comment for why a real GGUF isn't needed). Requires a real
     # sidecar venv at runtime (SPARKINFER_LMCACHE_PYTHON/_BRIDGE_SCRIPT), not build time.
@@ -82,7 +87,8 @@ if(BUILD_EXAMPLES)
     target_link_libraries(qwen3_gguf_cb_bench PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
     add_executable(qwen3_gguf_score examples/qwen3_gguf_score.cpp)
     target_include_directories(qwen3_gguf_score PRIVATE include)
-    target_link_libraries(qwen3_gguf_score PRIVATE sparkinfer_runtime CUDA::cudart)
+    target_link_libraries(qwen3_gguf_score PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)   # same reason as qwen3_gguf_bench above
     add_executable(qwen3_gguf_prefill_check examples/qwen3_gguf_prefill_check.cpp)
     target_include_directories(qwen3_gguf_prefill_check PRIVATE include)
     target_link_libraries(qwen3_gguf_prefill_check PRIVATE sparkinfer_runtime CUDA::cudart)

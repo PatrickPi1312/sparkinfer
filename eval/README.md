@@ -176,7 +176,60 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 `gh` authenticated and `VAST_INSTANCE` / `VAST_DEFAULT_INSTANCE` in `.env.eval`
 (`VAST_NO_AUTO_PROVISION=1`).
 
-## DFlash PR auto-evaluation bot (the only scored path)
+## Qwen3.8-27B PR auto-evaluation bot (the scored path)
+
+> **Intended scope: scoring is Qwen3.8-27B-only.** `pr_qwen38_bot.py` (`eval/run_qwen38_cron.sh`,
+> `*/30`) is meant to be the only bot on cron, with the Muse Glimmer (`pr_museglimmer_bot.py`) and
+> DFlash (`pr_dflash_bot.py`) bots kept for reference and run by hand only. Only one bot may hold
+> the shared `/tmp/sparkinfer_bot.lock` at a time, and they all drive the same single pinned GPU.
+>
+> **This is not automatic.** The crontab is host state, not repo state, so merging this does not
+> switch anything over. Until someone edits the eval host's crontab — drop
+> `0 * * * * eval/run_museglimmer_cron.sh`, add `*/30 * * * * eval/run_qwen38_cron.sh` — the Muse
+> Glimmer bot is still the one scoring PRs, and `pr_qwen38_bot.py` never runs. Check with
+> `crontab -l` on the eval host (the machine running the bot, **not** the GPU box it SSHes into).
+> A round costs ~80s per ref measured end-to-end (~3 min with one pending PR), so `*/30` is not a
+> bottleneck — see `run_qwen38_cron.sh`'s header for the stage-by-stage timings.
+
+`pr_qwen38_bot.py` scores **same-box PR vs `origin/main`** on three axes, applies
+`eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, mirrors it to `eval:*` (SN74 scoring reads `eval:*`),
+picks `qwen38-merge-first`, and can auto-merge (`SPARKINFER_QWEN38_AUTOMERGE=1`, off by default).
+
+1. **Speed — decode @ ctx=128**, median of 5 reps. The scored checkpoint is the HuggingFace
+   **compressed-tensors NVFP4 directory** (`unsloth/Qwen3.8-27B-NVFP4`), *not* a GGUF — that is
+   what `sparkinfer-server` actually serves. `qwen3_gguf_bench`/`qwen3_gguf_score` read directories
+   via `runtime/examples/qwen_checkpoint.h`, shared with the server so the benchmark and the
+   server cannot disagree about how a checkpoint is configured.
+
+   Prefill is deliberately *not* scored: at ctx=128 the batched prefill path declines (it needs
+   int8 KV, enabled only at ctx≥4096), so the number would measure the sequential fallback.
+
+2. **Accuracy gate — differential (PR vs main), not absolute.** llama.cpp cannot read a
+   compressed-tensors directory, so there is no same-weights external reference. Instead both
+   builds score the same token stream and the two distributions are compared
+   (`bench/scripts/accuracy_compare_pair.py`): **top1 ≥ 0.99, KL ≤ 0.01**. Tight, because two
+   builds of the same model on the same box should agree almost exactly. Failure is a hard
+   REJECT regardless of speed.
+
+   *Limitation:* a differential gate catches newly introduced divergence only — never a bug
+   already present on `main`.
+
+3. **Qwen3.6 no-regression guard** — decode + prefill at ctx 0/512/4k/16k/32k, 0.98 tolerance.
+   Qwen3.8 and Qwen3.6 share `qwen35.cpp`/`inference_engine.cpp`; a regression there is a hard
+   REJECT regardless of Qwen3.8's own result.
+
+```bash
+python eval/pr_qwen38_bot.py --repo gittensor-ai-lab/sparkinfer   # one poll
+python eval/pr_qwen38_bot.py --only-prs 636 --reeval              # re-score one PR
+python eval/pr_qwen38_bot.py --labels-only                        # no GPU, reconcile labels only
+```
+
+Box paths are `QWEN38_*` in `.env.eval` (`QWEN38_MODEL_DIR` defaults to
+`/root/workspace/models_qwen38`).
+
+## DFlash PR auto-evaluation bot (retired from cron)
+
+> **Status: retired from cron** — superseded by the Qwen3.8-27B bot above. Still runnable by hand.
 
 `pr_dflash_bot.py` evaluates PRs that touch DFlash paths (`dflash*`, `qwen3_gguf_dflash_*`,
 `dflash_accuracy.sh`). It scores **same-box PR DFlash tok/s vs `origin/main` DFlash tok/s**,
@@ -232,7 +285,8 @@ still comes from the deterministic evaluator so validators converge.)
   to run — validate the vast-specific calls (offer query, `--image`, instance field names) on the
   first run and adjust if your account's defaults differ.
 - First eval on a fresh box builds llama.cpp (~10–15 min); it persists at `/workspace/.llamacpp`.
-- Correctness currently gates vs **llama.cpp**. For an optimization PR, also gate vs the **previous
-  frontier build** (score-vs-baseline: ~100% top-1 + KL≈0) — a small extension to `evaluate.sh`.
+- Correctness gates vs **llama.cpp** for GGUF models. The Qwen3.8-27B bot instead gates
+  **PR vs main** (score-vs-baseline: ~100% top-1 + KL≈0), which is the extension suggested here —
+  necessary there because llama.cpp cannot read a compressed-tensors checkpoint at all.
 - Anti-gaming (an LLM/KDA agent reading the diff for benchmark-special-casing, weakened tolerances,
   harness edits) is a layer *on top* — it flags, it doesn't set the numeric label.

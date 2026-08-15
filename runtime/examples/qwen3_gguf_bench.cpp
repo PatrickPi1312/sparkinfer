@@ -3,7 +3,7 @@
 // llama.cpp's `llama-bench` tg number on the same model + GPU.
 //
 // Single context:
-//   qwen3_gguf_bench <model.gguf | weight_dir> [n_tokens] [context_tokens]
+//   qwen3_gguf_bench <model.gguf | compressed-tensors dir | weight_dir> [n_tokens] [context_tokens]
 //
 // Multi-context sweep (one load, many contexts) — set SPARKINFER_BENCH_SWEEP_CTXS:
 //   qwen3_gguf_bench <model> [n_tokens] sweep
@@ -17,6 +17,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
 #include "qwen3_gguf_config.h"
+#include "qwen_checkpoint.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -27,10 +28,6 @@
 #include <unordered_map>
 #include <algorithm>
 #include <memory>
-
-static bool ends_with(const std::string& s, const std::string& suf) {
-    return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
-}
 
 static std::vector<int> parse_ctx_list(const char* csv) {
     std::vector<int> out;
@@ -61,10 +58,10 @@ static double median_val(std::vector<double> v) {
     return v[(v.size() - 1) / 2];
 }
 
-static void print_bench_block(const sparkinfer::Qwen35Config& cfg, bool gguf_mode,
+static void print_bench_block(const sparkinfer::Qwen35Config& cfg, const char* quant_label,
                               size_t vram_used, int n_tokens, const SweepRow& row) {
     printf("\n=== sparkinfer bench (%s) sweep ctx=%d ===\n",
-           gguf_mode ? "Q4_K_M native" : "bf16", row.ctx);
+           quant_label, row.ctx);
     printf("model        : %d layers, %d experts top-%d\n",
            cfg.n_layers, cfg.n_experts, cfg.top_k);
     printf("VRAM used    : %.1f GB\n", vram_used / 1e9);
@@ -78,7 +75,7 @@ static void print_bench_block(const sparkinfer::Qwen35Config& cfg, bool gguf_mod
 
 struct BenchSession {
     sparkinfer::Qwen35Config cfg{};
-    bool gguf_mode = false;
+    QwenCheckpointKind kind = QwenCheckpointKind::Gguf;
     std::unique_ptr<sparkinfer::Runtime> rt;
     std::unique_ptr<sparkinfer::KVCacheManager> kv;
     std::unique_ptr<sparkinfer::moe::MoEEngine> engine;
@@ -87,12 +84,13 @@ struct BenchSession {
 };
 
 static bool init_session(BenchSession& s, const std::string& path, int max_ctx, int n_tokens) {
-    s.gguf_mode = ends_with(path, ".gguf");
-    if (s.gguf_mode) {
-        sparkinfer::GGUF g;
-        if (!g.open(path)) { printf("[FAIL] open gguf\n"); return false; }
-        qwen3_config_from_gguf(g, s.cfg);
-    } else {
+    sparkinfer::GGUF g;
+    std::string cperr;
+    if (!qwen_checkpoint_open(path, s.cfg, g, s.kind, cperr)) {
+        printf("[FAIL] %s\n", cperr.c_str());
+        return false;
+    }
+    if (s.kind == QwenCheckpointKind::LegacyWeightDir) {
         std::ifstream f(path + "/config.txt");
         std::string line;
         std::unordered_map<std::string, std::string> m;
@@ -139,9 +137,8 @@ static bool init_session(BenchSession& s, const std::string& path, int max_ctx, 
     s.engine = sparkinfer::moe::MoEEngine::create(mc);
     s.model = std::make_unique<sparkinfer::Qwen35Model>(s.cfg, s.kv.get(), s.engine.get());
 
-    printf("loading %s (%s) ...\n", path.c_str(),
-           s.gguf_mode ? "native GGUF, experts quantized" : "bf16");
-    bool ok = s.gguf_mode ? s.model->load_gguf(path) : s.model->load_weights(path);
+    printf("loading %s (%s) ...\n", path.c_str(), qwen_checkpoint_kind_label(s.kind));
+    bool ok = qwen_checkpoint_load(*s.model, path, s.kind);
     if (!ok) { printf("[FAIL] load\n"); return false; }
     size_t freeb = 0, totb = 0;
     cudaMemGetInfo(&freeb, &totb);
@@ -185,7 +182,7 @@ static int run_single(const std::string& path, int n_tokens, int context_tokens)
 
     auto bench = s.model->bench_decode(8, n_tokens, context_tokens);
     auto gpu = sparkinfer::query_gpu_stats();
-    printf("\n=== sparkinfer bench (%s) ===\n", s.gguf_mode ? "Q4_K_M native" : "bf16");
+    printf("\n=== sparkinfer bench (%s) ===\n", qwen_checkpoint_kind_label(s.kind));
     printf("model        : %s  (%d layers, %d experts top-%d)\n",
            qwen3_model_label(s.cfg), s.cfg.n_layers, s.cfg.n_experts, s.cfg.top_k);
     printf("VRAM used    : %.1f GB\n", s.vram_used / 1e9);
@@ -234,7 +231,7 @@ static int run_sweep(const std::string& path, int n_tokens, const std::vector<in
         row.decode_tps = median_val(dec);
         row.prefill_pp = ctx > 0 ? median_val(pp) : 0.0;
         rows.push_back(row);
-        print_bench_block(s.cfg, s.gguf_mode, s.vram_used, n_tokens, row);
+        print_bench_block(s.cfg, qwen_checkpoint_kind_label(s.kind), s.vram_used, n_tokens, row);
     }
 
     auto gpu = sparkinfer::query_gpu_stats();
@@ -257,7 +254,7 @@ static int run_sweep(const std::string& path, int n_tokens, const std::vector<in
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("usage: %s <model.gguf|weight_dir> [n_tokens] [context_tokens|sweep]\n", argv[0]);
+        printf("usage: %s <model.gguf|compressed-tensors dir|weight_dir> [n_tokens] [context_tokens|sweep]\n", argv[0]);
         printf("  sweep: SPARKINFER_BENCH_SWEEP_CTXS=0,4096,... %s <model> [n_tokens] sweep\n", argv[0]);
         return 2;
     }

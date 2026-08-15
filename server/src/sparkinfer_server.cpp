@@ -395,6 +395,7 @@ int main(int argc, char** argv) {
     sparkinfer_server::ModelEngine engine;
     if (!engine.load(model_path, ctx > 0 ? ctx : 0)) return 1;
     g_tokenizer.set_museglimmer(engine.is_museglimmer());
+    g_tokenizer.set_qwen38(engine.is_qwen38());
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
@@ -508,7 +509,7 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":{\"message\":\"unauthorized\"}}", "application/json");
             return;
         }
-        const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, false);
+        const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, engine.is_qwen38());
         std::vector<int> ids;
         std::string err;
         if (!encode_messages(req.body, ids, enable_thinking, err)) {
@@ -606,7 +607,7 @@ int main(int argc, char** argv) {
                  }
                  const bool stream = controls.stream;
                  if (stream) g_requests_streaming++;
-                 const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, false);
+                 const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, engine.is_qwen38());
                  int max_tokens = controls.max_tokens;
                  if (max_tokens <= 0) max_tokens = 256;
                  if (max_tokens > max_output_tokens()) max_tokens = max_output_tokens();

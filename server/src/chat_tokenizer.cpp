@@ -226,6 +226,7 @@ RawTokenPiece gpt2_bytelevel_decode(const std::string& raw_piece) {
 struct ChatTokenizer::Impl {
     std::unique_ptr<tokenizers::Tokenizer> tok;
     bool museglimmer = false;
+    bool qwen38 = false;
     // Muse Glimmer harmony-format marker token ids, resolved once in set_museglimmer() (single
     // -threaded server startup, after `tok` is loaded) -- see decode()'s comment for why these
     // need special handling. Deliberately NOT lazily resolved on first decode(): decode() runs
@@ -258,6 +259,8 @@ bool ChatTokenizer::load(const std::string& tokenizer_json_path, std::string& er
             tokenizer_json_path.c_str(), impl_->tok->GetVocabSize());
     return true;
 }
+
+void ChatTokenizer::set_qwen38(bool on) { impl_->qwen38 = on; }
 
 void ChatTokenizer::set_museglimmer(bool on) {
     impl_->museglimmer = on;
@@ -703,7 +706,7 @@ std::vector<int> ChatTokenizer::encode_augmented(const ChatRequest& request, boo
     if (!impl_->tok) return {};
     const std::string prompt = impl_->museglimmer
         ? apply_museglimmer_chat_template(request.messages, enable_thinking ? "high" : "low")
-        : apply_qwen36_tools_template(request, enable_thinking);
+        : apply_qwen36_tools_template(request, enable_thinking, impl_->qwen38);
     const std::vector<int32_t> enc = impl_->tok->Encode(prompt);
     return std::vector<int>(enc.begin(), enc.end());
 }

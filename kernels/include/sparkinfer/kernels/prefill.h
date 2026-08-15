@@ -57,12 +57,16 @@ void launch_prefill_gdn_conv(const void* qkv, const void* conv_w, void* conv_sta
 // layout [v_head][col][row] the decode gdn_ar_fast kernel expects. State starts at zero
 // (fresh prefill). q/k: [N,q_heads*hd] (head_dim==128), v: [N,v_heads*hd]; alpha/beta:
 // [N,v_heads]; dt/a: [v_heads] (per-head constants).
+// qh_block: v-head -> q/k-head broadcast convention; see launch_qwen36_gdn_ar's own comment
+// (fused.h). Defaults to the original cyclic convention (false) so existing callers are
+// unaffected; a checkpoint whose HF-side v-head layout needs block broadcast (Qwen3.8-27B)
+// must pass true, matching whatever the decode-path GDN kernel uses for the same model.
 void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              const void* alpha, const void* beta,
                              const void* dt, const void* a,
                              float* state, void* out,
                              int n_tokens, int q_heads, int v_heads, int head_dim,
-                             cudaStream_t stream = nullptr);
+                             bool qh_block = false, cudaStream_t stream = nullptr);
 
 // DFlash short-block variants. They start from the live decode state but leave it untouched,
 // writing a complete post-token checkpoint for every candidate row. checkpoint[t] uses the same
@@ -77,7 +81,7 @@ void launch_dflash_gdn_scan(const void* q, const void* k, const void* v,
                             const void* dt, const void* a, const float* live_state,
                             void* out, float* checkpoints,
                             int n_tokens, int q_heads, int v_heads, int head_dim,
-                            cudaStream_t stream = nullptr);
+                            bool qh_block = false, cudaStream_t stream = nullptr);
 
 // Verification-only forms: produce every candidate activation from the live state without
 // mutating it or writing O(N * state_size) checkpoints. The compact inputs are committed later.
@@ -90,7 +94,8 @@ void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
                                     const void* alpha, const void* beta,
                                     const void* dt, const void* a, const float* live_state,
                                     void* out, int n_tokens, int q_heads, int v_heads,
-                                    int head_dim, cudaStream_t stream = nullptr);
+                                    int head_dim, bool qh_block = false,
+                                    cudaStream_t stream = nullptr);
 
 // Compact accepted-prefix commit. Verification retains qkv plus k/v/alpha/beta per GDN layer;
 // these launchers update the live decode state once after posterior selection, avoiding both
@@ -103,7 +108,7 @@ void launch_dflash_gdn_scan_commit(const void* k, const void* v,
                                    const void* alpha, const void* beta,
                                    const void* dt, const void* a, float* live_state,
                                    int n_tokens, int q_heads, int v_heads, int head_dim,
-                                   cudaStream_t stream = nullptr);
+                                   bool qh_block = false, cudaStream_t stream = nullptr);
 
 // Batched gated RMSNorm: out[t,h,:] = (x/rms(x)) * weight * silu(z), per (token, v_head).
 //   x/z: [N, v_heads*hd]   weight: [hd]   out: [N, v_heads*hd]

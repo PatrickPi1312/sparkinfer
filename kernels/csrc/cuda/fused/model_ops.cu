@@ -165,23 +165,26 @@ __global__ void logit_softcap_kernel(float* __restrict__ logits, int vocab,
 __global__ void mg_debug_bf16_kernel(const __nv_bfloat16* __restrict__ x, int n,
                                      int tag, int layer, int step) {
     __shared__ float red[256];
-    float local = 0.f;
+    __shared__ float redsum[256];
+    float local = 0.f, localsum = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float v = __bfloat162float(x[i]);
         local += v * v;
+        localsum += v;
     }
     red[threadIdx.x] = local;
+    redsum[threadIdx.x] = localsum;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        if (threadIdx.x < s) { red[threadIdx.x] += red[threadIdx.x + s]; redsum[threadIdx.x] += redsum[threadIdx.x + s]; }
         __syncthreads();
     }
     if (threadIdx.x == 0) {
         float v0 = n > 0 ? __bfloat162float(x[0]) : 0.f;
         float v1 = n > 1 ? __bfloat162float(x[1]) : 0.f;
         float v2 = n > 2 ? __bfloat162float(x[2]) : 0.f;
-        printf("[mgstage] step=%d layer=%d tag=%d n=%d l2=%.6f v0=%.6f v1=%.6f v2=%.6f\n",
-               step, layer, tag, n, sqrtf(red[0]), v0, v1, v2);
+        printf("[mgstage] step=%d layer=%d tag=%d n=%d l2=%.6f sum=%.6f v0=%.6f v1=%.6f v2=%.6f\n",
+               step, layer, tag, n, sqrtf(red[0]), redsum[0], v0, v1, v2);
     }
 }
 
