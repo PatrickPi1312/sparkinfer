@@ -551,6 +551,31 @@ test -x build/runtime/qwen3_gguf_score
 source bench/scripts/_common.sh
 source bench/scripts/_eval_speed.sh
 SI_BIN="$PWD/build/runtime"; SI_LD=""
+
+# Score the decode against a REAL prompt, not bench_decode's built-in synthetic ramp
+# (ids[i] = 100 + i % 20000). Measured impact on this model is nil -- 82.61 vs 82.67 tok/s, inside
+# run-to-run spread -- because Qwen3.8 is dense_ffn and dense decode is weight-bandwidth bound, so
+# token content does not change the cost. The point is not the number, it is that a synthetic
+# prompt is a gaming surface: an optimisation keyed on a repeating/ramping token stream would post
+# a real-looking speedup here and nothing in production. That matters now that this bot AUTO-MERGES
+# its winner without a human reading the diff. Both refs in a round use the same file, so the
+# PR-vs-main comparison stays apples-to-apples either way.
+# If the file is missing or too short, bench_decode logs and falls back to the ramp rather than
+# padding -- a partly-synthetic prompt would be worse than an honestly synthetic one.
+BENCH_PROMPT_IDS=/tmp/q38_bench_prompt_ids.txt
+if python3 - "$MODEL_DIR/tokenizer.json" bench/scripts/bench_prompt.txt > "$BENCH_PROMPT_IDS" 2>/dev/null <<'PYBP'
+import sys
+from tokenizers import Tokenizer
+ids = Tokenizer.from_file(sys.argv[1]).encode(open(sys.argv[2]).read()).ids
+print(" ".join(str(i) for i in ids))
+PYBP
+then
+  export SPARKINFER_BENCH_PROMPT_FILE="$BENCH_PROMPT_IDS"
+  echo "BENCH_PROMPT_IDS $(wc -w < "$BENCH_PROMPT_IDS")"
+else
+  echo "BENCH_PROMPT_TOKENIZE_FAILED -- falling back to the synthetic prompt" >&2
+fi
+
 wait_gpu_clear
 if bench_sweep_run "$MODEL_DIR" "$NTOK" 128 5; then
   DECODE128_TPS=$(_bench_sweep_get 128 decode_tps)
@@ -597,6 +622,13 @@ fi
 # Qwen3.6's architecture would otherwise slip past this bot entirely, as it did for the LMCache
 # integration (PR #775) until checked by hand. reps=5 for the same clock-variance reason as above.
 # _common.sh/_eval_speed.sh/SI_BIN already sourced above -- reused here, not re-sourced.
+#
+# The real-prompt file above is Qwen3.8 token ids and MUST NOT leak into this guard: Qwen3.6 is a
+# different model with a different vocabulary, so those ids denote different text (or none). The
+# guard also sweeps to ctx=32768, far past this prompt's length, which would fall back per-context
+# anyway. Unset so the guard is unambiguously synthetic on both refs -- which is all it needs,
+# since it is a PR-vs-main comparison, not an absolute number.
+unset SPARKINFER_BENCH_PROMPT_FILE
 export MODELS_DIR="$Q36_GUARD_MODELS_DIR" MODEL_REPO="$Q36_GUARD_MODEL_REPO" \\
        MODEL_FILE="$Q36_GUARD_MODEL_FILE" TOK_REPO="$Q36_GUARD_TOK_REPO"
 export MODEL_SHA256="${{QWEN36_MODEL_SHA256:-}}"
