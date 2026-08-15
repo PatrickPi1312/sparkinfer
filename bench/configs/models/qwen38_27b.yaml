@@ -1,0 +1,92 @@
+# Qwen3.8-27B architecture specification.
+# Sources:
+#   https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/config.json
+#   https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
+#   https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4
+#
+# Same dense-hybrid geometry as Qwen3.6-27B (64 layers, 16×(3 GDN + 1 attn),
+# 16 linear Q/K heads vs 24 full-attention heads). SparkInfer's native load
+# path is GGUF. ModelOpt NVFP4 safetensors are a separate runtime — see
+# docs/qwen38-27b.md.
+
+model:
+  name: Qwen3.8-27B
+  family: qwen3_5_dense
+  modality: image_text_to_text
+  total_params_b: 27
+  active_params_b: 27
+
+text:
+  num_hidden_layers: 64
+  hidden_size: 5120
+  intermediate_size: 17408
+  max_position_embeddings: 262144
+  vocab_size: 248320
+  dtype: bfloat16
+  rms_norm_eps: 1e-6
+
+attention:
+  layout: hybrid_gated_deltanet
+  linear_attention_layers: 48
+  full_attention_layers: 16
+  full_attention_interval: 4
+
+  linear_attention:
+    type: gated_deltanet
+    num_qk_heads: 16
+    num_value_heads: 48
+    key_head_dim: 128
+    value_head_dim: 128
+    conv_kernel_dim: 4
+    ssm_dtype: float32
+
+  full_attention:
+    num_attention_heads: 24
+    num_key_value_heads: 4
+    head_dim: 256
+    rotary_dim: 64
+    partial_rotary_factor: 0.25
+    rope_theta: 10000000
+    mrope_interleaved: true
+    mrope_section: [11, 11, 10]
+
+mtp:
+  num_hidden_layers: 1
+  use_dedicated_embeddings: false
+
+vision:
+  enabled: true
+  hidden_size: 1152
+  depth: 27
+  num_heads: 16
+  patch_size: 16
+  temporal_patch_size: 2
+  spatial_merge_size: 2
+  out_hidden_size: 5120
+
+special_tokens:
+  bos_token_id: 248044
+  eos_token_id: 248044
+  image_token_id: 248056
+  video_token_id: 248057
+  vision_start_token_id: 248053
+  vision_end_token_id: 248054
+
+derived:
+  full_attention_kv_bytes_per_token: 65536
+  full_attention_kv_bytes_at_262k_ctx_gb: 16.0
+  dense_up_shape: [5120, 17408]
+  dense_down_shape: [17408, 5120]
+
+runtime:
+  sparkinfer_native_decode: true
+  input_support: text_only
+  implemented_runtime_work:
+    - gated_deltanet_linear_attention_decode
+    - linear_attention_recurrent_state_cache
+    - hybrid_layer_scheduler
+    - qwen3_5_dense_partial_rotary_decode
+  pending_validation:
+    - qwen38_27b_same_gguf_parity_against_llama_cpp
+    - qwen38_27b_nvfp4_modelopt_loader
+    - multimodal_token_and_vision_plumbing

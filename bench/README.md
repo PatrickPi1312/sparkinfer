@@ -21,6 +21,7 @@ Part of [gittensor-ai-lab](https://github.com/orgs/gittensor-ai-lab) — SN74.
 | Model | Quant | Size | Benchmark targets |
 |---|---|---|---|
 | Qwen3.6-27B | Q4_K_M | ~19.3 GB VRAM | 95.1 tok/s decode @ RTX 5090, bs=1, ctx=512 |
+| Qwen3.8-27B | Q4_K_M | GGUF (same layout as 3.6-27B) | baselines pending; NVFP4 is vLLM-only today |
 | Qwen3.5-35B-A3B | Q4_K_M | ~20 GB | 130 tok/s @ RTX 5090, bs=1, ctx=2K |
 | Gemma 4 26B-A4B | Q4_K_M | ~14.6 GB | 256K context on RTX 5090 without OOM |
 
@@ -42,11 +43,14 @@ configs/
 ├── models/
 │   ├── qwen35_35b_a3b.yaml       # arch spec, derived memory requirements
 │   ├── qwen36_27b.yaml            # dense hybrid text decoder (vision pending)
+│   ├── qwen38_27b.yaml            # Qwen3.8-27B — same geometry as 3.6-27B
 │   └── gemma4_26b_a4b.yaml        # interleaved 5L:1G attention, hd256/hd512
 ├── targets/
 │   ├── qwen35_q4km_rtx5090.yaml  # baseline 80 tok/s, target 130 tok/s
 │   ├── qwen35_q4km_rtx_spark.yaml
 │   ├── qwen36_27b_q4km_rtx5090.yaml
+│   ├── qwen38_27b_q4km_rtx5090.yaml
+│   ├── qwen38_27b_nvfp4_rtx_pro_6000.yaml
 │   ├── gemma4_q4km_rtx5090.yaml  # 20.2 GB @ 256K ctx
 │   └── gemma4_q4km_rtx_spark.yaml
 ├── rtx5090.yaml                  # hardware spec: 32 GB, 1.79 TB/s, sm_120

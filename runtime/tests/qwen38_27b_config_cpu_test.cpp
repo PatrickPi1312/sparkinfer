@@ -1,8 +1,8 @@
-// CPU-only Qwen3.6-27B GGUF metadata test.
+// CPU-only Qwen3.8-27B GGUF metadata test.
 //
-// The native runtime serves the text decoder from a standard Qwen3.6-27B
-// GGUF. Vision tensors live in the optional mmproj GGUF and are intentionally
-// not part of this text-only load path.
+// Qwen3.8-27B shares the Qwen3.6-27B dense-hybrid layout. The native runtime
+// serves the text decoder from a standard Qwen3.8-27B GGUF. Vision tensors
+// live in the optional mmproj GGUF and are not part of this load path.
 
 #include "../examples/qwen3_gguf_config.h"
 
@@ -50,7 +50,7 @@ uint64_t tensor_bytes(const Tensor& t) {
 
 bool write_tiny_gguf(const std::string& path) {
     std::vector<Meta> meta = {
-        {"general.name", VT_STR, 0, 0.f, "Qwen3.6-27B"},
+        {"general.name", VT_STR, 0, 0.f, "Qwen3.8-27B"},
         {"general.architecture", VT_STR, 0, 0.f, "qwen35"},
         {"general.alignment", VT_U32, 32},
         {"qwen35.block_count", VT_U32, 64},
@@ -69,16 +69,12 @@ bool write_tiny_gguf(const std::string& path) {
         {"qwen35.attention.layer_norm_rms_epsilon", VT_F32, 0, 1e-6f},
         {"tokenizer.ggml.eos_token_id", VT_U32, 248044},
     };
-    // Dimensions match the real unsloth/ggml-org Qwen3.6-27B-GGUF release: the
-    // linear-attention stage uses only 16 Q/K heads (fewer than the 24
-    // full-attention heads), so attn_qkv's ne[1] is 2*(16*128) + 48*128, not
-    // 2*(24*128) + 48*128. attn_gate mirrors the 48-head value width directly
-    // and is what the parser must read to get linear_v_heads right; dense FFN
-    // names prove this is not the routed-MoE path.
+    // Same tensor shapes as Qwen3.6-27B: linear-attention Q/K is 16 heads,
+    // not 24. attn_qkv ne[1] = 2*(16*128) + 48*128; attn_gate = 48*128.
     std::vector<Tensor> tensors = {
         {"token_embd.weight", {1, 248320}},
-        {"blk.0.attn_qkv.weight", {1, 10240}}, // 2*(16*128) + 48*128
-        {"blk.0.attn_gate.weight", {1, 6144}}, // 48*128
+        {"blk.0.attn_qkv.weight", {1, 10240}},
+        {"blk.0.attn_gate.weight", {1, 6144}},
         {"blk.0.ffn_gate.weight", {1, 17408}},
     };
 
@@ -121,7 +117,7 @@ bool write_tiny_gguf(const std::string& path) {
 } // namespace
 
 int main() {
-    const std::string path = "/tmp/sparkinfer_qwen36_27b_config_cpu_test.gguf";
+    const std::string path = "/tmp/sparkinfer_qwen38_27b_config_cpu_test.gguf";
     CHECK(write_tiny_gguf(path));
 
     sparkinfer::GGUF g;
@@ -150,6 +146,6 @@ int main() {
     CHECK(cfg.eos_id == 248044);
     CHECK(std::string(qwen3_model_label(cfg)) == "Qwen3.6/Qwen3.8-27B dense hybrid (text-only)");
 
-    std::printf("qwen36_27b_config_cpu_test: OK\n");
+    std::printf("qwen38_27b_config_cpu_test: OK\n");
     return 0;
 }

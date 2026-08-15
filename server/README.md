@@ -52,6 +52,19 @@ MODEL_NAME=qwen3.6-27b \
 ./server/run.sh --download
 ```
 
+### Qwen3.8-27B (text-only)
+
+Same dense-hybrid GGUF path as Qwen3.6-27B. Native SparkInfer decode is GGUF,
+not ModelOpt NVFP4 — see [`docs/qwen38-27b.md`](../docs/qwen38-27b.md).
+
+```bash
+MODEL_REPO=unsloth/Qwen3.8-27B-GGUF \
+MODEL_FILE=Qwen3.8-27B-Q4_K_M.gguf \
+TOK_REPO=Qwen/Qwen3.8-27B \
+MODEL_NAME=qwen3.8-27b \
+./server/run.sh --download
+```
+
 ## API
 
 | Endpoint | Description |

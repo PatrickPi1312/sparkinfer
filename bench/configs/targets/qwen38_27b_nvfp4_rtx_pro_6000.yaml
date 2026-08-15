@@ -1,0 +1,72 @@
+# Target card for gittensor-model-hub/Qwen3.8-27B-NVFP4 on RTX PRO 6000.
+#
+# This is NOT a native SparkInfer load yet. The checkpoint is NVIDIA ModelOpt
+# NVFP4 (W4A4, compressed-tensors / hf_quant_config) served today by vLLM.
+# SparkInfer's 27B path is GGUF dequant → BF16 GEMM. Landing this target
+# means: ModelOpt safetensors loader + Blackwell NVFP4 GEMM + FP8 KV.
+# See docs/qwen38-27b.md.
+
+model: configs/models/qwen38_27b.yaml
+quant: nvfp4_modelopt
+
+hardware:
+  name: RTX PRO 6000 Blackwell Server Edition
+  arch: sm_120
+  vram_gb: 96
+  bandwidth_tbps: 1.79
+  cuda_cores: 24064
+
+checkpoint:
+  hf_id: gittensor-model-hub/Qwen3.8-27B-NVFP4
+  format: modelopt_nvfp4
+  disk_gb: 20.6
+  weights_in_vram_gb: 18.8
+  kv_cache_dtype: fp8
+
+decode:
+  batch_sizes: [1, 8, 32, 64]
+  context_lens: [4096]
+  dtype: nvfp4
+  # Measured 2026-08-14 on this GPU with vLLM 0.27.1 (not SparkInfer).
+  # thinking off, ignore_eos, 256 output tokens. Keep as a vLLM reference
+  # until the native NVFP4 path exists.
+  vllm_reference_toks_per_sec:
+    bs1: 67.2
+    bs8: 476.6
+    bs32: 1448.6
+    bs64: 2152.4
+  baseline_toks_per_sec:
+    bs1_ctx512: null
+  target_toks_per_sec:
+    bs1_ctx512: null
+
+runtime:
+  sparkinfer_native_decode: false
+  sparkinfer_nvfp4_loader: false
+  current_serve: vllm
+  input_support: text_only
+  required_work:
+    - qwen38_27b_modelopt_nvfp4_weight_loader
+    - qwen38_27b_blackwell_w4a4_gemm
+    - qwen38_27b_fp8_kv_in_sparkinfer
+    - qwen38_27b_same_prompt_parity_vs_vllm
+  completed_work:
+    - qwen38_27b_arch_yaml
+    - qwen38_27b_gguf_parser_reuses_36_27b_path
+
+memory:
+  full_attention_kv_bytes_per_token: 65536
+
+attention:
+  linear_attention:
+    layers: 48
+    qk_heads: 16
+    value_heads: 48
+    head_dim: 128
+    bench_recurrent_state: true
+  full_attention:
+    layers: 16
+    num_kv_heads: 4
+    head_dim: 256
+    rotary_dim: 64
+    bench_full_ctx_attn: true

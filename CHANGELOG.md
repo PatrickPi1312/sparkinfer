@@ -3,6 +3,13 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased] — branch `qwen-3-8-27b`
+
+Qwen3.8-27B shares the Qwen3.6-27B dense-hybrid GGUF layout, so the existing
+27B parser and kernels load a Qwen3.8 GGUF without a new decode path. ModelOpt
+NVFP4 (`gittensor-model-hub/Qwen3.8-27B-NVFP4`) is documented but not loaded —
+SparkInfer still dequants GGUF to BF16. See `docs/qwen38-27b.md`.
+
 ## [0.4.3] — 2026-07-21
 
 sparkinfer's **prefill stack is the headline of this release**: Qwythos (Qwen3.5) is now

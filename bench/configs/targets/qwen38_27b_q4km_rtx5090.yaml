@@ -1,0 +1,60 @@
+# Benchmark target: Qwen3.8-27B Q4_K_M GGUF on RTX 5090.
+# Dense hybrid: 48 Gated DeltaNet layers + 16 full-attention layers.
+# Native SparkInfer path is GGUF (same kernels as Qwen3.6-27B).
+
+model: configs/models/qwen38_27b.yaml
+quant: q4_k_m
+
+hardware:
+  name: RTX 5090
+  arch: sm_120
+  vram_gb: 32
+  bandwidth_tbps: 1.79
+  cuda_cores: 21760
+
+decode:
+  batch_sizes: [1, 2, 4]
+  context_lens: [512, 2048, 8192, 32768]
+  dtype: bfloat16
+  baseline_toks_per_sec:
+    bs1_ctx512: null
+    bs1_ctx8192: null
+    bs4_ctx512: null
+  target_toks_per_sec:
+    bs1_ctx512: null
+    bs1_ctx8192: null
+    bs4_ctx512: null
+
+prefill:
+  seq_lens: [512, 2048, 8192, 32768]
+  batch_size: 1
+  dtype: bfloat16
+  baseline_toks_per_sec:
+    ctx512: null
+    ctx8192: null
+    ctx2048: null
+    ctx32768: null
+
+runtime:
+  sparkinfer_native_decode: true
+  input_support: text_only
+  required_work:
+    - qwen38_27b_same_gguf_parity_against_llama_cpp
+  completed_work: []
+
+memory:
+  full_attention_kv_bytes_per_token: 65536
+
+attention:
+  linear_attention:
+    layers: 48
+    qk_heads: 16
+    value_heads: 48
+    head_dim: 128
+    bench_recurrent_state: true
+  full_attention:
+    layers: 16
+    num_kv_heads: 4
+    head_dim: 256
+    rotary_dim: 64
+    bench_full_ctx_attn: true
