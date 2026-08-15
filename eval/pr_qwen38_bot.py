@@ -412,11 +412,20 @@ def _crash_reason(*outputs: str) -> str | None:
 
 
 def _looks_like_hard_kill(stdout: str, stderr: str) -> bool:
-    """Same hard-kill heuristic as pr_dflash_bot.py (no ERR-trap diagnostic captured at all)."""
+    """No ERR-trap diagnostic captured AND the run did not reach its final checkpoint.
+
+    The sibling bots key this off ACCURACY_STAGE_DONE because accuracy is their LAST stage. Here
+    it is not: the Qwen3.6 guard runs after it, so ACCURACY_STAGE_DONE would mark a run "far
+    enough along" while the entire guard was still missing. Observed for real 2026-08-15 --
+    a main run reached ACCURACY_STAGE_DONE and GUARD_START, then died at exit 6 during the guard
+    sweep with no ERR-trap output at all; re-running the identical script succeeded, so it was
+    transient. Under the old heuristic that run would NOT have been retried, check_q36_guard would
+    have seen an empty guard36 dict, called the measurement unavailable, and hard-REJECTed --
+    auto-closing a PR for a flake. GUARD_END is the real end-of-run marker, so use that."""
     combined = (stdout or "") + "\n" + (stderr or "")
     if _crash_reason(stdout, stderr):
         return False
-    return "ACCURACY_STAGE_DONE" not in combined  # never reached even the accuracy checkpoint
+    return "GUARD_END" not in combined
 
 
 def _ssh_run_resilient(host, port, script: str, label: str):
