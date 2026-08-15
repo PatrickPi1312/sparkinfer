@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """sparkinfer Muse Glimmer PR auto-evaluator.
 
-RETIRED FROM CRON. Superseded by eval/pr_qwen38_bot.py, which scores Qwen3.8-27B (decode@128 on
-the NVFP4 checkpoint) and is the bot now installed at :00. This file is kept for reference and
-still runs correctly by hand, but run_museglimmer_cron.sh is no longer scheduled -- only one bot
-may hold /tmp/sparkinfer_bot.lock, and they all drive the same single pinned GPU. Everything below
-describes how this bot behaves when run manually.
+SUPERSEDED by eval/pr_qwen38_bot.py, which scores Qwen3.8-27B (decode@128 on the NVFP4
+checkpoint) on a */30 schedule. Only one bot may hold /tmp/sparkinfer_bot.lock, and they all drive
+the same single pinned GPU, so the two are not meant to run concurrently.
+
+NOTE: the crontab is machine state, not repo state -- merging the commit that added this note does
+NOT retire anything by itself. Until the `0 * * * * eval/run_museglimmer_cron.sh` line is removed
+from the eval host's crontab and replaced with run_qwen38_cron.sh's `*/30` line, THIS bot is still
+the one actually scoring PRs. Everything below describes how it behaves whenever it does run.
 
 Sibling of pr_dflash_bot.py — narrowly scoped to Muse Glimmer's plain AR (autoregressive)
 decode + 128-ctx prefill. Not DFlash, not long-context beyond 128. This scope is deliberate:

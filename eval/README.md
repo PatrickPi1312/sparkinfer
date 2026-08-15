@@ -178,13 +178,18 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 
 ## Qwen3.8-27B PR auto-evaluation bot (the scored path)
 
-> **Status: scoring is Qwen3.8-27B-only.** `pr_qwen38_bot.py` is the bot on cron
-> (`eval/run_qwen38_cron.sh`, every 30 min). A round costs ~80s per ref measured end-to-end
-> (~3 min with one pending PR), so the interval is not a bottleneck — see that file's header for
-> the stage-by-stage timings. The Muse Glimmer bot (`pr_museglimmer_bot.py`) and
-> the DFlash bot (`pr_dflash_bot.py`) are **retired from cron** — their code is kept for reference
-> and both still work if run by hand, but neither is scheduled. Only one bot may hold the shared
-> `/tmp/sparkinfer_bot.lock` at a time, and they all drive the same single pinned GPU.
+> **Intended scope: scoring is Qwen3.8-27B-only.** `pr_qwen38_bot.py` (`eval/run_qwen38_cron.sh`,
+> `*/30`) is meant to be the only bot on cron, with the Muse Glimmer (`pr_museglimmer_bot.py`) and
+> DFlash (`pr_dflash_bot.py`) bots kept for reference and run by hand only. Only one bot may hold
+> the shared `/tmp/sparkinfer_bot.lock` at a time, and they all drive the same single pinned GPU.
+>
+> **This is not automatic.** The crontab is host state, not repo state, so merging this does not
+> switch anything over. Until someone edits the eval host's crontab — drop
+> `0 * * * * eval/run_museglimmer_cron.sh`, add `*/30 * * * * eval/run_qwen38_cron.sh` — the Muse
+> Glimmer bot is still the one scoring PRs, and `pr_qwen38_bot.py` never runs. Check with
+> `crontab -l` on the eval host (the machine running the bot, **not** the GPU box it SSHes into).
+> A round costs ~80s per ref measured end-to-end (~3 min with one pending PR), so `*/30` is not a
+> bottleneck — see `run_qwen38_cron.sh`'s header for the stage-by-stage timings.
 
 `pr_qwen38_bot.py` scores **same-box PR vs `origin/main`** on three axes, applies
 `eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, mirrors it to `eval:*` (SN74 scoring reads `eval:*`),
