@@ -16,10 +16,21 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               (runtime/examples/qwen_checkpoint.h, shared with the server so the two cannot
               disagree about how a checkpoint is configured).
 
-              Prefill is NOT a scored dimension here, unlike the Muse Glimmer bot. At ctx=128 this
-              model's batched prefill path declines anyway (it requires int8 KV, which the bench
-              only enables at ctx>=4096), so a prefill@128 number would measure the sequential
-              fallback and move for reasons unrelated to the prefill kernels a PR touches.
+              Prefill@128 is ALSO scored, from the same sweep and the same model load (no extra
+              GPU time -- prefill_pp was already computed alongside decode_tps and simply
+              discarded). Combination rule is pr_museglimmer_bot.py's, verbatim: either dimension
+              regressing is a hard REJECT, otherwise the better of the two tiers wins, so a pure
+              prefill win with flat decode still scores.
+
+              Read the ABSOLUTE prefill number with care. Measured 2026-08-15 on the pinned box,
+              Qwen3.8-27B prefill@128 is ~86 pp -- roughly this model's DECODE speed (82.7 tok/s),
+              which is the signature of a token-at-a-time path rather than one batched GEMM pass.
+              llama.cpp ingests the same 128-token prompt at ~2651 t/s from a Q4_K_M GGUF of this
+              model. That gap is ~31x and is not explained by quantization. Scoring the dimension
+              does not fix it; it makes it visible and rewards whoever does.
+              What scoring it IS valid for regardless: it is a PR-vs-main comparison on the same
+              box and the same shape, so a PR that speeds up or regresses whatever path ctx=128
+              actually takes is measured correctly even while the absolute number is unflattering.
 
   2. Accuracy gate — DIFFERENTIAL, not absolute. llama.cpp cannot read a compressed-tensors
               directory, so the Muse Glimmer methodology (teacher-forced score vs a live
@@ -448,7 +459,7 @@ def _ssh_run_resilient(host, port, script: str, label: str):
 
 
 def _remote_script(ref: str, role: str = "pr") -> str:
-    """Bash run on the eval box: checkout ref, build, decode@128 speed bench on the NVFP4
+    """Bash run on the eval box: checkout ref, build, decode+prefill@128 bench on the NVFP4
     checkpoint, teacher-forced score dump, and the Qwen3.6 no-regression guard.
 
     Run once per ref -- identical script both times so the two measurements are directly
@@ -579,10 +590,15 @@ fi
 wait_gpu_clear
 if bench_sweep_run "$MODEL_DIR" "$NTOK" 128 5; then
   DECODE128_TPS=$(_bench_sweep_get 128 decode_tps)
+  # Same model load, same sweep, no extra GPU time: prefill_pp is already computed alongside
+  # decode_tps for this context, it was simply being discarded.
+  PREFILL128_PP=$(_bench_sweep_get 128 prefill_pp)
 else
   DECODE128_TPS=0
+  PREFILL128_PP=0
 fi
 echo "RESULT_DECODE128_TPS ${{DECODE128_TPS:-0}}"
+echo "RESULT_PREFILL128_PP ${{PREFILL128_PP:-0}}"
 
 # --- teacher-forced score dump (differential accuracy gate, module docstring pt. 2) ---
 # llama.cpp cannot read a compressed-tensors directory, so there is no same-weights external
@@ -662,6 +678,11 @@ def _parse_remote(stdout: str) -> dict:
         elif line.startswith("RESULT_DECODE128_TPS "):
             try:
                 out["decode128_tps"] = float(line.split()[1])
+            except ValueError:
+                pass
+        elif line.startswith("RESULT_PREFILL128_PP "):
+            try:
+                out["prefill128_pp"] = float(line.split()[1])
             except ValueError:
                 pass
         elif line.startswith("RESULT_TOKEN_COUNT "):
@@ -858,6 +879,8 @@ def measure_main_baseline(host, port):
     main = _parse_remote(r.stdout or "")
     if "decode128_tps" not in main:
         return {"ok": False, "reason": "main bench missing decode@128 tok/s", "log": (r.stdout or "")[-1500:]}
+    if "prefill128_pp" not in main:
+        return {"ok": False, "reason": "main bench missing prefill@128 pp", "log": (r.stdout or "")[-1500:]}
     main["ok"] = True
     return main
 
@@ -875,6 +898,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     pr = _parse_remote(r.stdout or "")
     if "decode128_tps" not in pr:
         return {"ok": False, "reason": "PR bench missing decode@128 tok/s", "log": (r.stdout or "")[-1500:]}
+    if "prefill128_pp" not in pr:
+        return {"ok": False, "reason": "PR bench missing prefill@128 pp", "log": (r.stdout or "")[-1500:]}
     if "top1" not in pr or "kl" not in pr:
         # Either the score dump failed, or main's dump was missing so the comparator never ran
         # (ACCURACY_NO_BASELINE). Both are infra faults, but they must NOT pass as "accurate" --
@@ -882,14 +907,32 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         return {"ok": False, "reason": "PR run missing accuracy METRIC line (score dump failed, "
                                        "or no main baseline dump to diff against)",
                 "log": (r.stdout or "")[-1500:]}
-    print(f">> PR decode@128={pr['decode128_tps']:.2f} "
+    print(f">> PR decode@128={pr['decode128_tps']:.2f} prefill@128={pr['prefill128_pp']:.2f} "
           f"top1={pr.get('top1', 0):.4f} kl={pr.get('kl', 99):.5f}")
 
-    # Single scored dimension: decode @ ctx=128 on the NVFP4 checkpoint (module docstring pt. 1).
-    label, delta_pct, passed, speed_reason = tier_from_gain(
+    # Two scored dimensions on the NVFP4 checkpoint, both from the one model load (module
+    # docstring pt. 1). Combination rule copied verbatim from pr_museglimmer_bot.py rather than
+    # reinvented: EITHER dimension regressing is a hard REJECT regardless of the other, but
+    # otherwise take the BETTER of the two tiers, so a pure prefill win with flat decode still
+    # scores on its own merits instead of being dragged to "none".
+    decode_label, decode_delta_pct, decode_passed, decode_reason = tier_from_gain(
         pr["decode128_tps"], main["decode128_tps"], metric="decode@128")
+    prefill_label, prefill_delta_pct, prefill_passed, prefill_reason = tier_from_gain(
+        pr["prefill128_pp"], main["prefill128_pp"], metric="prefill@128")
+
+    if decode_label == "REJECT" and prefill_label == "REJECT":
+        label, delta_pct, passed = "REJECT", min(decode_delta_pct, prefill_delta_pct), False
+        speed_reason = f"{decode_reason} | {prefill_reason}"
+    elif decode_label == "REJECT":
+        label, delta_pct, passed, speed_reason = "REJECT", decode_delta_pct, False, decode_reason
+    elif prefill_label == "REJECT":
+        label, delta_pct, passed, speed_reason = "REJECT", prefill_delta_pct, False, prefill_reason
+    elif _TIER_RANK[decode_label] >= _TIER_RANK[prefill_label]:
+        label, delta_pct, passed, speed_reason = decode_label, decode_delta_pct, decode_passed, decode_reason
+    else:
+        label, delta_pct, passed, speed_reason = prefill_label, prefill_delta_pct, prefill_passed, prefill_reason
     # Keep the speed-only verdict: `label` below can be forced to REJECT by the accuracy gate or
-    # the Qwen3.6 guard, and the comment/dashboard still need to say whether decode itself moved.
+    # the Qwen3.6 guard, and the comment/dashboard still need to say whether speed itself moved.
     speed_label = label
 
     pr_top1 = pr.get("top1", 0.0)
@@ -925,8 +968,16 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "delta_pct": delta_pct,
         "pr_decode_tps": pr["decode128_tps"],
         "main_decode_tps": main["decode128_tps"],
-        "decode_delta_pct": delta_pct,
-        "decode_regressed": speed_label == "REJECT",
+        "decode_delta_pct": decode_delta_pct,
+        "decode_regressed": decode_label == "REJECT",
+        "pr_prefill_pp": pr["prefill128_pp"],
+        "main_prefill_pp": main["prefill128_pp"],
+        "prefill_delta_pct": prefill_delta_pct,
+        "prefill_regressed": prefill_label == "REJECT",
+        # Which dimension the headline tier came from -- otherwise an XL on the comment is
+        # ambiguous between a decode win and a prefill win.
+        "scored_dimension": ("decode@128" if _TIER_RANK[decode_label] >= _TIER_RANK[prefill_label]
+                             else "prefill@128"),
         "speedup_vs_main": round(pr["decode128_tps"] / main["decode128_tps"], 3) if main.get("decode128_tps") else 0,
         "pr_top1": pr_top1,
         "pr_kl": pr_kl,
@@ -964,6 +1015,9 @@ def format_comment(commit: str, res: dict) -> str:
         "delta_pct": res.get("delta_pct"),
         "pr_decode_tps": res.get("pr_decode_tps"),
         "main_decode_tps": res.get("main_decode_tps"),
+        "pr_prefill_pp": res.get("pr_prefill_pp"),
+        "main_prefill_pp": res.get("main_prefill_pp"),
+        "scored_dimension": res.get("scored_dimension"),
         "pr_top1": res.get("pr_top1"),
         "pr_kl": res.get("pr_kl"),
         "pass": res.get("pass"),
@@ -1011,10 +1065,14 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer qwen38 auto-eval — `eval-qwen38:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-qwen38:{lab}` |\n"
-        f"| scored at | 128-token decode (ctx=0) + 128-ctx prefill — shared regression floor, best of the two |\n"
+        f"| scored at | decode@128 + prefill@128 — shared regression floor, best of the two |\n"
+        f"| tier came from | `{res.get('scored_dimension', '?')}` |\n"
         f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
         f"| main decode tok/s | {res['main_decode_tps']:.2f} |\n"
         f"| decode speedup vs main | **{res.get('speedup_vs_main', 0):.2f}×** ({res.get('decode_delta_pct', 0):+.1f}%) |\n"
+        f"| PR prefill pp | {res['pr_prefill_pp']:.2f} |\n"
+        f"| main prefill pp | {res['main_prefill_pp']:.2f} |\n"
+        f"| prefill vs main | {res.get('prefill_delta_pct', 0):+.1f}% |\n"
 
         f"{acc_row}"
         f"{main_acc_note}"
@@ -1157,6 +1215,9 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
             "label": res.get("label"), "pass": res.get("pass"), "reason": res.get("reason"),
             "delta_pct": res.get("delta_pct"),
             "pr_decode_tps": res.get("pr_decode_tps"), "main_decode_tps": res.get("main_decode_tps"),
+            "pr_prefill_pp": res.get("pr_prefill_pp"), "main_prefill_pp": res.get("main_prefill_pp"),
+            "prefill_delta_pct": res.get("prefill_delta_pct"),
+            "scored_dimension": res.get("scored_dimension"),
             "speedup_vs_main": res.get("speedup_vs_main"),
             "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
             "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
@@ -1210,6 +1271,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         label = "REJECT"
     print(f"PR #{num}: eval-qwen38:{label}  "
           f"decode PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')}  "
+          f"prefill PR={res.get('pr_prefill_pp')} main={res.get('main_prefill_pp')}  "
+          f"from={res.get('scored_dimension')}  "
           f"top1={res.get('pr_top1')} kl={res.get('pr_kl')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
           f"q36_guard_ok={res.get('q36_guard_ok')}")
@@ -1272,10 +1335,14 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
             elif not res.get("accuracy_ok"):
                 fail_clause = "and failed the accuracy gate"
+            elif res.get("decode_regressed") and res.get("prefill_regressed"):
+                fail_clause = "(decode@128 and prefill@128 regression)"
             elif res.get("decode_regressed"):
                 fail_clause = "(decode@128 regression)"
+            elif res.get("prefill_regressed"):
+                fail_clause = "(prefill@128 regression)"
             elif label == "none":
-                fail_clause = "with no verified decode@128 improvement"
+                fail_clause = "with no verified decode@128 or prefill@128 improvement"
             else:
                 fail_clause = "(regression)"
             close_body = (
@@ -1411,7 +1478,8 @@ def main():
         return
     # main has no top1/kl of its own: it IS the accuracy reference, and its score dump was just
     # written to SCORE_DUMP_MAIN for each PR in this round to diff against.
-    print(f">> main baseline: decode@128={main_result['decode128_tps']:.2f} tok/s")
+    print(f">> main baseline: decode@128={main_result['decode128_tps']:.2f} tok/s "
+          f"prefill@128={main_result['prefill128_pp']:.2f} pp")
 
     for num, head, short, ref, title in pending:
         print(f"PR #{num} @ {short}: evaluating Qwen3.8-27B '{ref}' …")
