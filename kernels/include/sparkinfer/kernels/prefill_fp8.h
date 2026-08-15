@@ -23,12 +23,25 @@ namespace sparkinfer { namespace kernels {
 void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
                                       int rows, int cols, cudaStream_t stream = nullptr);
 
+// Checkpoint SI_QTYPE_FP8 stores per-row scales as bf16. The GEMM epilogue wants fp32 sw[N]
+// with the same multiply convention (W_bf16 = e4m3 * scale).
+void launch_prefill_fp8_wscales_bf16(const void* scale_bf16, float* sw, int n,
+                                     cudaStream_t stream = nullptr);
+
 // fp8 GEMM: C[M,N] = A[M,K] @ W^T, W dequantized bf16 [N,K] row-major (C[m,n]=sum_k A[m,k]*W[n,k]).
 // A/W e4m3 with per-row scales sx[M] (per token) and sw[N] (per output channel). Output C is bf16
 // with the dequant sx[m]*sw[n] fused into the store. fp16 accumulate with a per-BK-tile fp32 flush.
 void launch_prefill_gemm_fp8(const void* A, const void* W,
                              const float* sx, const float* sw, void* C,
                              int M, int N, int K, cudaStream_t stream = nullptr);
+
+// Split-K variant for the scored M=128 GDN projections (40-64 tiles on a 170-SM 5090).
+// `partials` is M*N fp32. Returns false when the shape already fills the device (caller
+// keeps launch_prefill_gemm_fp8). SPARKINFER_PREFILL_GEMM_SPLITK=0 disables.
+bool launch_prefill_gemm_fp8_splitk(const void* A, const void* W,
+                                    const float* sx, const float* sw, void* C,
+                                    int M, int N, int K, float* partials,
+                                    cudaStream_t stream = nullptr);
 
 // Fused SwiGLU + per-row int8 quantize: q[r,:] = int8(silu(gate[r,:]) * up[r,:]) with
 // scale[r] = amax_c|.| / 127. Replaces launch_prefill_swiglu + launch_prefill_quantize_rows_i8 on

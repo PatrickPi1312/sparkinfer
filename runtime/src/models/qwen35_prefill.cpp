@@ -347,7 +347,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // already has grid.y tiles to fill the device with, so the launcher declines it anyway.
     // SPARKINFER_PREFILL_GEMM_SPLITK=0 disables (A/B).
     constexpr int kSkMaxRows = 512;
-    const bool want_sk = c.muse_glimmer && !moe && need_i8 && N <= kSkMaxRows && [] {
+    // Muse Glimmer and Qwen3.8-27B both score M=128, where a 128x128 tile leaves the 5090
+    // empty on skinny n_out (GDN out=40 tiles, attn k/v=8). Qwen3.6 is MoE and stays off.
+    const bool want_sk = !moe && need_i8 && N <= kSkMaxRows && [] {
         const char* e = getenv("SPARKINFER_PREFILL_GEMM_SPLITK");
         return !(e && e[0] == '0');
     }();
@@ -365,7 +367,6 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         sx = sw = nullptr;
         sk_p = nullptr;
     }
-    // Every split-K use is gated on this, so a non-Muse model never reaches the new kernel.
     const bool mg_sk = sk_p != nullptr;
 
     // Native block-scaled FP4 is deliberately narrow: Muse, the scored M=128 shape, and layers
@@ -670,8 +671,29 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         else       kernels::launch_prefill_gemm_i8(Aq, Wq, sxq, swq, Cc, R, n_out, K, st);
     };
     // C[N,n_out] = A[N,K] @ W^T  (W native quantized [n_out,K]).
+    static const bool q38_fp8_prefill = [] {
+        const char* e = getenv("SPARKINFER_Q38_FP8_PREFILL");
+        return !(e && e[0] == '0');
+    }();
+    auto proj_fp8_native = [&](const bf16* A, const void* W, bf16* C, int R, int n_out, int K) -> bool {
+        // Checkpoint SI_QTYPE_FP8 is already e4m3 + per-row bf16 scale. At the scored
+        // ctx=128 the int8 arm dequants that to bf16 and requants to s8 every GDN
+        // projection (48 layers × qkv/z/out). Feed the packed e4m3 to the existing
+        // fp8 GEMM instead. SPARKINFER_Q38_FP8_PREFILL=0 restores the requant path.
+        if (!q38_fp8_prefill || !W || !A_i8 || !sx || !sw || n_out < 128) return false;
+        a_q = nullptr; a_pk = false;
+        kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
+        kernels::launch_prefill_fp8_wscales_bf16(W, sw, n_out, st);
+        const void* We4 = static_cast<const char*>(W) + (size_t)n_out * 2;
+        if (!(sk_p && kernels::launch_prefill_gemm_fp8_splitk(
+                A_i8, We4, sx, sw, C, R, n_out, K,
+                reinterpret_cast<float*>(sk_p), st)))
+            kernels::launch_prefill_gemm_fp8(A_i8, We4, sx, sw, C, R, n_out, K, st);
+        return true;
+    };
     auto proj = [&](const bf16* A, const void* W, int wtype, bf16* C, int n_out, int K, int rows = 0) {
         const int R = rows > 0 ? rows : N;   // rows (M) to process; chunked FFN passes a sub-N count
+        if (wtype == kernels::SI_QTYPE_FP8 && proj_fp8_native(A, W, C, R, n_out, K)) return;
         // int8 only for the big weight-bound projections; keep the tiny per-v-head gate
         // projections (ssm_alpha/ssm_beta, n_out == v_heads) in bf16 — they feed the GDN
         // sigmoid gates, where per-row int8 quant of a 32-wide weight costs more accuracy
@@ -712,7 +734,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool resid_fuse = !_prfuse || _prfuse[0] != '0';
     auto proj_resid = [&](const bf16* A, const void* W, int wtype, bf16* Cx, int n_out, int K,
                           int rows = 0) -> bool {
-        if (!resid_fuse || !use_i8 || n_out < 128) return false;
+        if (!resid_fuse || !use_i8 || n_out < 128 || wtype == kernels::SI_QTYPE_FP8) return false;
         const int R = rows > 0 ? rows : N;
         quant_a_i8(A, R, K);
         if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
@@ -779,7 +801,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const char* _pshareq = getenv("SPARKINFER_PREFILL_FP8_GDN_SHAREQ");
     const bool fp8_shareq = (use_fp8_gdn || moe_fp8) && (!_pshareq || _pshareq[0] != '0');
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w) {
-        if (fp8_shareq) {
+        if (q38_fp8_prefill && w.wqkv_type == kernels::SI_QTYPE_FP8 &&
+            w.wqkv_gate_type == kernels::SI_QTYPE_FP8 && A_i8 && sx && sw) {
+            a_q = nullptr; a_pk = false;
+            kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);
+            kernels::launch_prefill_fp8_wscales_bf16(w.wqkv, sw, lqkv, st);
+            const void* Wq = static_cast<const char*>(w.wqkv) + (size_t)lqkv * 2;
+            if (!(sk_p && kernels::launch_prefill_gemm_fp8_splitk(
+                    A_i8, Wq, sx, sw, b8, N, lqkv, H,
+                    reinterpret_cast<float*>(sk_p), st)))
+                kernels::launch_prefill_gemm_fp8(A_i8, Wq, sx, sw, b8, N, lqkv, H, st);
+            kernels::launch_prefill_fp8_wscales_bf16(w.wqkv_gate, sw, lvdim, st);
+            const void* Wz = static_cast<const char*>(w.wqkv_gate) + (size_t)lvdim * 2;
+            if (!(sk_p && kernels::launch_prefill_gemm_fp8_splitk(
+                    A_i8, Wz, sx, sw, lz, N, lvdim, H,
+                    reinterpret_cast<float*>(sk_p), st)))
+                kernels::launch_prefill_gemm_fp8(A_i8, Wz, sx, sw, lz, N, lvdim, H, st);
+        } else if (fp8_shareq) {
             a_q = nullptr; a_pk = false;                // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);   // xn -> e4m3 once
             const void* wb = dq(w.wqkv, w.wqkv_type, lqkv, H);
