@@ -4226,9 +4226,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
 //     scalar).
 //   - everything else (linear_attn's small in_proj_a/in_proj_b/norm, dt_bias, A_log, conv1d,
 //     all *_norm weights): plain bf16 ".weight".
-// HF tensors are [out,in] (PyTorch Linear convention); this runtime's GEMM/GEMV kernels want
-// [in,out] -- every quantized/dequantized tensor below is transposed once at load, same as
-// load_gguf()'s own dense() closure already does for its own transpose=true callers.
+// HF tensors are [out,in] (PyTorch Linear convention), which is byte-identical to the GGUF-native
+// [out,in] this runtime's GEMM/GEMV kernels already want -- so nothing below is transposed. An
+// earlier revision of this loader DID relayout to [in,out], on the assumption stated in this very
+// comment, and silently mis-shaped every projection in the model; see the dequant_fp8 comment for
+// the three kernels whose contracts pin the layout down.
 //
 // Every quantized tensor is dequantized to bf16 once (via the new launch_ct_dequant_fp8/
 // launch_ct_dequant_nvfp4 kernels), then requantized into the SAME internal formats load_gguf()
