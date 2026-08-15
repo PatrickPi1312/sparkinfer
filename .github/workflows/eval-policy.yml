@@ -34,6 +34,9 @@ jobs:
           bash -n bench/scripts/warm_llamacpp.sh
           bash -n eval/run_bot_cron.sh
           bash -n eval/setup_labels.sh
+          # Qwen3.8-27B is the scored model (eval/README.md); its cron wrapper is the one that
+          # actually runs, so a syntax error here silently stops all scoring.
+          bash -n eval/run_qwen38_cron.sh
 
       - name: Python syntax
         run: |
@@ -43,7 +46,9 @@ jobs:
             bench/scripts/test_label.py \
             eval/pr_eval_bot.py \
             eval/test_pr_eval_bot.py \
-            eval/vast_eval.py
+            eval/vast_eval.py \
+            eval/pr_qwen38_bot.py \
+            bench/scripts/accuracy_compare_pair.py
 
       - name: Eval policy tests
         run: |

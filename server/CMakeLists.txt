@@ -10,12 +10,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(tokenizers_cpp)
 
-FetchContent_Declare(
-    nlohmann_json
-    URL      https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
-    URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
-)
-FetchContent_MakeAvailable(nlohmann_json)
+# nlohmann_json is declared at the TOP-LEVEL CMakeLists (runtime/ needs it too and is configured
+# first); this target just uses it.
 
 # JSON Schema patterns come from untrusted API requests. Use RE2's bounded,
 # linear-time engine instead of std::regex, whose backtracking implementation
