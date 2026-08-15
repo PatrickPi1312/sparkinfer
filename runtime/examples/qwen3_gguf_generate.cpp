@@ -12,6 +12,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
 #include "sparkinfer/thermal_governor.h"
+#include "sparkinfer/hf_config.h"
 #include "qwen3_gguf_config.h"
 
 #include <cuda_runtime.h>
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -33,11 +35,17 @@ int main(int argc, char** argv) {
     std::vector<int> prompt;
     for (int i = 3; i < argc; i++) prompt.push_back(atoi(argv[i]));
 
-    // read architecture from GGUF metadata
-    sparkinfer::GGUF g;
-    if (!g.open(path)) { printf("[FAIL] cannot open %s\n", path.c_str()); return 1; }
+    const bool nvfp4 = sparkinfer::path_is_nvfp4_dir(path);
     sparkinfer::Qwen35Config cfg;
-    qwen3_config_from_gguf(g, cfg);
+    if (nvfp4) {
+        if (!sparkinfer::qwen3_config_from_hf_dir(path, cfg)) {
+            printf("[FAIL] parse HF config.json\n"); return 1;
+        }
+    } else {
+        sparkinfer::GGUF g;
+        if (!g.open(path)) { printf("[FAIL] cannot open %s\n", path.c_str()); return 1; }
+        qwen3_config_from_gguf(g, cfg);
+    }
     cfg.max_seq    = std::max(2048, (int)prompt.size() + max_new + 16);
     printf("arch: %s, %d layers, hidden %d, %dQ/%dKV hd%d, %d experts top-%d, ffn %d, vocab %d\n",
            qwen3_model_label(cfg), cfg.n_layers, cfg.hidden, cfg.n_q_heads,
@@ -60,8 +68,12 @@ int main(int argc, char** argv) {
     auto engine = sparkinfer::moe::MoEEngine::create(mc);
 
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
-    printf("loading GGUF (dense->bf16, experts kept quantized) ...\n");
-    if (!model.load_gguf(path)) { printf("[FAIL] load_gguf\n"); return 1; }
+    printf("loading %s ...\n", nvfp4 ? "ModelOpt NVFP4" : "GGUF");
+    if (nvfp4) {
+        if (!model.load_nvfp4(path)) { printf("[FAIL] load_nvfp4\n"); return 1; }
+    } else {
+        if (!model.load_gguf(path)) { printf("[FAIL] load_gguf\n"); return 1; }
+    }
     {
         auto g = sparkinfer::query_gpu_stats();
         printf("loaded. GPU: %s. generating %d tokens from %zu prompt tokens\n",

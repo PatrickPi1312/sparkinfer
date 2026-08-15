@@ -54,15 +54,19 @@ MODEL_NAME=qwen3.6-27b \
 
 ### Qwen3.8-27B (text-only)
 
-Same dense-hybrid GGUF path as Qwen3.6-27B. Native SparkInfer decode is GGUF,
-not ModelOpt NVFP4 — see [`docs/qwen38-27b.md`](../docs/qwen38-27b.md).
+Same dense-hybrid GGUF path as Qwen3.6-27B, **or** a ModelOpt NVFP4 Hugging Face
+directory (`load_nvfp4`). See [`docs/qwen38-27b.md`](../docs/qwen38-27b.md).
 
 ```bash
+# GGUF
 MODEL_REPO=unsloth/Qwen3.8-27B-GGUF \
 MODEL_FILE=Qwen3.8-27B-Q4_K_M.gguf \
 TOK_REPO=Qwen/Qwen3.8-27B \
 MODEL_NAME=qwen3.8-27b \
 ./server/run.sh --download
+
+# Native NVFP4 (HF directory)
+MODEL=/path/to/Qwen3.8-27B-NVFP4 ./server/run.sh
 ```
 
 ## API

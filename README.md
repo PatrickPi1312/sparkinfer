@@ -18,7 +18,7 @@ SparkInfer focuses on the models driving the future of AI — not thousands of l
 |---|---|
 | [**Qwen3.6-35B-A3B**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | Primary SOTA — hybrid Gated-DeltaNet + full-attention MoE |
 | [**Qwen3.6-27B**](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | Dense hybrid — native text-only GGUF decode; vision projector pending |
-| [**Qwen3.8-27B**](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | Same dense-hybrid layout as 3.6-27B — native GGUF decode; [NVFP4 notes](docs/qwen38-27b.md) |
+| [**Qwen3.8-27B**](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4) | Dense hybrid — native ModelOpt NVFP4 load; [notes](docs/qwen38-27b.md) |
 | [**Qwythos 9B**](https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF) | Mythos-level reasoning · long-context guard |
 | [**SparkDistill**](https://github.com/gittensor-model-hub/SparkDistill/) | Fable 5 / OpenAI 5.6-level CoT *(coming soon)* |
 | [**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) | Open MoE frontier *(next)* |

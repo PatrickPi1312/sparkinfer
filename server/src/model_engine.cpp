@@ -8,6 +8,7 @@
 #include "sparkinfer/runtime.h"
 
 #include "../../runtime/examples/qwen3_gguf_config.h"
+#include "sparkinfer/hf_config.h"
 
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -64,14 +65,21 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         return false;
     }
 
-    sparkinfer::GGUF g;
-    if (!g.open(gguf_path)) {
-        fprintf(stderr, "[sparkinfer-server] cannot open %s\n", gguf_path.c_str());
-        return false;
-    }
-
+    const bool nvfp4 = sparkinfer::path_is_nvfp4_dir(gguf_path);
     impl_->cfg = sparkinfer::Qwen35Config{};
-    qwen3_config_from_gguf(g, impl_->cfg);
+    if (nvfp4) {
+        if (!sparkinfer::qwen3_config_from_hf_dir(gguf_path, impl_->cfg)) {
+            fprintf(stderr, "[sparkinfer-server] cannot parse %s/config.json\n", gguf_path.c_str());
+            return false;
+        }
+    } else {
+        sparkinfer::GGUF g;
+        if (!g.open(gguf_path)) {
+            fprintf(stderr, "[sparkinfer-server] cannot open %s\n", gguf_path.c_str());
+            return false;
+        }
+        qwen3_config_from_gguf(g, impl_->cfg);
+    }
     if (max_seq > 0) impl_->cfg.max_seq = max_seq;
     else if (impl_->cfg.max_seq < 2048) impl_->cfg.max_seq = 2048;
 
@@ -110,8 +118,13 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     impl_->model = std::make_unique<sparkinfer::Qwen35Model>(
         impl_->cfg, impl_->kv.get(), impl_->engine.get());
 
-    fprintf(stderr, "[sparkinfer-server] loading GGUF ...\n");
-    if (!impl_->model->load_gguf(gguf_path)) {
+    fprintf(stderr, "[sparkinfer-server] loading %s ...\n", nvfp4 ? "ModelOpt NVFP4" : "GGUF");
+    if (nvfp4) {
+        if (!impl_->model->load_nvfp4(gguf_path)) {
+            fprintf(stderr, "[sparkinfer-server] load_nvfp4 failed\n");
+            return false;
+        }
+    } else if (!impl_->model->load_gguf(gguf_path)) {
         fprintf(stderr, "[sparkinfer-server] load_gguf failed\n");
         return false;
     }

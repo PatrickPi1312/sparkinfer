@@ -41,18 +41,20 @@ decode:
     bs1_ctx512: null
 
 runtime:
-  sparkinfer_native_decode: false
-  sparkinfer_nvfp4_loader: false
-  current_serve: vllm
+  sparkinfer_native_decode: true
+  sparkinfer_nvfp4_loader: true
+  sparkinfer_nvfp4_w4a4_gemm: false
+  current_serve: sparkinfer
   input_support: text_only
   required_work:
-    - qwen38_27b_modelopt_nvfp4_weight_loader
     - qwen38_27b_blackwell_w4a4_gemm
     - qwen38_27b_fp8_kv_in_sparkinfer
     - qwen38_27b_same_prompt_parity_vs_vllm
   completed_work:
     - qwen38_27b_arch_yaml
     - qwen38_27b_gguf_parser_reuses_36_27b_path
+    - qwen38_27b_modelopt_nvfp4_weight_loader
+    - qwen38_27b_nvfp4_w4a16_decode_gemv
 
 memory:
   full_attention_kv_bytes_per_token: 65536

@@ -24,6 +24,7 @@ struct Qwen35PrefillCtx {
     int*                 d_out_id;         // device argmax slot
     int*                 h_out_id;         // pinned host argmax slot
     bool                 gguf;             // native GGUF load (quantized weights)
+    bool                 nvfp4 = false;    // ModelOpt NVFP4 blobs (dequant to bf16 then GEMM)
     int                  qdim, kvdim;                       // full-attn q / kv dims
     int                  linear_qdim, linear_vdim, linear_qkvdim;  // GDN dims
 };

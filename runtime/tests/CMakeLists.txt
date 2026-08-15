@@ -19,6 +19,15 @@ add_executable(qwen38_27b_config_cpu_test qwen38_27b_config_cpu_test.cpp ../src/
 set_target_properties(qwen38_27b_config_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME qwen38_27b_config_cpu_test COMMAND qwen38_27b_config_cpu_test)
 
+add_executable(nvfp4_cpu_test nvfp4_cpu_test.cpp)
+set_target_properties(nvfp4_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(nvfp4_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME nvfp4_cpu_test COMMAND nvfp4_cpu_test)
+
+add_executable(hf_config_cpu_test hf_config_cpu_test.cpp ../src/hf_config.cpp)
+set_target_properties(hf_config_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME hf_config_cpu_test COMMAND hf_config_cpu_test)
+
 # Thermal governor — pure tiering policy (no GPU); links the runtime for classify()/pace() symbols.
 add_executable(thermal_governor_cpu_test thermal_governor_cpu_test.cpp)
 target_link_libraries(thermal_governor_cpu_test PRIVATE sparkinfer_runtime)

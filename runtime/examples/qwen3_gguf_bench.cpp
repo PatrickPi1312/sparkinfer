@@ -16,6 +16,7 @@
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
+#include "sparkinfer/hf_config.h"
 #include "qwen3_gguf_config.h"
 
 #include <cuda_runtime.h>
@@ -61,10 +62,9 @@ static double median_val(std::vector<double> v) {
     return v[(v.size() - 1) / 2];
 }
 
-static void print_bench_block(const sparkinfer::Qwen35Config& cfg, bool gguf_mode,
+static void print_bench_block(const sparkinfer::Qwen35Config& cfg, const char* mode,
                               size_t vram_used, int n_tokens, const SweepRow& row) {
-    printf("\n=== sparkinfer bench (%s) sweep ctx=%d ===\n",
-           gguf_mode ? "Q4_K_M native" : "bf16", row.ctx);
+    printf("\n=== sparkinfer bench (%s) sweep ctx=%d ===\n", mode, row.ctx);
     printf("model        : %d layers, %d experts top-%d\n",
            cfg.n_layers, cfg.n_experts, cfg.top_k);
     printf("VRAM used    : %.1f GB\n", vram_used / 1e9);
@@ -79,6 +79,7 @@ static void print_bench_block(const sparkinfer::Qwen35Config& cfg, bool gguf_mod
 struct BenchSession {
     sparkinfer::Qwen35Config cfg{};
     bool gguf_mode = false;
+    bool nvfp4_mode = false;
     std::unique_ptr<sparkinfer::Runtime> rt;
     std::unique_ptr<sparkinfer::KVCacheManager> kv;
     std::unique_ptr<sparkinfer::moe::MoEEngine> engine;
@@ -88,10 +89,16 @@ struct BenchSession {
 
 static bool init_session(BenchSession& s, const std::string& path, int max_ctx, int n_tokens) {
     s.gguf_mode = ends_with(path, ".gguf");
+    s.nvfp4_mode = !s.gguf_mode && sparkinfer::path_is_nvfp4_dir(path);
     if (s.gguf_mode) {
         sparkinfer::GGUF g;
         if (!g.open(path)) { printf("[FAIL] open gguf\n"); return false; }
         qwen3_config_from_gguf(g, s.cfg);
+    } else if (s.nvfp4_mode) {
+        if (!sparkinfer::qwen3_config_from_hf_dir(path, s.cfg)) {
+            printf("[FAIL] parse HF config.json\n");
+            return false;
+        }
     } else {
         std::ifstream f(path + "/config.txt");
         std::string line;
@@ -140,8 +147,9 @@ static bool init_session(BenchSession& s, const std::string& path, int max_ctx, 
     s.model = std::make_unique<sparkinfer::Qwen35Model>(s.cfg, s.kv.get(), s.engine.get());
 
     printf("loading %s (%s) ...\n", path.c_str(),
-           s.gguf_mode ? "native GGUF, experts quantized" : "bf16");
-    bool ok = s.gguf_mode ? s.model->load_gguf(path) : s.model->load_weights(path);
+           s.nvfp4_mode ? "ModelOpt NVFP4" : (s.gguf_mode ? "native GGUF, experts quantized" : "bf16"));
+    bool ok = s.nvfp4_mode ? s.model->load_nvfp4(path)
+            : (s.gguf_mode ? s.model->load_gguf(path) : s.model->load_weights(path));
     if (!ok) { printf("[FAIL] load\n"); return false; }
     size_t freeb = 0, totb = 0;
     cudaMemGetInfo(&freeb, &totb);
@@ -185,7 +193,8 @@ static int run_single(const std::string& path, int n_tokens, int context_tokens)
 
     auto bench = s.model->bench_decode(8, n_tokens, context_tokens);
     auto gpu = sparkinfer::query_gpu_stats();
-    printf("\n=== sparkinfer bench (%s) ===\n", s.gguf_mode ? "Q4_K_M native" : "bf16");
+    printf("\n=== sparkinfer bench (%s) ===\n",
+           s.nvfp4_mode ? "NVFP4" : (s.gguf_mode ? "Q4_K_M native" : "bf16"));
     printf("model        : %s  (%d layers, %d experts top-%d)\n",
            qwen3_model_label(s.cfg), s.cfg.n_layers, s.cfg.n_experts, s.cfg.top_k);
     printf("VRAM used    : %.1f GB\n", s.vram_used / 1e9);
@@ -234,7 +243,8 @@ static int run_sweep(const std::string& path, int n_tokens, const std::vector<in
         row.decode_tps = median_val(dec);
         row.prefill_pp = ctx > 0 ? median_val(pp) : 0.0;
         rows.push_back(row);
-        print_bench_block(s.cfg, s.gguf_mode, s.vram_used, n_tokens, row);
+        print_bench_block(s.cfg, s.nvfp4_mode ? "NVFP4" : (s.gguf_mode ? "Q4_K_M native" : "bf16"),
+                          s.vram_used, n_tokens, row);
     }
 
     auto gpu = sparkinfer::query_gpu_stats();

@@ -14,8 +14,11 @@
 #include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
+#include "sparkinfer/safetensors.h"
+#include "sparkinfer/nvfp4_format.h"
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/kernels/gemm.h"
+#include "sparkinfer/kernels/nvfp4.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
@@ -32,6 +35,8 @@
 #include <string>
 #include <fstream>
 #include <limits>
+#include <cstring>
+#include <cstdint>
 
 namespace sparkinfer {
 
@@ -40,6 +45,18 @@ inline void cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) fprintf(stderr, "[qwen35] %s: %s\n", what, cudaGetErrorString(e));
 }
 using bf16 = unsigned short;
+
+inline float bf16_to_f32(bf16 h) {
+    uint32_t u = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+inline bf16 f32_to_bf16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (bf16)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
 
 // launch_gguf_dequant only implements F32/F16/Q8_0/Q4_K/Q6_K. Reject anything
 // else at load time so Q5_K (etc.) cannot silently fall through as F32.
@@ -122,6 +139,7 @@ struct Qwen35Model::Impl {
     int qdim, kvdim;
     int linear_qdim = 0, linear_vdim = 0, linear_qkvdim = 0;
     bool gguf = false;   // true after load_gguf: dense weights are native [out,in], use GEMV
+    bool nvfp4 = false;  // ModelOpt NVFP4 blobs (WTYPE_NVFP4); layout same as GGUF GEMV
     // CUDA-graph capture of the decode compute (captured once, replayed each token)
     cudaGraph_t cu_graph{};
     cudaGraphExec_t cu_exec{};
@@ -339,6 +357,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->lin_z); cudaFree(p_->lin_alpha); cudaFree(p_->lin_beta);
     cudaFree(p_->lin_gdn); cudaFree(p_->lin_norm); cudaFree(p_->lin_conv_state); cudaFree(p_->lin_state);
     cudaFree(p_->shared_gate_tmp);
+    cudaFree(p_->sh_gate); cudaFree(p_->sh_up); cudaFree(p_->sh_h);
     cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
     cudaFree(p_->sx_h); cudaFree(p_->sx_q8);
     cudaFree(p_->mf_ids); cudaFree(p_->mf_counts); cudaFree(p_->mf_rc);
@@ -533,6 +552,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             }
         };
         auto proj_xn = [&](const void* W, int t, void* y, int N, cudaStream_t pst) {
+            if (t == WTYPE_NVFP4) {
+                kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
+                return;
+            }
             if (s.gguf) {
                 if (s.use_pq && t == 12) {
                     if (s.use_llama) kernels::launch_mmvq_q4k(s.aq81, W, y, N, H, pst);
@@ -549,6 +572,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
             }
         };
         auto proj_from = [&](const void* x, const void* W, int t, void* y, int N, int K) {
+            if (t == WTYPE_NVFP4) {
+                kernels::launch_gemv_nvfp4(x, W, y, N, K, st);
+                return;
+            }
             if (s.gguf) {
                 if (s.use_pq && t == 12) {
                     if (s.use_llama) {
@@ -834,6 +861,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                 kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, s.qdim, st);
                 kernels::launch_mmvq_q80(s.aq81, w.wo, s.ao, H, s.qdim, st);
             }
+            else if (w.wo_type == WTYPE_NVFP4)
+                kernels::launch_gemv_nvfp4(s.attn, w.wo, s.ao, H, s.qdim, st);
             else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
             else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
             else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
@@ -913,6 +942,17 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
         }
 
         if (c.dense_ffn) {
+            if (s.nvfp4) {
+                if (!s.sh_gate) {
+                    fprintf(stderr, "[qwen35] nvfp4 dense FFN missing SwiGLU scratch\n");
+                } else {
+                    proj_from(s.hn, w.gate_q, w.gate_qtype, s.sh_gate, c.moe_ffn, H);
+                    proj_from(s.hn, w.up_q, w.up_qtype, s.sh_up, c.moe_ffn, H);
+                    kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w,
+                                                         s.sh_h, c.moe_ffn, st);
+                    proj_from(s.sh_h, w.down_q, w.down_qtype, s.routed, H, c.moe_ffn);
+                }
+            } else {
             // Qwen3.5 dense SwiGLU: keep gate/up/down quantized and run the same MMVQ
             // expert-FFN path as MoE decode — bf16 dequant+GEMV diverged ~40pp vs llama.cpp.
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
@@ -920,6 +960,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample) {
                                                s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
                                                1, c.top_k, H, c.moe_ffn,
                                                fnq ? s.aq81 : nullptr, st);
+            }
         } else if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
             // decode expert FFN reads ids/weights directly and never touches them. Zeroing that
@@ -1366,7 +1407,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
     bf16* lin_conv = (it != s.sessions.end()) ? it->second.lin_conv_state : s.lin_conv_state;
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.active_seq_id, lin_state, lin_conv,
-                          s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.logits, s.d_out_id, s.h_out_id, s.gguf, s.nvfp4,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
     return prefill_batched_run(ctx, prompt_ids, n);
 }
@@ -1976,6 +2017,153 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (i == 0 || i == c.n_layers - 1) fprintf(stderr, "[gguf] layer %d loaded\n", i);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
+    return true;
+}
+
+bool Qwen35Model::load_nvfp4(const std::string& dir) {
+    Impl& s = *p_;
+    SafeTensorsDir st;
+    if (!st.open(dir)) return false;
+
+    const char* lm = st.has("model.language_model.layers.0.input_layernorm.weight")
+        ? "model.language_model." : "model.";
+    auto name = [&](const std::string& rest) { return std::string(lm) + rest; };
+
+    s.cfg.hybrid = true;
+    s.cfg.dense_ffn = true;
+    s.cfg.n_experts = 1;
+    s.cfg.top_k = 1;
+    s.cfg.n_shared = 0;
+    if (s.cfg.full_attn_interval <= 0) s.cfg.full_attn_interval = 4;
+    if (s.cfg.rope_dim <= 0 && s.cfg.head_dim == 256) s.cfg.rope_dim = 64;
+    const Qwen35Config& c = s.cfg;
+    const int H = c.hidden;
+    s.gguf = true;
+    s.nvfp4 = true;
+
+    if (!s.sh_gate) {
+        s.sh_gate = s.alloc<bf16>(c.moe_ffn);
+        s.sh_up   = s.alloc<bf16>(c.moe_ffn);
+        s.sh_h    = s.alloc<bf16>(c.moe_ffn);
+    }
+
+    auto upload = [&](const void* host, size_t bytes, const char* what) -> const void* {
+        if (!host || bytes == 0) {
+            fprintf(stderr, "[nvfp4] missing %s\n", what);
+            return nullptr;
+        }
+        void* d = nullptr;
+        if (cudaMalloc(&d, bytes) != cudaSuccess) {
+            fprintf(stderr, "[nvfp4] cudaMalloc failed for %s (%zu bytes)\n", what, bytes);
+            return nullptr;
+        }
+        cudaMemcpy(d, host, bytes, cudaMemcpyHostToDevice);
+        s.owned.push_back(d);
+        return d;
+    };
+    auto dense_bf16 = [&](const std::string& key) -> const void* {
+        const STTensor* t = st.tensor(key);
+        if (!t) { fprintf(stderr, "[nvfp4] missing %s\n", key.c_str()); return nullptr; }
+        return upload(t->data, t->nbytes, key.c_str());
+    };
+    auto load_A_log = [&](const std::string& key) -> const void* {
+        const STTensor* t = st.tensor(key);
+        if (!t) { fprintf(stderr, "[nvfp4] missing %s\n", key.c_str()); return nullptr; }
+        const int n = t->shape.empty() ? 1 : (int)t->shape[0];
+        std::vector<bf16> in(n), out(n);
+        memcpy(in.data(), t->data, (size_t)n * 2);
+        for (int i = 0; i < n; i++)
+            out[i] = f32_to_bf16(-expf(bf16_to_f32(in[i])));
+        return upload(out.data(), (size_t)n * 2, key.c_str());
+    };
+    auto load_nv = [&](const std::string& base, int& qtype) -> const void* {
+        const STTensor* w  = st.tensor(base + ".weight");
+        const STTensor* sc = st.tensor(base + ".weight_scale");
+        const STTensor* s2 = st.tensor(base + ".weight_scale_2");
+        if (!w || !sc || !s2 || w->shape.size() != 2) {
+            fprintf(stderr, "[nvfp4] incomplete NVFP4 tensor %s\n", base.c_str());
+            qtype = 0;
+            return nullptr;
+        }
+        const int n_out = (int)w->shape[0];
+        const int n_in  = (int)w->shape[1] * 2;
+        if (n_in % NVFP4_GROUP != 0) {
+            fprintf(stderr, "[nvfp4] %s n_in=%d not divisible by 16\n", base.c_str(), n_in);
+            return nullptr;
+        }
+        const size_t packed_n = nvfp4_packed_bytes(n_out, n_in);
+        const size_t scale_n  = nvfp4_scale_bytes(n_out, n_in);
+        if (w->nbytes < packed_n || sc->nbytes < scale_n || s2->nbytes < 4) {
+            fprintf(stderr, "[nvfp4] size mismatch for %s\n", base.c_str());
+            return nullptr;
+        }
+        std::vector<uint8_t> blob(nvfp4_blob_bytes(n_out, n_in));
+        Nvfp4Hdr hdr{};
+        hdr.n_out = n_out;
+        hdr.n_in = n_in;
+        memcpy(&hdr.scale2, s2->data, 4);
+        memcpy(blob.data(), &hdr, sizeof(hdr));
+        memcpy(blob.data() + sizeof(hdr), w->data, packed_n);
+        memcpy(blob.data() + sizeof(hdr) + packed_n, sc->data, scale_n);
+        qtype = WTYPE_NVFP4;
+        return upload(blob.data(), blob.size(), base.c_str());
+    };
+
+    s.w.embed_tokens = dense_bf16(name("embed_tokens.weight"));
+    s.w.final_norm   = dense_bf16(name("norm.weight"));
+    {
+        const STTensor* t = st.tensor("lm_head.weight");
+        if (!t) t = st.tensor(name("embed_tokens.weight"));
+        if (!t) { fprintf(stderr, "[nvfp4] missing lm_head.weight\n"); return false; }
+        s.w.lm_head = upload(t->data, t->nbytes, "lm_head.weight");
+        s.w.lm_head_type = 0;
+    }
+    if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
+
+    s.w.layers.resize(c.n_layers);
+    for (int i = 0; i < c.n_layers; i++) {
+        const std::string L = name("layers." + std::to_string(i) + ".");
+        Qwen35LayerWeights& w = s.w.layers[i];
+        w.linear_attn = is_linear_layer(c, i);
+        w.input_norm = dense_bf16(L + "input_layernorm.weight");
+        w.post_attn_norm = dense_bf16(L + "post_attention_layernorm.weight");
+        if (w.linear_attn) {
+            w.wqkv = load_nv(L + "linear_attn.in_proj_qkv", w.wqkv_type);
+            w.wqkv_gate = load_nv(L + "linear_attn.in_proj_z", w.wqkv_gate_type);
+            w.ssm_out = load_nv(L + "linear_attn.out_proj", w.ssm_out_type);
+            w.ssm_conv = dense_bf16(L + "linear_attn.conv1d.weight");
+            w.ssm_dt = dense_bf16(L + "linear_attn.dt_bias");
+            w.ssm_a = load_A_log(L + "linear_attn.A_log");
+            w.ssm_alpha = dense_bf16(L + "linear_attn.in_proj_a.weight");
+            w.ssm_beta  = dense_bf16(L + "linear_attn.in_proj_b.weight");
+            w.ssm_alpha_type = 0;
+            w.ssm_beta_type = 0;
+            w.ssm_norm = dense_bf16(L + "linear_attn.norm.weight");
+        } else {
+            w.q_has_gate = true;
+            w.wq = load_nv(L + "self_attn.q_proj", w.wq_type);
+            w.wk = load_nv(L + "self_attn.k_proj", w.wk_type);
+            w.wv = load_nv(L + "self_attn.v_proj", w.wv_type);
+            w.wo = load_nv(L + "self_attn.o_proj", w.wo_type);
+            w.q_norm = dense_bf16(L + "self_attn.q_norm.weight");
+            w.k_norm = dense_bf16(L + "self_attn.k_norm.weight");
+        }
+        w.gate_q = load_nv(L + "mlp.gate_proj", w.gate_qtype);
+        w.up_q   = load_nv(L + "mlp.up_proj",   w.up_qtype);
+        w.down_q = load_nv(L + "mlp.down_proj", w.down_qtype);
+        const bool have_attn = w.linear_attn
+            ? (w.wqkv && w.wqkv_gate && w.ssm_conv && w.ssm_dt && w.ssm_a &&
+               w.ssm_beta && w.ssm_alpha && w.ssm_norm && w.ssm_out)
+            : (w.wq && w.wk && w.wv && w.wo && w.q_norm && w.k_norm);
+        if (!have_attn || !w.input_norm || !w.post_attn_norm || !w.gate_q || !w.up_q || !w.down_q) {
+            fprintf(stderr, "[nvfp4] layer %d incomplete\n", i);
+            return false;
+        }
+        if (i == 0 || i == c.n_layers - 1)
+            fprintf(stderr, "[nvfp4] layer %d loaded (%s)\n", i, w.linear_attn ? "GDN" : "attn");
+    }
+    fprintf(stderr, "[nvfp4] loaded %s (%d layers, hidden %d, FFN %d)\n",
+            dir.c_str(), c.n_layers, H, c.moe_ffn);
     return true;
 }
 

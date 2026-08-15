@@ -82,7 +82,9 @@ public:
     // Load weights directly from a GGUF file (native). Dense tensors are
     // dequantized to bf16; expert tensors are kept quantized in VRAM and
     // dequantized per-layer at decode time (Q4_K_M-sized resident footprint).
-    bool load_gguf(const std::string& path);
+    // Load NVIDIA ModelOpt NVFP4 safetensors (Qwen3.8-27B and the same dense-hybrid family).
+    // Linear weights stay packed e2m1+fp8 scales in VRAM; decode uses on-read NVFP4 GEMV.
+    bool load_nvfp4(const std::string& dir);
 
     // Greedy generate: prompt token ids -> generated token ids (host). An optional ThermalGovernor
     // paces decode under thermal pressure (accuracy-preserving); nullptr = full speed, no overhead.
