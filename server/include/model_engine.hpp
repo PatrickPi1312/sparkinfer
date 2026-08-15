@@ -52,6 +52,7 @@ public:
     int vocab() const;
     int max_seq() const;
     bool is_museglimmer() const;
+    bool is_qwen38() const;
 
     // Optional shared prompt prefix (e.g. system message tokens). When set, each request whose
     // prompt starts with these ids calls cache_prefix() (batched prefill) before generate().

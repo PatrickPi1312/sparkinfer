@@ -111,7 +111,12 @@ endif()
 
 # Unified interface library
 add_library(sparkinfer_kernels INTERFACE)
-target_link_libraries(sparkinfer_kernels INTERFACE ${SPARKINFER_KERNEL_LIBS})
+# --start-group/--end-group: these static archives end up adjacent in every consumer's final link
+# line (verified via link.txt), but some symbols (e.g. launch_muse_sandwich_tail in si_fused) are
+# only referenced from within this archive set itself in certain link orders -- ld's single-pass
+# scan can drop such an archive member even though it's present, unless told to rescan the group
+# until nothing new resolves.
+target_link_libraries(sparkinfer_kernels INTERFACE -Wl,--start-group ${SPARKINFER_KERNEL_LIBS} -Wl,--end-group)
 target_include_directories(sparkinfer_kernels INTERFACE include)
 
 if(BUILD_TESTS)

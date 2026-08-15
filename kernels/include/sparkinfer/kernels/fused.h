@@ -273,11 +273,18 @@ void launch_qwen36_conv_split_l2norm_fused(const void* qkv_bf16, const void* con
                                  void* v_bf16, int q_heads, int v_heads, int head_dim,
                                  int conv_kernel, float eps, cudaStream_t stream = nullptr);
 
+// qh_block: v-head -> q/k-head broadcast convention. false = cyclic (vh % q_heads), the
+// original/validated convention for Qwythos and Qwen3.6-35B-A3B's checkpoints (v_heads/q_heads
+// ratio 2). true = block (vh / (v_heads/q_heads)), which Qwen3.8-27B's checkpoint needs instead
+// (ratio 3) -- confirmed empirically against a real reference implementation (llama.cpp), since
+// the two checkpoints' own HF-side v-head layout conventions differ despite the shared
+// architecture family. This is a property of the loaded checkpoint, not a global default.
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,
                           float* state_f32, void* out_bf16,
-                          int q_heads, int v_heads, int head_dim, cudaStream_t stream = nullptr);
+                          int q_heads, int v_heads, int head_dim, bool qh_block,
+                          cudaStream_t stream = nullptr);
 
 void launch_qwen36_gated_norm(const void* x_bf16, const void* z_bf16,
                               const void* weight_bf16, void* out_bf16,

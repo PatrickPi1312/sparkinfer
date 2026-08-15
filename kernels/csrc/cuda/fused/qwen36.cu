@@ -270,13 +270,14 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
                                    const __nv_bfloat16* __restrict__ a,
                                    float* __restrict__ state,   // TRANSPOSED [vh][col][row]
                                    __nv_bfloat16* __restrict__ out,
-                                   int q_heads, int v_heads) {
+                                   int q_heads, int v_heads, bool qh_block) {
     constexpr int NROW = HEAD_DIM / 32;                        // rows per lane (compile-time -> unrolls)
     const int vh   = blockIdx.x;
     const int j    = blockIdx.y * COLS + (threadIdx.x >> 5);   // state column (all lanes in a warp share j)
     const int lane = threadIdx.x & 31;
     if (vh >= v_heads || j >= HEAD_DIM) return;                // whole-warp guard (j is warp-uniform)
-    const int qh   = vh % q_heads;
+    // v-head -> q/k-head broadcast convention; see launch_qwen36_gdn_ar's own comment.
+    const int qh   = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
     const float scale = rsqrtf((float)HEAD_DIM);
     const float bb = q36_sigmoid(q36_to_f(beta[vh]));
     const float g  = __expf(q36_softplus(q36_to_f(alpha[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
@@ -555,7 +556,8 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
                           const void* alpha_bf16, const void* beta_bf16,
                           const void* dt_bf16, const void* a_bf16,
                           float* state_f32, void* out_bf16,
-                          int q_heads, int v_heads, int head_dim, cudaStream_t stream) {
+                          int q_heads, int v_heads, int head_dim, bool qh_block,
+                          cudaStream_t stream) {
     // SPARKINFER_GDN_FAST: warp-per-column, register-cached, transposed-state kernel (fills the GPU +
     // 2x state traffic). Uses a transposed internal state layout, so it MUST be all-or-nothing for the
     // run — the static flag guarantees that. Requires head_dim a multiple of 32 (128 -> NROW=4).
@@ -582,7 +584,7 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
                 reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
                 reinterpret_cast<const __nv_bfloat16*>(a_bf16),
                 state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
-                q_heads, v_heads);
+                q_heads, v_heads, (bool)qh_block);
         } else if (c == 16) {
             gdn_ar_fast_kernel<16, HD><<<grid, 16 * 32, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q_bf16),
@@ -593,7 +595,7 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
                 reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
                 reinterpret_cast<const __nv_bfloat16*>(a_bf16),
                 state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
-                q_heads, v_heads);
+                q_heads, v_heads, (bool)qh_block);
         } else {
             gdn_ar_fast_kernel<8, HD><<<grid, 8 * 32, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q_bf16),
@@ -604,7 +606,7 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
                 reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
                 reinterpret_cast<const __nv_bfloat16*>(a_bf16),
                 state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
-                q_heads, v_heads);
+                q_heads, v_heads, (bool)qh_block);
         }
         return;
     }

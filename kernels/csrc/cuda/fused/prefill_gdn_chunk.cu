@@ -100,7 +100,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
                                     __nv_bfloat16* __restrict__ w_buf,
                                     __nv_bfloat16* __restrict__ u_buf,
                                     float* __restrict__ m_buf,
-                                    int n_tokens, int q_heads, int v_heads) {
+                                    int n_tokens, int q_heads, int v_heads, bool qh_block) {
     extern __shared__ char s_raw[];
     __nv_bfloat16* s_k = reinterpret_cast<__nv_bfloat16*>(s_raw);              // [C][HD+PAD]
     __nv_bfloat16* s_x = s_k + (size_t)C * (HD + PAD);                         // [C][HD+PAD] q then v
@@ -117,7 +117,7 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     const int len  = min(C, n_tokens - t0);
     if (len <= 0) return;
 
-    const int qh    = h % q_heads;
+    const int qh    = qh_block ? (h / (v_heads / q_heads)) : (h % q_heads);
     const int q_dim = q_heads * HD;
     const int v_dim = v_heads * HD;
     const float a_h  = gc_to_f(a[h]);
@@ -283,7 +283,8 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
                                     const float* __restrict__ m_buf,
                                     float* __restrict__ state,
                                     __nv_bfloat16* __restrict__ out,
-                                    int n_tokens, int q_heads, int v_heads, int n_chunks) {
+                                    int n_tokens, int q_heads, int v_heads, int n_chunks,
+                                    bool qh_block) {
     extern __shared__ char s_raw[];
     float* s_S = reinterpret_cast<float*>(s_raw);                              // [HD][JC]  fp32 carrier
     float* s_U = s_S + (size_t)HD * JC;                                        // [C][JC]
@@ -306,7 +307,7 @@ __global__ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     const int tid  = threadIdx.x;
     const int nthr = blockDim.x;
 
-    const int qh    = h % q_heads;
+    const int qh    = qh_block ? (h / (v_heads / q_heads)) : (h % q_heads);
     const int q_dim = q_heads * HD;
     const int v_dim = v_heads * HD;
     const float scale = rsqrtf((float)HD);
@@ -525,7 +526,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               const void* dt, const void* a,
                               float* state, void* out,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
-                              cudaStream_t stream) {
+                              bool qh_block, cudaStream_t stream) {
     constexpr int C = 32, HD = 128, JC = 32, SCAN_THREADS = 256, PREP_THREADS = 256;
 
     static const int enabled = [] {
@@ -615,7 +616,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     static_assert(C * C == PREP_THREADS * 4, "2x2 A/M tiling requires C*C == 4*PREP_THREADS");
     dim3 gprep(n_chunks, v_heads);
     pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
-        qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf, n_tokens, q_heads, v_heads);
+        qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf, n_tokens, q_heads, v_heads, qh_block);
 
     // SCAN_THREADS is not free tuning: the register tiling below partitions the [C,JC] and [HD,JC]
     // outputs across exactly this many threads (2x2 and 4x4 tiles respectively).
@@ -623,7 +624,7 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     static_assert(HD * JC == SCAN_THREADS * 16, "4x4 tiling requires HD*JC == 16*SCAN_THREADS");
     dim3 gscan(v_heads, HD / JC);
     pf_gdnc_scan_kernel<C, HD, JC><<<gscan, SCAN_THREADS, sm_scan, stream>>>(
-        qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob, n_tokens, q_heads, v_heads, n_chunks);
+        qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob, n_tokens, q_heads, v_heads, n_chunks, qh_block);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek —
     // rather than get — so a pre-existing sticky error is not silently cleared here.
     // Returning false lets the caller fall through to the sequential GDN scan.

@@ -37,6 +37,11 @@ public:
     // Glimmer's harmony-style <|start|>/<|message|>/<|eot|>/<|eom|> segments. Call once after
     // the model's architecture is known (ModelEngine::is_museglimmer()), before the first request.
     void set_museglimmer(bool on);
+    // Qwen3.8-27B's pinned chat_template.jinja unconditionally prepends a reasoning-effort
+    // system message (see apply_qwen36_tools_template's inject_reasoning_effort param). Call
+    // once after the model's architecture is known (ModelEngine::is_qwen38()), before the first
+    // request. Independent of set_museglimmer -- the two are mutually exclusive model families.
+    void set_qwen38(bool on);
 
     bool encode_chat_request(const std::string& request_json, std::vector<int>& ids, bool enable_thinking,
                              std::string& err, ChatRequest* parsed_request = nullptr) const;

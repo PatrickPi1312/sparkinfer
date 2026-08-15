@@ -165,8 +165,13 @@ bool should_reject_dflash_logit_bias(bool dflash_env_on, bool has_logit_bias);
 bool validate_response_format(const std::string& content, const ResponseFormat& format,
                               std::string& err);
 
+// inject_reasoning_effort: Qwen3.8-27B's pinned chat_template.jinja unconditionally prepends a
+// "Reasoning effort is set to xhigh..." system message whenever thinking is enabled -- regardless
+// of tools/response_format -- which Qwen3.6/Muse Glimmer's own templates never do. Defaults false
+// so every existing caller (Qwen3.6, tests) is byte-for-byte unchanged.
 std::string apply_qwen36_tools_template(const ChatRequest& request,
-                                        bool enable_thinking = false);
+                                        bool enable_thinking = false,
+                                        bool inject_reasoning_effort = false);
 
 ParsedToolOutput parse_qwen36_tool_output(const std::string& raw,
                                           bool enable_thinking,

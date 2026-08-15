@@ -1,4 +1,5 @@
 #include "sparkinfer/kernels/prefill_nvfp4.h"
+#include "sparkinfer/kernels/compressed_tensors.h"
 
 #include <cuda_bf16.h>
 #include <cutlass/cutlass.h>
@@ -307,4 +308,47 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
     return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st)
                               : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st);
 }
+
+// ---- HuggingFace "compressed-tensors" NVFP4 checkpoint dequant (load-time, one-shot) ----
+// See sparkinfer/kernels/compressed_tensors.h -- converts a checkpoint's own NVFP4 encoding
+// (block_size=16 UE4M3 group scale + one F32 global scale) straight to bf16, so the result feeds
+// this runtime's OWN from-bf16 quantizers (quant_rows above, or the Q4_K requant path) rather than
+// needing the GEMM kernels above to understand a second, foreign two-level scale scheme.
+namespace {
+__global__ void ct_dequant_nvfp4_kernel(const unsigned char* __restrict__ packed,
+                                        const unsigned char* __restrict__ group_scale,
+                                        float global_scale, __nv_bfloat16* __restrict__ out,
+                                        int rows, int cols) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long n = (long)rows * cols;
+    if (i >= n) return;
+    const int r = (int)(i / cols);
+    const int c = (int)(i - (long)r * cols);
+    const unsigned char byte = packed[(size_t)r * (cols / 2) + (c >> 1)];
+    const unsigned char nibble = (c & 1) ? (byte >> 4) : (byte & 0xF);
+    const unsigned char sbyte = group_scale[(size_t)r * (cols / 16) + (c >> 4)];
+    const float v = float(cutlass::float_e2m1_t::bitcast(nibble));
+    const float s = float(cutlass::float_ue4m3_t::bitcast(sbyte));
+    // weight_global_scale is stored as the quantization-time multiplier that mapped local block
+    // scales (local_amax/6) UP into UE4M3's representable range before rounding to 8 bits, so
+    // dequant must invert it: block_scale_fp32 = e4m3(block_scale) / global_scale. Confirmed
+    // empirically against the real unsloth/Qwen3.8-27B-NVFP4 checkpoint -- multiplying (the other
+    // natural reading) produces weight magnitudes in the hundreds of thousands; dividing produces
+    // the expected ~0.01-0.05 std typical of a trained projection matrix.
+    out[i] = __float2bfloat16(v * s / global_scale);
+}
+} // namespace
+
+void launch_ct_dequant_nvfp4(const void* packed_u8, const void* group_scale_ue4m3,
+                             float global_scale, void* out_bf16, int rows, int cols,
+                             cudaStream_t stream) {
+    const long n = (long)rows * cols;
+    const int threads = 256;
+    const long blocks = (n + threads - 1) / threads;
+    ct_dequant_nvfp4_kernel<<<(unsigned)blocks, threads, 0, stream>>>(
+        reinterpret_cast<const unsigned char*>(packed_u8),
+        reinterpret_cast<const unsigned char*>(group_scale_ue4m3), global_scale,
+        reinterpret_cast<__nv_bfloat16*>(out_bf16), rows, cols);
+}
+
 } // namespace sparkinfer::kernels

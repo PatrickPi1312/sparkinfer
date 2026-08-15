@@ -16,6 +16,8 @@
 #include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
+#include "sparkinfer/safetensors.h"
+#include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/fused.h"
@@ -28,6 +30,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstring>
 #include <atomic>
 #include <unordered_map>
 #include <cstdlib>
@@ -752,7 +755,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // concludes; harmless no-op (env unset) otherwise.
     static int mg_dbg = -1;
     if (mg_dbg < 0) { const char* e = getenv("SPARKINFER_MG_STAGE_DEBUG"); mg_dbg = (e && e[0] == '1') ? 1 : 0; }
-    const bool mgd = c.muse_glimmer && mg_dbg;
+    // Widened to any dense_ffn hybrid model (originally Muse-Glimmer-only) to reuse this
+    // instrumentation for the Qwen3.8-27B bring-up too -- still opt-in via the same env var.
+    const bool mgd = (c.muse_glimmer || c.dense_ffn) && mg_dbg;
     if (mgd && s.graph_ready) {
         cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph);
         s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
@@ -1239,7 +1244,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                           s.lin_alpha, s.lin_beta, w.ssm_dt, w.ssm_a,
                                           layer_state, s.lin_gdn,
                                           c.linear_q_heads, c.linear_v_heads,
-                                          c.linear_head_dim, st);
+                                          c.linear_head_dim, c.gdn_qh_block, st);
             if (gdn_pipelined && !gdn_fused_proj) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
             const bool gdn_gn_q8 = s.gguf && s.use_pq && s.use_llama &&
                                    (w.ssm_out_type == 12 || w.ssm_out_type == 8) &&
@@ -1518,8 +1523,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                mg_gate_ok ? 1 : 0);
             }
             dbg_bf16(s.attn, s.qdim, 30, L);   // tag 30: SDPA output, pre-gate
-            if (w.q_has_gate && !attn_gate_q8)
+            if (w.q_has_gate && !attn_gate_q8) {
                 kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, s.qdim, st);
+            }
             dbg_bf16(s.attn, s.qdim, 31, L);   // tag 31: SDPA output, post sigmoid-gate
 
             // ---- O projection (main's int8 mmvq path) ----
@@ -1577,8 +1583,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // Q8_1(hn) into aq81 so the MoE gate/up mmvq skips its own quantize node (the
             // router below reads bf16 hn).
             kernels::launch_add_rmsnorm2_q8(s.x, s.ao, w.post_attn_norm, s.h, s.hn, s.aq81, H, c.rms_eps, st);
+            dbg_bf16(s.h, H, 50, L);
+            dbg_bf16(s.hn, H, 51, L);
         } else {
             kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
+            dbg_bf16(s.h, H, 50, L);
+            dbg_bf16(s.hn, H, 51, L);
         }
 
         const bool qmoe = w.shared_gate_q && w.shared_up_q && w.shared_down_q
@@ -4200,6 +4210,326 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 down_ready, c.n_layers);
     }
     // decode scratch (mf_* / fa_*) is allocated in the constructor for all paths.
+    return true;
+}
+
+// ----- HuggingFace "compressed-tensors" mixed FP8/NVFP4 checkpoint load -----
+// (e.g. unsloth/Qwen3.8-27B-NVFP4). Scheme, confirmed by direct tensor inspection of the actual
+// checkpoint (not assumed from the format spec alone):
+//   - self_attn.{q,k,v,o}_proj, linear_attn.{in_proj_qkv,in_proj_z,out_proj}, lm_head, and
+//     layers 56-63's mlp.{gate,up,down}_proj: FP8 (E4M3), one BF16 scale per output channel.
+//     ".weight" (F8_E4M3) + ".weight_scale" (BF16, [out_channels,1]).
+//   - every other layer's mlp.{gate,up,down}_proj (the bulk of total params): NVFP4, block_size
+//     16, two-level scale. ".weight_packed" (U8, 2 values/byte) + ".weight_scale" (F8_E4M3 bytes,
+//     interpreted as CUTLASS's unsigned e4m3 -- the standard NVIDIA NVFP4 export convention, not
+//     literally signed e4m3 despite the safetensors dtype tag) + ".weight_global_scale" (F32
+//     scalar).
+//   - everything else (linear_attn's small in_proj_a/in_proj_b/norm, dt_bias, A_log, conv1d,
+//     all *_norm weights): plain bf16 ".weight".
+// HF tensors are [out,in] (PyTorch Linear convention); this runtime's GEMM/GEMV kernels want
+// [in,out] -- every quantized/dequantized tensor below is transposed once at load, same as
+// load_gguf()'s own dense() closure already does for its own transpose=true callers.
+//
+// Every quantized tensor is dequantized to bf16 once (via the new launch_ct_dequant_fp8/
+// launch_ct_dequant_nvfp4 kernels), then requantized into the SAME internal formats load_gguf()
+// already produces for every other model: Q4_K (gate_q/up_q/down_q/wq/wk/wv/wo, decode path,
+// launch_proj_requant_q4k_lloyd) and, for the NVFP4-routed FFN layers only, this runtime's own
+// fresh NVFP4 (gate_fp4/up_fp4, prefill path, launch_prefill_nvfp4_quant_b) -- no new GEMM/GEMV
+// kernels, no checkpoint-provided global scale carried past the initial dequant.
+bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
+    Impl& s = *p_;
+    SafeTensorsModel st;
+    if (!st.open(model_dir)) {
+        fprintf(stderr, "[compressed-tensors] failed to open %s\n", model_dir.c_str());
+        return false;
+    }
+    const Qwen35Config& c = s.cfg;
+    const int H = c.hidden;
+    s.gguf = true;   // reuses the same "dense weights native, kept-quantized attn/ffn" decode shape
+
+    // FP8 tensors' MLP layers -- confirmed by direct inspection of the checkpoint's
+    // quantization_config.config_groups.group_0.targets: layers 56-63 (the last 8 of 64).
+    auto ffn_is_fp8_layer = [](int i) { return i >= 56 && i <= 63; };
+
+    // bf16 upload, no transpose (embeddings, norms, and the small linear_attn gate-scalar
+    // projections that the checkpoint leaves unquantized).
+    auto plain_bf16 = [&](const std::string& name, long n_values) -> const void* {
+        const STTensor* t = st.tensor(name);
+        if (!t) { fprintf(stderr, "[compressed-tensors] missing %s\n", name.c_str()); return nullptr; }
+        if (t->dtype != STDType::BF16 || t->n_values != n_values) {
+            fprintf(stderr, "[compressed-tensors] %s: expected BF16[%ld], got dtype=%d n=%ld\n",
+                    name.c_str(), n_values, (int)t->dtype, t->n_values);
+            return nullptr;
+        }
+        void* d = nullptr;
+        if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, t->data, (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        s.owned.push_back(d);
+        return d;
+    };
+
+    // A_log -> -exp(A_log), applied on the host before upload. The checkpoint stores the raw HF
+    // "A_log" parameter, but the shared GDN kernels (launch_qwen36_gdn_ar and friends, reused
+    // unchanged from Qwythos/Qwen3.6) expect the pre-transformed decay coefficient -- confirmed
+    // by comparing this exact tensor's values against the reference unsloth GGUF for this model
+    // (whose own conversion pipeline applies this same transform): raw HF A_log runs roughly
+    // [-5.6,-1.1], the GGUF's stored values are exp() of that with a sign flip, e.g. -exp(-1.0859)
+    // = -0.3376, matching the GGUF's own max value bit-for-bit. Loading the raw value directly (as
+    // plain_bf16 would) makes every decay gate ~exp(large-negative) instead of ~exp(small-negative)
+    // -- GDN state collapses to near-zero every step, silently (no NaN/Inf) producing coherent-
+    // magnitude but semantically empty hidden states. Covers all 48 linear-attention layers.
+    auto load_a_log_transformed = [&](const std::string& name, long n_values) -> const void* {
+        const STTensor* t = st.tensor(name);
+        if (!t) { fprintf(stderr, "[compressed-tensors] missing %s\n", name.c_str()); return nullptr; }
+        if (t->dtype != STDType::BF16 || t->n_values != n_values) {
+            fprintf(stderr, "[compressed-tensors] %s: expected BF16[%ld], got dtype=%d n=%ld\n",
+                    name.c_str(), n_values, (int)t->dtype, t->n_values);
+            return nullptr;
+        }
+        std::vector<uint16_t> transformed((size_t)n_values);
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(t->data);
+        for (long i = 0; i < n_values; i++) {
+            uint32_t bits = (uint32_t)src[i] << 16;
+            float f; memcpy(&f, &bits, sizeof(f));
+            f = -expf(f);
+            memcpy(&bits, &f, sizeof(bits));
+            transformed[(size_t)i] = (uint16_t)(bits >> 16);
+        }
+        void* d = nullptr;
+        if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        s.owned.push_back(d);
+        return d;
+    };
+
+    // RMSNorm weight -> 1.0 + weight, applied on the host before upload. This checkpoint stores
+    // norm weights zero-centered (values cluster around 0, e.g. [0.047, -0.063, -0.074, ...] for
+    // layer 0's input_layernorm) rather than the standard one-centered convention every other
+    // model in this codebase uses (values cluster around 1). Confirmed by hand-computing the
+    // RMSNorm output for token "Hi" through layer 0 both ways and comparing against the reference
+    // unsloth/ggml-org GGUF's own eval-callback trace: 1+weight gives sum=-63.79, matching the
+    // reference's attn_norm-0 sum=-65.72 (residual difference is ordinary bf16/eps rounding);
+    // plain weight gives sum=+3.28, off by both sign and two orders of magnitude. Loading the raw
+    // value directly (as plain_bf16 would) multiplies every normalized activation by ~0 instead of
+    // ~1 -- silently attenuating the entire signal path without producing NaN/Inf, which is why
+    // every other numerical check in this bring-up looked "healthy" while generation stayed
+    // incoherent. Applies to 5 of the 6 norm-weight kinds: input_layernorm,
+    // post_attention_layernorm, q_norm, k_norm, and the final norm. NOT linear_attn.norm
+    // (ssm_norm), which this checkpoint stores one-centered like every other model -- verified
+    // per-tensor against the reference GGUF, and confirmed numerically (adding 1 there instead
+    // moved layer 0's residual to 14.4 vs the reference's 8.41, away from the 8.73 it gives now).
+    auto load_norm_plus1 = [&](const std::string& name, long n_values) -> const void* {
+        const STTensor* t = st.tensor(name);
+        if (!t) { fprintf(stderr, "[compressed-tensors] missing %s\n", name.c_str()); return nullptr; }
+        if (t->dtype != STDType::BF16 || t->n_values != n_values) {
+            fprintf(stderr, "[compressed-tensors] %s: expected BF16[%ld], got dtype=%d n=%ld\n",
+                    name.c_str(), n_values, (int)t->dtype, t->n_values);
+            return nullptr;
+        }
+        std::vector<uint16_t> transformed((size_t)n_values);
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(t->data);
+        for (long i = 0; i < n_values; i++) {
+            uint32_t bits = (uint32_t)src[i] << 16;
+            float f; memcpy(&f, &bits, sizeof(f));
+            f = 1.0f + f;
+            memcpy(&bits, &f, sizeof(bits));
+            transformed[(size_t)i] = (uint16_t)(bits >> 16);
+        }
+        void* d = nullptr;
+        if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        s.owned.push_back(d);
+        return d;
+    };
+
+    // FP8 weight [rows,cols] -> dequant -> bf16 device buffer, layout unchanged. HF stores Linear
+    // weights [out_features,in_features], which is byte-identical to the GGUF-native [out,in] that
+    // every consumer here wants -- launch_gemv (gemm.h: "W is [N,K] row-major ([out,in],
+    // GGUF-native)"), launch_proj_requant_q4k_lloyd (its 256-element Q4_K blocks must run along the
+    // input dim WITHIN one output row), and launch_prefill_nvfp4_quant_b. So no transpose: an
+    // earlier [rows,cols]->[cols,rows] relayout here silently mis-shaped every projection in the
+    // model (q/k/v/o, FFN, lm_head, GDN), which reads as fluent-looking garbage rather than as any
+    // one tensor obviously loading wrong.
+    // Caller requantizes from here (Q4_K for decode; FP8 tensors never get an NVFP4 copy).
+    auto dequant_fp8 = [&](const std::string& prefix, int rows, int cols) -> void* {
+        const STTensor* w = st.tensor(prefix + ".weight");
+        const STTensor* sc = st.tensor(prefix + ".weight_scale");
+        if (!w || !sc || w->dtype != STDType::F8_E4M3 || w->n_values != (long)rows * cols ||
+            sc->n_values != rows) {
+            fprintf(stderr, "[compressed-tensors] %s: missing/malformed FP8 weight or scale\n",
+                    prefix.c_str());
+            return nullptr;
+        }
+        void *wd = nullptr, *scd = nullptr, *out = nullptr;
+        if (cudaMalloc(&wd, (size_t)rows * cols) != cudaSuccess) return nullptr;
+        if (cudaMalloc(&scd, (size_t)rows * 2) != cudaSuccess) { cudaFree(wd); return nullptr; }
+        if (cudaMalloc(&out, (size_t)rows * cols * 2) != cudaSuccess) { cudaFree(wd); cudaFree(scd); return nullptr; }
+        cudaMemcpy(wd, w->data, (size_t)rows * cols, cudaMemcpyHostToDevice);
+        cudaMemcpy(scd, sc->data, (size_t)rows * 2, cudaMemcpyHostToDevice);
+        kernels::launch_ct_dequant_fp8(wd, scd, out, rows, cols, s.stream);
+        cudaStreamSynchronize(s.stream);
+        cudaFree(wd); cudaFree(scd);
+        return out;   // caller owns; either requantizes from it (then frees) or pushes to s.owned
+    };
+
+    // NVFP4 weight [rows,cols] (HF [out,in], block_size=16) -> dequant -> bf16, layout unchanged.
+    auto dequant_nvfp4 = [&](const std::string& prefix, int rows, int cols) -> void* {
+        const STTensor* wp = st.tensor(prefix + ".weight_packed");
+        const STTensor* gs = st.tensor(prefix + ".weight_scale");
+        const STTensor* glob = st.tensor(prefix + ".weight_global_scale");
+        if (!wp || !gs || !glob || wp->dtype != STDType::U8 || wp->n_values != (long)rows * cols / 2 ||
+            gs->n_values != (long)rows * cols / 16 || glob->n_values != 1) {
+            fprintf(stderr, "[compressed-tensors] %s: missing/malformed NVFP4 tensors\n", prefix.c_str());
+            return nullptr;
+        }
+        float global_scale = 1.f;
+        memcpy(&global_scale, glob->data, sizeof(float));
+        void *wpd = nullptr, *gsd = nullptr, *out = nullptr;
+        const size_t packed_bytes = (size_t)rows * cols / 2, scale_bytes = (size_t)rows * cols / 16;
+        if (cudaMalloc(&wpd, packed_bytes) != cudaSuccess) return nullptr;
+        if (cudaMalloc(&gsd, scale_bytes) != cudaSuccess) { cudaFree(wpd); return nullptr; }
+        if (cudaMalloc(&out, (size_t)rows * cols * 2) != cudaSuccess) { cudaFree(wpd); cudaFree(gsd); return nullptr; }
+        cudaMemcpy(wpd, wp->data, packed_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(gsd, gs->data, scale_bytes, cudaMemcpyHostToDevice);
+        kernels::launch_ct_dequant_nvfp4(wpd, gsd, global_scale, out, rows, cols, s.stream);
+        cudaStreamSynchronize(s.stream);
+        cudaFree(wpd); cudaFree(gsd);
+        return out;
+    };
+
+    // bf16 [out,in] source -> kept resident as-is (qtype=0), decode reads it via the existing
+    // plain-bf16 launch_gemv fallback in proj_xn/proj_from (the t==0 branch of the same dispatch
+    // Q4_K/Q6_K/Q8_0 share). Used for GDN's projections instead of requant_q4k: these weights are
+    // themselves dequantized from FP8 at load time, and re-quantizing an already-quantized source
+    // to 4 bits a second time compounds error more than a single quantization step from a native
+    // bf16/fp32 checkpoint would.
+    auto keep_bf16 = [&](void* bf16_src, int& qtype) -> const void* {
+        if (!bf16_src) return nullptr;
+        s.owned.push_back(bf16_src);
+        qtype = 0;
+        return bf16_src;
+    };
+
+    // bf16 [out,in] source -> resident Q4_K (decode path). Frees the source.
+    auto requant_q4k = [&](void* bf16_src, long n_values, int& qtype) -> const void* {
+        if (!bf16_src || n_values % 256 != 0) { if (bf16_src) cudaFree(bf16_src); return nullptr; }
+        void* q4 = nullptr;
+        if (cudaMalloc(&q4, (size_t)(n_values / 256) * 144) != cudaSuccess) { cudaFree(bf16_src); return nullptr; }
+        kernels::launch_proj_requant_q4k_lloyd(bf16_src, q4, n_values, s.stream);
+        cudaStreamSynchronize(s.stream);
+        cudaFree(bf16_src);
+        s.owned.push_back(q4);
+        qtype = 12;
+        return q4;
+    };
+
+    // bf16 [out,in] source -> fresh NVFP4 (prefill path, gate_fp4/up_fp4 shape). Does NOT free
+    // bf16_src -- caller (FFN loop below) still needs it for the Q4_K decode copy.
+    auto quantize_nvfp4_prefill = [&](const void* bf16_src, int rows, int cols,
+                                      const void** data, const void** sf) -> bool {
+        if (!bf16_src || !kernels::prefill_nvfp4_supported(128, rows, cols)) return false;
+        void *d = nullptr, *scale = nullptr;
+        if (cudaMalloc(&d, kernels::prefill_nvfp4_data_bytes(rows, cols)) != cudaSuccess) return false;
+        if (cudaMalloc(&scale, kernels::prefill_nvfp4_scale_bytes_b(rows, cols)) != cudaSuccess) {
+            cudaFree(d); return false;
+        }
+        if (!kernels::launch_prefill_nvfp4_quant_b(bf16_src, d, scale, rows, cols, s.stream) ||
+            cudaStreamSynchronize(s.stream) != cudaSuccess) {
+            cudaFree(d); cudaFree(scale); return false;
+        }
+        s.owned.push_back(d); s.owned.push_back(scale);
+        *data = d; *sf = scale;
+        return true;
+    };
+
+    // embed_tokens: HF embedding tables are already [vocab,hidden] (not a Linear layer), no
+    // transpose needed -- matches load_gguf()'s own dense("token_embd.weight", false).
+    s.w.embed_tokens = plain_bf16("model.language_model.embed_tokens.weight", (long)c.vocab * H);
+    s.w.final_norm = load_norm_plus1("model.language_model.norm.weight", H);
+    {
+        void* lmb = dequant_fp8("lm_head", c.vocab, H);
+        s.w.lm_head = requant_q4k(lmb, (long)c.vocab * H, s.w.lm_head_type);
+    }
+    if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
+
+    s.w.layers.resize(c.n_layers);
+    int gu_ready = 0;
+    for (int i = 0; i < c.n_layers; i++) {
+        const std::string b = "model.language_model.layers." + std::to_string(i) + ".";
+        Qwen35LayerWeights& w = s.w.layers[i];
+        w.linear_attn = is_linear_layer(c, i);
+        w.input_norm = load_norm_plus1(b + "input_layernorm.weight", H);
+        w.post_attn_norm = load_norm_plus1(b + "post_attention_layernorm.weight", H);
+
+        if (w.linear_attn) {
+            const std::string lb = b + "linear_attn.";
+            void* qkv = dequant_fp8(lb + "in_proj_qkv", s.linear_qkvdim, H);
+            w.wqkv = keep_bf16(qkv, w.wqkv_type);
+            void* z = dequant_fp8(lb + "in_proj_z", c.linear_v_heads * c.linear_head_dim, H);
+            w.wqkv_gate = keep_bf16(z, w.wqkv_gate_type);
+            void* op = dequant_fp8(lb + "out_proj", H, s.linear_vdim);
+            w.ssm_out = keep_bf16(op, w.ssm_out_type);
+            // Small, checkpoint-unquantized tensors -- plain bf16, NO transpose. conv1d's raw HF
+            // layout [qkvdim,1,conv_kernel] (=[qkvdim,conv_kernel] squeezed) already matches
+            // conv_split_kernel's own indexing (conv_w[d*conv_kernel+t], d=channel, t=tap) --
+            // transposing it here was wrong (same bug class as keep_bf16 below: see its comment).
+            // in_proj_a/in_proj_b are ordinary HF Linear weights [out,in]=[v_heads,H], which is
+            // exactly what proj_xn's plain-bf16 launch_gemv fallback wants (gemm.h: "[N,K]
+            // row-major ([out,in], GGUF-native)") -- transposing them to [H,v_heads] was wrong
+            // for the same reason. Root-caused via the same byte-level cross-check against
+            // llama.cpp that found the keep_bf16 transpose bug: alpha/beta projections summed to
+            // 10.8/3.2 in this runtime vs. 108.6/79.7 in the reference trace, and neither tensor
+            // goes through conv at all, ruling out the conv1d weight as their cause and pointing
+            // straight at their own [out,in]-vs-[in,out] mismatch.
+            w.ssm_dt = plain_bf16(lb + "dt_bias", c.linear_v_heads);
+            w.ssm_a = load_a_log_transformed(lb + "A_log", c.linear_v_heads);
+            w.ssm_norm = plain_bf16(lb + "norm.weight", c.linear_head_dim);
+            w.ssm_conv = plain_bf16(lb + "conv1d.weight", (long)s.linear_qkvdim * c.linear_conv_kernel);
+            w.ssm_alpha = plain_bf16(lb + "in_proj_a.weight", (long)c.linear_v_heads * H);
+            w.ssm_beta = plain_bf16(lb + "in_proj_b.weight", (long)c.linear_v_heads * H);
+            if (!w.wqkv || !w.wqkv_gate || !w.ssm_out || !w.ssm_dt || !w.ssm_a || !w.ssm_norm ||
+                !w.ssm_conv || !w.ssm_alpha || !w.ssm_beta) return false;
+        } else {
+            w.q_has_gate = c.hybrid;
+            const std::string ab = b + "self_attn.";
+            const int q_out = w.q_has_gate ? s.qdim * 2 : s.qdim;
+            void* q = dequant_fp8(ab + "q_proj", q_out, H);
+            w.wq = requant_q4k(q, (long)q_out * H, w.wq_type);
+            void* k = dequant_fp8(ab + "k_proj", s.kvdim, H);
+            w.wk = requant_q4k(k, (long)s.kvdim * H, w.wk_type);
+            void* v = dequant_fp8(ab + "v_proj", s.kvdim, H);
+            w.wv = requant_q4k(v, (long)s.kvdim * H, w.wv_type);
+            void* o = dequant_fp8(ab + "o_proj", H, s.qdim);
+            w.wo = requant_q4k(o, (long)H * s.qdim, w.wo_type);
+            w.q_norm = load_norm_plus1(ab + "q_norm.weight", c.head_dim);
+            w.k_norm = load_norm_plus1(ab + "k_norm.weight", c.head_dim);
+            if (!w.wq || !w.wk || !w.wv || !w.wo || !w.q_norm || !w.k_norm) return false;
+        }
+
+        const std::string mb = b + "mlp.";
+        if (ffn_is_fp8_layer(i)) {
+            void* g = dequant_fp8(mb + "gate_proj", c.moe_ffn, H);
+            w.gate_q = requant_q4k(g, (long)c.moe_ffn * H, w.gate_qtype);
+            void* u = dequant_fp8(mb + "up_proj", c.moe_ffn, H);
+            w.up_q = requant_q4k(u, (long)c.moe_ffn * H, w.up_qtype);
+            void* d = dequant_fp8(mb + "down_proj", H, c.moe_ffn);
+            w.down_q = requant_q4k(d, (long)H * c.moe_ffn, w.down_qtype);
+        } else {
+            void* g_bf16 = dequant_nvfp4(mb + "gate_proj", c.moe_ffn, H);
+            void* u_bf16 = dequant_nvfp4(mb + "up_proj", c.moe_ffn, H);
+            void* d_bf16 = dequant_nvfp4(mb + "down_proj", H, c.moe_ffn);
+            bool gu_ok = g_bf16 && u_bf16 &&
+                quantize_nvfp4_prefill(g_bf16, c.moe_ffn, H, &w.gate_fp4, &w.gate_fp4_sf) &&
+                quantize_nvfp4_prefill(u_bf16, c.moe_ffn, H, &w.up_fp4, &w.up_fp4_sf);
+            if (gu_ok) ++gu_ready;
+            w.gate_q = requant_q4k(g_bf16, (long)c.moe_ffn * H, w.gate_qtype);
+            w.up_q = requant_q4k(u_bf16, (long)c.moe_ffn * H, w.up_qtype);
+            w.down_q = requant_q4k(d_bf16, (long)H * c.moe_ffn, w.down_qtype);
+        }
+        if (!w.gate_q || !w.up_q || !w.down_q) return false;
+    }
+    fprintf(stderr, "[compressed-tensors] loaded %d layers, gate/up NVFP4 prefill ready %d/%d\n",
+            c.n_layers, gu_ready, c.n_layers);
     return true;
 }
 

@@ -141,6 +141,9 @@ public:
     // dequantized to bf16; expert tensors are kept quantized in VRAM and
     // dequantized per-layer at decode time (Q4_K_M-sized resident footprint).
     bool load_gguf(const std::string& path);
+    // HuggingFace "compressed-tensors" mixed FP8/NVFP4 checkpoint (e.g. unsloth/Qwen3.8-27B-NVFP4)
+    // -- see runtime/src/models/qwen35.cpp's own comment on the function for the exact scheme.
+    bool load_compressed_tensors(const std::string& model_dir);
 
     // Greedy generate: prompt token ids -> generated token ids (host). An optional ThermalGovernor
     // paces decode under thermal pressure (accuracy-preserving); nullptr = full speed, no overhead.

@@ -1375,16 +1375,27 @@ bool should_reject_dflash_logit_bias(bool dflash_env_on, bool has_logit_bias) {
     return dflash_env_on && has_logit_bias;
 }
 
-std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking) {
+std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking,
+                                        bool inject_reasoning_effort) {
     std::ostringstream out;
     size_t first_message = 0;
     const bool tools_active = !request.tools.empty() && request.tool_choice == ToolChoiceMode::kAuto;
     const bool json_mode = request.response_format.type != ResponseFormatType::kText;
+    // Qwen3.8-27B's chat_template.jinja always resolves reasoning_effort to its default (xhigh)
+    // -- this server never wires reasoning_effort as a request param -- and prepends this exact
+    // wording whenever thinking is enabled, independent of tools/response_format.
+    const std::string reasoning_instructions = (inject_reasoning_effort && enable_thinking)
+        ? "Reasoning effort is set to xhigh. Please think carefully through the task, validate "
+          "key assumptions, consider plausible alternatives, and prioritize correctness, "
+          "consistency, and clarity in the final answer."
+        : std::string();
+    const bool has_leading_system = !request.messages.empty() && request.messages[0].role == "system";
     // Request-time validation (parse_chat_request_json) rejects tools + response_format
     // together, so tools_active and json_mode are never both true -- written as two independent
     // segments anyway to keep this function's shape uniform rather than forking it in two.
     if (tools_active || json_mode) {
         out << kImStart << "system\n";
+        if (!reasoning_instructions.empty()) out << reasoning_instructions << "\n\n";
         if (tools_active) {
             out << kToolInstructions;
             for (const ToolDefinition& tool : request.tools)
@@ -1401,12 +1412,29 @@ std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_
                     << kJsonSchemaInstructionsTail;
             }
         }
-        if (!request.messages.empty() && request.messages[0].role == "system") {
+        if (has_leading_system) {
             const std::string system_content = trim_copy(request.messages[0].content);
             if (!system_content.empty()) out << "\n\n" << system_content;
         }
         out << kImEnd << '\n';
-        if (!request.messages.empty() && request.messages[0].role == "system") first_message = 1;
+        if (has_leading_system) first_message = 1;
+    } else if (inject_reasoning_effort && (!reasoning_instructions.empty() || has_leading_system)) {
+        // Plain case (no tools, no json_mode): the pinned template still merges leading system
+        // message(s) with the reasoning-effort instructions rather than letting them fall
+        // through the generic per-message loop below.
+        const std::string system_content = has_leading_system ? trim_copy(request.messages[0].content)
+                                                               : std::string();
+        if (!system_content.empty() || !reasoning_instructions.empty()) {
+            out << kImStart << "system\n";
+            if (!reasoning_instructions.empty()) {
+                out << reasoning_instructions;
+                if (!system_content.empty()) out << "\n\n" << system_content;
+            } else {
+                out << system_content;
+            }
+            out << kImEnd << '\n';
+        }
+        if (has_leading_system) first_message = 1;
     }
     size_t last_user = request.messages.size();
     for (size_t i = request.messages.size(); i > 0; --i) {

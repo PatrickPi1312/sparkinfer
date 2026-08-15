@@ -372,9 +372,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const bool muse_nvfp4 = c.muse_glimmer && N == 128 && !s.w.layers.empty() &&
                             s.w.layers[0].gate_fp4 &&
                             kernels::prefill_nvfp4_supported(N, ffn, H);
-    const size_t fp4_a_data_bytes = muse_nvfp4
+    // Qwen3.8-27B's own gate/up NVFP4 (compressed-tensors checkpoint, see
+    // Qwen35Model::load_compressed_tensors): same dense_ffn shape and the exact same gate_fp4/
+    // up_fp4 fields Muse Glimmer already uses, so it reuses `layer_fp4`'s existing GEMM sequence
+    // below unchanged -- this flag ONLY widens that one gate, mutually exclusive with
+    // muse_nvfp4 at runtime (one process loads one model), so the buffers below are shared, not
+    // duplicated. Deliberately NOT touching any c.muse_glimmer-gated branch elsewhere in this
+    // function (qkv-fusion, wo-fusion, sandwich norm) -- those are structurally specific to
+    // Muse's own tensor layout (a separate wgate tensor; Qwen3.8-27B fuses its gate into Q's
+    // projection width instead) and don't apply here.
+    const bool q38_nvfp4 = c.dense_ffn && !c.muse_glimmer && N == 128 && !s.w.layers.empty() &&
+                           s.w.layers[0].gate_fp4 &&
+                           kernels::prefill_nvfp4_supported(N, ffn, H);
+    const bool gu_nvfp4 = muse_nvfp4 || q38_nvfp4;
+    const size_t fp4_a_data_bytes = gu_nvfp4
         ? kernels::prefill_nvfp4_data_bytes(N, H) : 0;
-    const size_t fp4_a_sf_bytes = muse_nvfp4
+    const size_t fp4_a_sf_bytes = gu_nvfp4
         ? kernels::prefill_nvfp4_scale_bytes_a(N, H) : 0;
     // The attention projection group: q | gate | k | v stacked, so one GEMM covers all four. Its A
     // operand is `xn` at k = H -- the same shape gate/up already quantize -- so fp4_a/fp4_as serve
@@ -382,7 +395,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const int qkvg_n = 2 * qdim + 2 * kvdim;
     const bool muse_nvfp4_qkv = muse_nvfp4 && s.w.layers[0].qkvg_fp4 &&
                                 kernels::prefill_nvfp4_supported(N, qkvg_n, H);
-    const size_t fp4_ws_gu = muse_nvfp4
+    const size_t fp4_ws_gu = gu_nvfp4
         ? kernels::prefill_nvfp4_workspace_bytes(N, ffn, H) : 0;
     const size_t fp4_ws_qkv = muse_nvfp4_qkv
         ? kernels::prefill_nvfp4_workspace_bytes(N, qkvg_n, H) : 0;
@@ -398,9 +411,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     size_t fp4_ws_bytes = (fp4_ws_qkv > fp4_ws_gu) ? fp4_ws_qkv : fp4_ws_gu;
     if (fp4_ws_wo > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_wo;
     if (fp4_ws_down > fp4_ws_bytes) fp4_ws_bytes = fp4_ws_down;
-    unsigned char* fp4_a = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
-    unsigned char* fp4_as = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
-    unsigned char* fp4_ws = muse_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
+    unsigned char* fp4_a = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_data_bytes) : nullptr;
+    unsigned char* fp4_as = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_a_sf_bytes) : nullptr;
+    unsigned char* fp4_ws = gu_nvfp4 ? a8.alloc<unsigned char>(fp4_ws_bytes) : nullptr;
     bf16* fp4_qkv = muse_nvfp4_qkv ? a8.alloc<bf16>((size_t)N * qkvg_n) : nullptr;
     unsigned char* fp4_down_a = muse_nvfp4_down
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, ffn)) : nullptr;
@@ -812,7 +825,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st);
             float* layer_state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
             kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
-                layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim, st);
+                layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
+                c.gdn_qh_block, st);
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
             attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
             if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
@@ -947,8 +961,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 gate_fused = true;
             }
             // If the fused quantize ran but the GEMM declined, `att` is still raw -- gate it here.
-            if (!gate_fused && !wo_fp4_done)
+            if (!gate_fused && !wo_fp4_done) {
                 kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
+            }
             if (c.muse_glimmer) {
                 // Sandwich norm needs the RAW O-proj output in `ao` (not fused into x); the residual
                 // add happens in launch_norm_then_add below. The FP4 GEMM already wrote `ao` and
@@ -1025,7 +1040,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
-                const bool layer_fp4 = muse_nvfp4 && fn == 128 && w.gate_fp4 && w.gate_fp4_sf &&
+                const bool layer_fp4 = gu_nvfp4 && fn == 128 && w.gate_fp4 && w.gate_fp4_sf &&
                     w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as &&
                     kernels::launch_prefill_nvfp4_quant_a(hn_c, fp4_a, fp4_as, fn, H, st) &&
                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, w.gate_fp4, w.gate_fp4_sf,
@@ -2012,7 +2027,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
             const float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
             kernels::launch_dflash_gdn_scan_compact(gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
-                state, att, N, c.linear_q_heads, vh, c.linear_head_dim, st);
+                state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                 c.linear_head_dim, c.rms_eps, st);
             supported = proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
@@ -2072,8 +2087,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
             // dependency latency for the same work.
-            if (!kv8)
+            if (!kv8) {
                 kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
+            }
             supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
         }
         if (!supported) break;
@@ -2308,7 +2324,8 @@ verify_forward_done:
             kernels::launch_dflash_gdn_conv_commit(rq, conv_live, keep, c.linear_q_heads, vh,
                 c.linear_head_dim, c.linear_conv_kernel, st);
             kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
-                s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim, st);
+                s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim,
+                c.gdn_qh_block, st);
         }
     }
     pf_cu(cudaStreamSynchronize(st), "verify commit");
