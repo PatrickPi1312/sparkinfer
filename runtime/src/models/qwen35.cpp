@@ -1138,6 +1138,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_mmvq_q80(s.aq81, W, y, N, H, pst);
                 else if (t == kernels::SI_QTYPE_FP8)
                     kernels::launch_gemv_fp8(s.xn, W, y, N, H, pst);
+                else if (t == kernels::SI_QTYPE_NVFP4)
+                    kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -1162,6 +1164,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_mmvq_q80(s.aq81, W, y, N, K, st);
                 } else if (t == kernels::SI_QTYPE_FP8) {
                     kernels::launch_gemv_fp8(x, W, y, N, K, st);
+                } else if (t == kernels::SI_QTYPE_NVFP4) {
+                    kernels::launch_gemv_nvfp4(x, W, y, N, K, st);
                 } else if (t) kernels::launch_gemv_q(x, W, t, y, N, K, st);
                 else          kernels::launch_gemv(x, W, y, N, K, st);
             } else {
@@ -4288,9 +4292,17 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     const int H = c.hidden;
     s.gguf = true;   // reuses the same "dense weights native, kept-quantized attn/ffn" decode shape
 
-    // FP8 tensors' MLP layers -- confirmed by direct inspection of the checkpoint's
-    // quantization_config.config_groups.group_0.targets: layers 56-63 (the last 8 of 64).
-    auto ffn_is_fp8_layer = [](int i) { return i >= 56 && i <= 63; };
+    // Does this layer's FFN ship as NVFP4 (-> keep the packed payload resident for batched
+    // prefill) or as something else (-> dequant and requant to Q4_K like load_gguf does)? Asked
+    // of the tensor names, per layer, because the two checkpoints this loader handles split it
+    // differently and neither split is derivable from the architecture: compressed-tensors puts
+    // layers 0-55 in NVFP4 and 56-63 in FP8, ModelOpt puts all 64 in NVFP4. A hardcoded range
+    // silently mis-reads the other checkpoint -- it would look for ".weight_packed" on a tensor
+    // that has none and fail the load, or worse, take the FP8 branch on bytes that are not FP8.
+    auto ffn_is_nvfp4 = [&](const std::string& mlp_prefix) {
+        return st.tensor(mlp_prefix + "gate_proj.weight_packed") != nullptr ||
+               st.tensor(mlp_prefix + "gate_proj.weight_scale_2") != nullptr;
+    };
 
     // bf16 upload, no transpose (embeddings, norms, and the small linear_attn gate-scalar
     // projections that the checkpoint leaves unquantized).
@@ -4457,20 +4469,72 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     // scatters the UE4M3 scales into SFB; the tensor-wide global_scale becomes
     // GEMM alpha (1/global), matching launch_ct_dequant_nvfp4's divide. The
     // header is 256 B so the packed region stays TMA-aligned.
+    // Resolves one NVFP4 weight's three tensors across the two export conventions that ship in
+    // the wild. They differ in NAMING and, silently, in the DIRECTION of the tensor-wide scale:
+    //
+    //   llm-compressor / "compressed-tensors"  (unsloth/Qwen3.8-27B-NVFP4)
+    //     ".weight_packed" (U8) + ".weight_scale" (UE4M3) + ".weight_global_scale" (F32)
+    //     global = (6*448)/amax  ->  W = q * block_scale / global
+    //   NVIDIA ModelOpt                        (gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)
+    //     ".weight" (U8)        + ".weight_scale" (UE4M3) + ".weight_scale_2" (F32)
+    //     weight_scale_2 = amax/(6*448)  ->  W = q * block_scale * weight_scale_2
+    //
+    // The two constants are exact reciprocals, so reading one checkpoint with the other's
+    // convention scales every weight by amax^2/2688^2 -- no NaN, no shape error, just a model
+    // that emits confident garbage. Everything downstream here (launch_ct_dequant_nvfp4's divide,
+    // the CUTLASS GEMM's alpha = 1/global) is written against the compressed-tensors form, so
+    // ModelOpt's multiplier is inverted once, here, and never again.
+    //
+    // Which one a checkpoint uses is decided by the tensor names present, not by
+    // quantization_config.quant_method: the config key is metadata a re-uploader can copy
+    // without the bytes matching, whereas ".weight_scale_2" existing IS the ModelOpt layout.
+    // Direction confirmed numerically against the actual file rather than from the format docs --
+    // layer 3's k_proj carries weight_scale_2 = 1.19e-4, which under the multiply reading implies
+    // a weight amax of 6*448*1.19e-4 = 0.32 (ordinary for a projection) and under the divide
+    // reading 2.25e7 (impossible).
+    struct NvFp4Src { const void* packed; const void* group; float global; };
+    auto nvfp4_src = [&](const std::string& prefix, int rows, int cols, NvFp4Src& out) -> bool {
+        const STTensor* gs = st.tensor(prefix + ".weight_scale");
+        const STTensor* wp = st.tensor(prefix + ".weight_packed");
+        const STTensor* glob = wp ? st.tensor(prefix + ".weight_global_scale") : nullptr;
+        bool modelopt = false;
+        if (!wp) {   // ModelOpt stores the packed nibbles under the plain ".weight" name
+            wp = st.tensor(prefix + ".weight");
+            glob = st.tensor(prefix + ".weight_scale_2");
+            modelopt = true;
+        }
+        // Not an NVFP4 weight at all (bf16 or FP8) -- a quiet miss, not a malformed checkpoint.
+        if (!wp || !gs || !glob || wp->dtype != STDType::U8) return false;
+        if (wp->n_values != (long)rows * cols / 2 ||
+            gs->n_values != (long)rows * cols / 16 || glob->n_values != 1) {
+            fprintf(stderr, "[compressed-tensors] %s: malformed NVFP4 tensors "
+                    "(packed=%ld want %ld, group=%ld want %ld, global=%ld want 1)\n",
+                    prefix.c_str(), wp->n_values, (long)rows * cols / 2,
+                    gs->n_values, (long)rows * cols / 16, glob->n_values);
+            return false;
+        }
+        float g = 1.f;
+        memcpy(&g, glob->data, sizeof(float));
+        if (!(g > 0.f)) {
+            fprintf(stderr, "[compressed-tensors] %s: non-positive global scale %g\n",
+                    prefix.c_str(), g);
+            return false;
+        }
+        out.packed = wp->data;
+        out.group = gs->data;
+        out.global = modelopt ? (1.f / g) : g;
+        return true;
+    };
+
     auto keep_nvfp4 = [&](const std::string& prefix, int rows, int cols,
                           const void** fp4, const void** fp4_sf, float& fp4_alpha) -> const void* {
-        const STTensor* wp = st.tensor(prefix + ".weight_packed");
-        const STTensor* gs = st.tensor(prefix + ".weight_scale");
-        const STTensor* glob = st.tensor(prefix + ".weight_global_scale");
-        if (!wp || !gs || !glob || wp->dtype != STDType::U8 ||
-            wp->n_values != (long)rows * cols / 2 ||
-            gs->n_values != (long)rows * cols / 16 || glob->n_values != 1) {
+        NvFp4Src src{};
+        if (!nvfp4_src(prefix, rows, cols, src)) {
             fprintf(stderr, "[compressed-tensors] %s: missing/malformed NVFP4 tensors\n",
                     prefix.c_str());
             return nullptr;
         }
-        float global_scale = 1.f;
-        memcpy(&global_scale, glob->data, sizeof(float));
+        const float global_scale = src.global;
         const size_t scale_bytes = (size_t)rows * cols / 16;
         const size_t packed_bytes = (size_t)rows * cols / 2;
         const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
@@ -4478,8 +4542,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         if (cudaMalloc(&payload, hdr + scale_bytes + packed_bytes) != cudaSuccess) return nullptr;
         cudaMemset(payload, 0, hdr);
         cudaMemcpy(payload, &global_scale, 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr, gs->data, scale_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, wp->data, packed_bytes,
+        cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
         s.owned.push_back(payload);
         fp4_alpha = (global_scale != 0.f) ? (1.f / global_scale) : 1.f;
@@ -4517,14 +4581,119 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         return requant_q4k(out, (long)rows * cols, qtype);
     };
 
+    // NVFP4 -> bf16 device buffer, transient. Same dequant as q4k_from_nvfp4, but the packed
+    // source is uploaded to scratch and released here instead of staying resident: this is for
+    // weights with no batched-prefill NVFP4 consumer, where holding the payload would cost VRAM
+    // that nothing reads. Contract matches dequant_fp8's deliberately (caller owns the returned
+    // buffer and either requantizes from it or pushes it to s.owned), so callers can dispatch on
+    // storage format without also branching on ownership.
+    auto dequant_nvfp4 = [&](const std::string& prefix, int rows, int cols) -> void* {
+        NvFp4Src src{};
+        if (!nvfp4_src(prefix, rows, cols, src)) {
+            fprintf(stderr, "[compressed-tensors] %s: missing/malformed NVFP4 tensors\n",
+                    prefix.c_str());
+            return nullptr;
+        }
+        const size_t scale_bytes = (size_t)rows * cols / 16;
+        const size_t packed_bytes = (size_t)rows * cols / 2;
+        void *pd = nullptr, *gd = nullptr, *out = nullptr;
+        if (cudaMalloc(&pd, packed_bytes) != cudaSuccess) return nullptr;
+        if (cudaMalloc(&gd, scale_bytes) != cudaSuccess) { cudaFree(pd); return nullptr; }
+        if (cudaMalloc(&out, (size_t)rows * cols * 2) != cudaSuccess) {
+            cudaFree(pd); cudaFree(gd); return nullptr;
+        }
+        cudaMemcpy(pd, src.packed, packed_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(gd, src.group, scale_bytes, cudaMemcpyHostToDevice);
+        kernels::launch_ct_dequant_nvfp4(pd, gd, src.global, out, rows, cols, s.stream);
+        cudaStreamSynchronize(s.stream);
+        cudaFree(pd); cudaFree(gd);
+        return out;
+    };
+
+    // Whichever of the three storage formats this Linear actually uses -> bf16, so the callers
+    // that only ever want a requant source (attention projections, lm_head) do not have to know.
+    // Decided per tensor from the bytes present rather than from quantization_config's
+    // targets/ignore rules or from hardcoded layer ranges: the two Qwen3.8-27B NVFP4 checkpoints
+    // this loader handles disagree on which tensors are quantized at all (compressed-tensors puts
+    // attention/GDN/lm_head in FP8 and the last 8 FFN layers too; ModelOpt quantizes all 400
+    // Linears to NVFP4 and leaves lm_head plain bf16), and a checkpoint's own tensor list is the
+    // only description of it that cannot be stale.
+    auto dequant_any = [&](const std::string& prefix, int rows, int cols) -> void* {
+        NvFp4Src probe{};
+        if (nvfp4_src(prefix, rows, cols, probe)) return dequant_nvfp4(prefix, rows, cols);
+        const STTensor* w = st.tensor(prefix + ".weight");
+        if (!w) {
+            fprintf(stderr, "[compressed-tensors] missing %s.weight\n", prefix.c_str());
+            return nullptr;
+        }
+        if (w->dtype == STDType::F8_E4M3) return dequant_fp8(prefix, rows, cols);
+        if (w->dtype != STDType::BF16 || w->n_values != (long)rows * cols) {
+            fprintf(stderr, "[compressed-tensors] %s.weight: expected BF16[%ld] or a quantized "
+                    "form, got dtype=%d n=%ld\n",
+                    prefix.c_str(), (long)rows * cols, (int)w->dtype, w->n_values);
+            return nullptr;
+        }
+        void* d = nullptr;
+        if (cudaMalloc(&d, (size_t)rows * cols * 2) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, w->data, (size_t)rows * cols * 2, cudaMemcpyHostToDevice);
+        return d;   // caller owns, same contract as dequant_fp8 / dequant_nvfp4
+    };
+
+    // Checkpoint NVFP4 kept native for decode (SI_QTYPE_NVFP4 -> launch_gemv_nvfp4). This is
+    // keep_fp8's policy above, carried across the format change: the ModelOpt checkpoint stores
+    // the GDN projections as NVFP4 where compressed-tensors stored them as FP8, and requantizing
+    // an already-4-bit weight lands its values between Q4_K's own grid points -- adding a second
+    // helping of quantization noise on 48 of 64 layers, in a format whose whole premise is that
+    // 4 bits are already as coarse as the model tolerates. (The FFN below still takes a Q4_K
+    // decode copy: there the NVFP4 payload stays resident anyway for batched prefill, so the copy
+    // buys decode speed rather than costing accuracy for nothing.)
+    // SPARKINFER_Q38_GDN_NVFP4=0 requantizes to Q4_K instead, for A/B.
+    static const bool gdn_keep_nvfp4 = [] {
+        const char* e = getenv("SPARKINFER_Q38_GDN_NVFP4");
+        return !(e && e[0] == '0');
+    }();
+    auto keep_nvfp4_native = [&](const std::string& prefix, int rows, int cols,
+                                 int& qtype) -> const void* {
+        NvFp4Src src{};
+        if (!nvfp4_src(prefix, rows, cols, src)) return nullptr;
+        if (!gdn_keep_nvfp4) return requant_q4k(dequant_nvfp4(prefix, rows, cols),
+                                                (long)rows * cols, qtype);
+        const size_t scale_bytes = (size_t)rows * cols / 16;
+        const size_t packed_bytes = (size_t)rows * cols / 2;
+        const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
+        void* payload = nullptr;
+        if (cudaMalloc(&payload, hdr + scale_bytes + packed_bytes) != cudaSuccess) return nullptr;
+        cudaMemset(payload, 0, hdr);
+        cudaMemcpy(payload, &src.global, 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes,
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
+                   cudaMemcpyHostToDevice);
+        s.owned.push_back(payload);
+        qtype = kernels::SI_QTYPE_NVFP4;
+        return payload;
+    };
+
+    // One Linear kept in whatever native form this checkpoint ships it in: FP8 stays FP8, NVFP4
+    // stays NVFP4, and anything else falls back to a Q4_K fit from bf16. Used for the GDN
+    // projections, where both shipped checkpoints deliberately avoid a second quantization.
+    auto keep_native = [&](const std::string& prefix, int rows, int cols,
+                           int& qtype) -> const void* {
+        NvFp4Src probe{};
+        if (nvfp4_src(prefix, rows, cols, probe)) return keep_nvfp4_native(prefix, rows, cols, qtype);
+        const STTensor* w = st.tensor(prefix + ".weight");
+        if (w && w->dtype == STDType::F8_E4M3) return keep_fp8(prefix, rows, cols, qtype);
+        return requant_q4k(dequant_any(prefix, rows, cols), (long)rows * cols, qtype);
+    };
+
     // embed_tokens: HF embedding tables are already [vocab,hidden] (not a Linear layer), no
     // transpose needed -- matches load_gguf()'s own dense("token_embd.weight", false).
     s.w.embed_tokens = plain_bf16("model.language_model.embed_tokens.weight", (long)c.vocab * H);
     s.w.final_norm = load_norm_plus1("model.language_model.norm.weight", H);
-    {
-        void* lmb = dequant_fp8("lm_head", c.vocab, H);
-        s.w.lm_head = requant_q4k(lmb, (long)c.vocab * H, s.w.lm_head_type);
-    }
+    // lm_head: FP8 in the compressed-tensors checkpoint, plain bf16 in the ModelOpt one (which
+    // lists it under quantization_config.ignore). Either way it ends up Q4_K, as in load_gguf().
+    s.w.lm_head = requant_q4k(dequant_any("lm_head", c.vocab, H), (long)c.vocab * H,
+                              s.w.lm_head_type);
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
     s.w.layers.resize(c.n_layers);
@@ -4538,12 +4707,12 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
 
         if (w.linear_attn) {
             const std::string lb = b + "linear_attn.";
-            // Native checkpoint FP8 (not a second Q4_K/Q8_0 fit): same bf16 rounding as
-            // keep_bf16, half the GDN traffic. See keep_fp8 above.
-            w.wqkv = keep_fp8(lb + "in_proj_qkv", s.linear_qkvdim, H, w.wqkv_type);
-            w.wqkv_gate = keep_fp8(lb + "in_proj_z", c.linear_v_heads * c.linear_head_dim, H,
-                                   w.wqkv_gate_type);
-            w.ssm_out = keep_fp8(lb + "out_proj", H, s.linear_vdim, w.ssm_out_type);
+            // Native checkpoint format, whichever it is (FP8 or NVFP4) -- not a second Q4_K/Q8_0
+            // fit: same bf16 rounding as keep_bf16, half the GDN traffic. See keep_native above.
+            w.wqkv = keep_native(lb + "in_proj_qkv", s.linear_qkvdim, H, w.wqkv_type);
+            w.wqkv_gate = keep_native(lb + "in_proj_z", c.linear_v_heads * c.linear_head_dim, H,
+                                      w.wqkv_gate_type);
+            w.ssm_out = keep_native(lb + "out_proj", H, s.linear_vdim, w.ssm_out_type);
             // Small, checkpoint-unquantized tensors -- plain bf16, NO transpose. conv1d's raw HF
             // layout [qkvdim,1,conv_kernel] (=[qkvdim,conv_kernel] squeezed) already matches
             // conv_split_kernel's own indexing (conv_w[d*conv_kernel+t], d=channel, t=tap) --
@@ -4568,27 +4737,23 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.q_has_gate = c.hybrid;
             const std::string ab = b + "self_attn.";
             const int q_out = w.q_has_gate ? s.qdim * 2 : s.qdim;
-            void* q = dequant_fp8(ab + "q_proj", q_out, H);
-            w.wq = requant_q4k(q, (long)q_out * H, w.wq_type);
-            void* k = dequant_fp8(ab + "k_proj", s.kvdim, H);
-            w.wk = requant_q4k(k, (long)s.kvdim * H, w.wk_type);
-            void* v = dequant_fp8(ab + "v_proj", s.kvdim, H);
-            w.wv = requant_q4k(v, (long)s.kvdim * H, w.wv_type);
-            void* o = dequant_fp8(ab + "o_proj", H, s.qdim);
-            w.wo = requant_q4k(o, (long)H * s.qdim, w.wo_type);
+            w.wq = requant_q4k(dequant_any(ab + "q_proj", q_out, H), (long)q_out * H, w.wq_type);
+            w.wk = requant_q4k(dequant_any(ab + "k_proj", s.kvdim, H), (long)s.kvdim * H, w.wk_type);
+            w.wv = requant_q4k(dequant_any(ab + "v_proj", s.kvdim, H), (long)s.kvdim * H, w.wv_type);
+            w.wo = requant_q4k(dequant_any(ab + "o_proj", H, s.qdim), (long)H * s.qdim, w.wo_type);
             w.q_norm = load_norm_plus1(ab + "q_norm.weight", c.head_dim);
             w.k_norm = load_norm_plus1(ab + "k_norm.weight", c.head_dim);
             if (!w.wq || !w.wk || !w.wv || !w.wo || !w.q_norm || !w.k_norm) return false;
         }
 
         const std::string mb = b + "mlp.";
-        if (ffn_is_fp8_layer(i)) {
-            void* g = dequant_fp8(mb + "gate_proj", c.moe_ffn, H);
-            w.gate_q = requant_q4k(g, (long)c.moe_ffn * H, w.gate_qtype);
-            void* u = dequant_fp8(mb + "up_proj", c.moe_ffn, H);
-            w.up_q = requant_q4k(u, (long)c.moe_ffn * H, w.up_qtype);
-            void* d = dequant_fp8(mb + "down_proj", H, c.moe_ffn);
-            w.down_q = requant_q4k(d, (long)H * c.moe_ffn, w.down_qtype);
+        if (!ffn_is_nvfp4(mb)) {
+            w.gate_q = requant_q4k(dequant_any(mb + "gate_proj", c.moe_ffn, H),
+                                   (long)c.moe_ffn * H, w.gate_qtype);
+            w.up_q = requant_q4k(dequant_any(mb + "up_proj", c.moe_ffn, H),
+                                 (long)c.moe_ffn * H, w.up_qtype);
+            w.down_q = requant_q4k(dequant_any(mb + "down_proj", H, c.moe_ffn),
+                                   (long)H * c.moe_ffn, w.down_qtype);
         } else {
             const void* g_pay = keep_nvfp4(mb + "gate_proj", c.moe_ffn, H,
                                            &w.gate_fp4, &w.gate_fp4_sf, w.gate_fp4_alpha);
@@ -4607,10 +4772,11 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             "(decode stays Q4_K)\n",
             c.n_layers, gu_ready, c.n_layers);
 
-    // Same fused Q4_K-in-GEMM row scales Muse uses, for the tensors this checkpoint still
-    // stores as Q4_K: full-attn q/k/v/o (16 layers) and FFN 56-63 (the 8 FP8 MLP layers
-    // requanted to Q4_K). Lets prefill decode Q4_K inside the GEMM instead of materializing
-    // int8 weights every layer. SPARKINFER_Q38_PREFILL_QB=0 skips (A/B).
+    // Same fused Q4_K-in-GEMM row scales Muse uses, for whichever tensors ended up Q4_K after the
+    // per-tensor routing above -- full-attn q/k/v/o always, plus any FFN layer with no native
+    // NVFP4 prefill operand (all 8 FP8 MLP layers in the compressed-tensors checkpoint; none in
+    // the ModelOpt one, which is NVFP4 end to end). Lets prefill decode Q4_K inside the GEMM
+    // instead of materializing int8 weights every layer. SPARKINFER_Q38_PREFILL_QB=0 skips (A/B).
     {
         const char* e = getenv("SPARKINFER_Q38_PREFILL_QB");
         if (e && e[0] == '0') return true;
@@ -4649,8 +4815,11 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             place(lw.wk,     lw.wk_type,     &lw.wk_rs,    kd,    H);
             place(lw.wv,     lw.wv_type,     &lw.wv_rs,    kd,    H);
             place(lw.wo,     lw.wo_type,     &lw.wo_rs,    H,     qd);
-            // Layers 0-55 FFN stay on checkpoint NVFP4; only 56-63 are Q4_K in prefill.
-            if (ffn_is_fp8_layer(i)) {
+            // A row scale is only worth computing where prefill will actually read Q4_K. Keyed on
+            // whether the native NVFP4 operand got built rather than on a layer index: that is
+            // the condition prefill itself branches on, so the two cannot drift, and it covers
+            // the case where keep_nvfp4 declined a shape that prefill_nvfp4_supported rejected.
+            if (!lw.gate_fp4) {
                 place(lw.gate_q, lw.gate_qtype,  &lw.gate_rs,  ff, H);
                 place(lw.up_q,   lw.up_qtype,    &lw.up_rs,    ff, H);
                 place(lw.down_q, lw.down_qtype,  &lw.down_rs,  H,  ff);

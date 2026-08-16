@@ -759,6 +759,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_ct_dequant_fp8_packed(W, wbuf, n_out, K, st);
             return wbuf;
         }
+        if (wtype == kernels::SI_QTYPE_NVFP4) {
+            // Payload is [256 B header with the f32 global scale | ue4m3 group scales | packed
+            // nibbles]; the global scale lives on the device, so read it through the kernel's own
+            // pointer rather than copying it back to the host inside a prefill step.
+            const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
+            const size_t scale_bytes = (size_t)n_out * K / 16;
+            kernels::launch_ct_dequant_nvfp4_dev(
+                static_cast<const char*>(W) + hdr + scale_bytes,
+                static_cast<const char*>(W) + hdr,
+                static_cast<const float*>(W), wbuf, n_out, K, st);
+            return wbuf;
+        }
         kernels::launch_gguf_dequant(wtype, W, wbuf, (long)n_out * K, st);
         return wbuf;
     };
