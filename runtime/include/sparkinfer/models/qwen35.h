@@ -382,6 +382,18 @@ public:
     int dflash_hidden_row_stride() const;       // bf16 elems per row = n_capture * hidden
     int dflash_context_len() const;
 
+    // Final hidden state of the last forward_token, [hidden] bf16 on device. Feeds the Qwen3.8
+    // MTP head, whose fc takes [pre_fc_norm_embedding(emb) ; pre_fc_norm_hidden(hidden)].
+    //   pre_norm=true  -> x_final, the last layer's residual sum BEFORE final_norm. This is what
+    //                    MTP's own pre_fc_norm_hidden expects: the head is a parallel branch with
+    //                    its own norms, so feeding it the target's already-normed output would
+    //                    double-norm that branch. It is also the buffer DFlash captures from.
+    //   pre_norm=false -> RMSNorm(x_final, final_norm), the lm_head input.
+    // Both are exposed because which one the checkpoint was trained against is not decidable from
+    // the tensor shapes, and picking wrong degrades the acceptance rate without ever producing a
+    // visibly wrong token -- so it is settled by measuring argmax agreement, not by argument.
+    const void* final_hidden(bool pre_norm) const;
+
     // Snapshot hybrid recurrent state for speculative rollback.
     void save_spec_snapshot();
     void restore_spec_snapshot();

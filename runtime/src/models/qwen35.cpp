@@ -2744,6 +2744,13 @@ void Qwen35Model::dflash_stash_capture(int global_pos) {
     if (global_pos + 1 > s.dflash_ctx_len) s.dflash_ctx_len = global_pos + 1;
 }
 
+const void* Qwen35Model::final_hidden(bool pre_norm) const {
+    // s.x is the per-layer hidden buffer; after the last layer's launch_add_rmsnorm2 tail it holds
+    // out_sum = x_final (the residual sum, pre final_norm) while s.xn holds out_norm. DFlash's own
+    // launch_capture_row reads s.x for exactly this reason.
+    return pre_norm ? p_->x : p_->xn;
+}
+
 const void* Qwen35Model::dflash_hidden_buffer() const { return p_->dflash_hidden; }
 const void* Qwen35Model::dflash_context_buffer() const { return p_->dflash_context; }
 int Qwen35Model::dflash_hidden_row_stride() const {

@@ -70,6 +70,13 @@ if(BUILD_EXAMPLES)
     # qwen_checkpoint.h so a compressed-tensors directory can be generated from directly.
     target_link_libraries(qwen3_gguf_generate PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads
                           nlohmann_json::nlohmann_json)
+    # MTP wiring check: measures the head's argmax agreement against the target, which is the
+    # acceptance rate a greedy speculative loop would get. Needs nlohmann_json for the same reason
+    # as qwen3_gguf_bench below (qwen_checkpoint.h reads the HF config.json).
+    add_executable(qwen38_mtp_check examples/qwen38_mtp_check.cpp)
+    target_include_directories(qwen38_mtp_check PRIVATE include)
+    target_link_libraries(qwen38_mtp_check PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(qwen3_gguf_bench examples/qwen3_gguf_bench.cpp)
     target_include_directories(qwen3_gguf_bench PRIVATE include)
     # nlohmann_json: qwen_checkpoint.h reads an HF compressed-tensors (NVFP4) config.json via

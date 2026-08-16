@@ -228,7 +228,7 @@ void Qwen38MtpHead::crop(int keep) { if (keep >= 0 && keep < p_->kv_len) p_->kv_
 int  Qwen38MtpHead::seq_len() const { return p_->kv_len; }
 
 bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int pos,
-                            int* out_argmax, cudaStream_t stream) {
+                            int* out_argmax, cudaStream_t stream, bool swap_cat) {
     Impl& s = *p_;
     const Qwen38MtpConfig& c = s.cfg;
     if (!ready() || !s.rt_ready || !target_hidden || !out_argmax) return false;
@@ -245,11 +245,12 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     // disambiguate the halves: swapping them yields plausible-but-degraded proposals that show up
     // only as a poor acceptance rate, never as a crash. Pinned here, and checked empirically by
     // the argmax-agreement test rather than trusted.
+    void* emb_slot = swap_cat ? (void*)((char*)s.cat + (size_t)H * 2) : s.cat;
+    void* hid_slot = swap_cat ? s.cat : (void*)((char*)s.cat + (size_t)H * 2);
     cudaMemcpyAsync(s.d_token, &next_token_id, sizeof(int), cudaMemcpyHostToDevice, st);
-    kernels::launch_embedding(s.d_token, s.embed, s.cat, 1, H, st);
-    kernels::launch_rmsnorm(s.cat, s.pre_fc_norm_embedding, s.cat, 1, H, c.rms_eps, st);
-    kernels::launch_rmsnorm(target_hidden, s.pre_fc_norm_hidden,
-                            (char*)s.cat + (size_t)H * 2, 1, H, c.rms_eps, st);
+    kernels::launch_embedding(s.d_token, s.embed, emb_slot, 1, H, st);
+    kernels::launch_rmsnorm(emb_slot, s.pre_fc_norm_embedding, emb_slot, 1, H, c.rms_eps, st);
+    kernels::launch_rmsnorm(target_hidden, s.pre_fc_norm_hidden, hid_slot, 1, H, c.rms_eps, st);
     kernels::launch_gemv(s.cat, s.fc, s.x, H, 2 * H, st);
 
     // --- decoder layer 0: pre-attention norm, then gated attention ---

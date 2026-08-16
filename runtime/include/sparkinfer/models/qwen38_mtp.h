@@ -114,8 +114,12 @@ public:
     //   out_argmax    : host, [1]. The proposed token id.
     // Greedy only -- speculative decoding needs exact argmax determinism to stay lossless, the
     // same constraint dflash_generate documents.
+    //   swap_cat      : concatenate [hidden ; embedding] instead of the default
+    //                   [embedding ; hidden]. Diagnostic only -- fc is [hidden, 2*hidden] so the
+    //                   shape cannot say which half is which, and the wrong order yields a merely
+    //                   mediocre draft rather than a visible fault. qwen38_mtp_check measures both.
     bool forward(const void* target_hidden, int next_token_id, int pos,
-                 int* out_argmax, cudaStream_t stream = nullptr);
+                 int* out_argmax, cudaStream_t stream = nullptr, bool swap_cat = false);
 
     // Drop the draft's KV back to `keep` tokens after a rejected proposal. Without this the draft
     // desynchronises from the target on the first mismatch and every later proposal is scored
