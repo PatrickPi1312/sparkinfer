@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace sparkinfer {
@@ -144,27 +145,61 @@ bool Qwen38MtpHead::load(SafeTensorsModel& st) {
         return d;
     };
 
-    s.pre_fc_norm_embedding = bf16("mtp.pre_fc_norm_embedding.weight", H);
-    s.pre_fc_norm_hidden    = bf16("mtp.pre_fc_norm_hidden.weight",    H);
+    // Qwen3.8 stores RMSNorm weights ZERO-CENTRED: the effective weight is 1+w. The target's
+    // loader has load_norm_plus1 for exactly this and applies it to every norm including q_norm/
+    // k_norm/final_norm. Measured on this shard: pre_fc_norm_embedding averages -0.46 and is
+    // ENTIRELY negative, input_layernorm averages +0.04 -- neither is a scale factor.
+    //
+    // Uploading them raw is undetectable by differential checking: bench/scripts/mtp_recompute.py
+    // read the same raw bytes, so every stage matched at cos>=0.99999 while the head's actual
+    // predictions were meaningless. A comparison can only catch errors the two sides do not share.
+    auto norm_plus1 = [&](const char* name, long n_values) -> const void* {
+        const STTensor* t = st.tensor(name);
+        if (!t) { fprintf(stderr, "[mtp] missing %s\n", name); ok = false; return nullptr; }
+        if (t->dtype != STDType::BF16 || t->n_values != n_values) {
+            fprintf(stderr, "[mtp] %s: expected BF16[%ld], got dtype=%d n=%ld\n",
+                    name, n_values, (int)t->dtype, t->n_values);
+            ok = false; return nullptr;
+        }
+        std::vector<uint16_t> tr((size_t)n_values);
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(t->data);
+        for (long i = 0; i < n_values; i++) {
+            uint32_t bits = (uint32_t)src[i] << 16;
+            float f; memcpy(&f, &bits, sizeof f);
+            f = 1.0f + f;
+            memcpy(&bits, &f, sizeof bits);
+            tr[i] = (uint16_t)(bits >> 16);
+        }
+        void* d = nullptr;
+        const size_t nb = (size_t)n_values * 2;
+        if (cudaMalloc(&d, nb) != cudaSuccess) { fprintf(stderr, "[mtp] cudaMalloc %s\n", name); ok = false; return nullptr; }
+        cudaMemcpy(d, tr.data(), nb, cudaMemcpyHostToDevice);
+        s.owned.push_back(d);
+        s.bytes += nb;
+        return d;
+    };
+
+    s.pre_fc_norm_embedding = norm_plus1("mtp.pre_fc_norm_embedding.weight", H);
+    s.pre_fc_norm_hidden    = norm_plus1("mtp.pre_fc_norm_hidden.weight",  H);
     // fc consumes the CONCATENATION of the two normed branches, hence 2*hidden inputs.
     s.fc                    = bf16("mtp.fc.weight",                    H * 2 * H);
 
-    s.input_layernorm          = bf16("mtp.layers.0.input_layernorm.weight",          H);
-    s.post_attention_layernorm = bf16("mtp.layers.0.post_attention_layernorm.weight", H);
+    s.input_layernorm          = norm_plus1("mtp.layers.0.input_layernorm.weight",          H);
+    s.post_attention_layernorm = norm_plus1("mtp.layers.0.post_attention_layernorm.weight", H);
     // q_proj carries Q **and** the fused output gate: 2*qdim rows, not qdim. Asserting the doubled
     // width here is what pins trap #1 down at load time rather than at the first bad sample.
     s.wq = bf16("mtp.layers.0.self_attn.q_proj.weight", 2 * qdim * H);
     s.wk = bf16("mtp.layers.0.self_attn.k_proj.weight", kvdim * H);
     s.wv = bf16("mtp.layers.0.self_attn.v_proj.weight", kvdim * H);
     s.wo = bf16("mtp.layers.0.self_attn.o_proj.weight", H * qdim);
-    s.q_norm = bf16("mtp.layers.0.self_attn.q_norm.weight", c.head_dim);
-    s.k_norm = bf16("mtp.layers.0.self_attn.k_norm.weight", c.head_dim);
+    s.q_norm = norm_plus1("mtp.layers.0.self_attn.q_norm.weight", c.head_dim);
+    s.k_norm = norm_plus1("mtp.layers.0.self_attn.k_norm.weight", c.head_dim);
 
     s.gate_proj = bf16("mtp.layers.0.mlp.gate_proj.weight", (long)c.intermediate * H);
     s.up_proj   = bf16("mtp.layers.0.mlp.up_proj.weight",   (long)c.intermediate * H);
     s.down_proj = bf16("mtp.layers.0.mlp.down_proj.weight", H * c.intermediate);
 
-    s.norm = bf16("mtp.norm.weight", H);
+    s.norm = norm_plus1("mtp.norm.weight", H);
 
     if (!ok) {
         for (void* d : s.owned) cudaFree(d);

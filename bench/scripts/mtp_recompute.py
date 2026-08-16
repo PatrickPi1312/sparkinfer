@@ -44,8 +44,8 @@ def bf16_file(path, shape=None):
     return a.reshape(shape) if shape else a
 
 
-def rms_norm(x, w, eps):
-    return (x / np.sqrt((x.astype(np.float64) ** 2).mean() + eps)).astype(np.float32) * w
+def rms_norm(x, w, eps):   # w is ZERO-CENTRED: effective weight is 1+w
+    return (x / np.sqrt((x.astype(np.float64) ** 2).mean() + eps)).astype(np.float32) * (1.0 + w)
 
 
 def cmp(tag, mine, theirs):

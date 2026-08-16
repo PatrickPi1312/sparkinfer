@@ -83,8 +83,8 @@ def lm_head_rows(path, ids, hidden):
     return out
 
 
-def rms(x, w):
-    return (x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + EPS)).astype(np.float32) * w
+def rms(x, w):   # w is ZERO-CENTRED in this checkpoint: effective weight is 1+w
+    return (x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + EPS)).astype(np.float32) * (1.0 + w)
 
 
 W = load_bf16_shard(f"{ckpt}/model_mtp.safetensors")
