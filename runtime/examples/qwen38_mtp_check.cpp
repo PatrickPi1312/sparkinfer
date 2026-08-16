@@ -97,6 +97,25 @@ int main(int argc, char** argv) {
     mtp.set_shared_weights(model.embed_weights(), model.lm_head_weights(), model.lm_head_quant_type());
     if (!mtp.init_runtime(cfg.max_seq)) { printf("[FAIL] mtp init_runtime\n"); return 1; }
 
+    // SPARKINFER_MTP_DUMPSEQ=<dir>: write the target's hidden at EVERY position plus the token
+    // sequence, so a NumPy reference can run the MTP head over the whole sequence with full causal
+    // attention. That is the only way to test RoPE at pos>0 -- the pos=0 recomputation cannot,
+    // because position 0 is a no-op rotation under every convention.
+    const char* seqdir = getenv("SPARKINFER_MTP_DUMPSEQ");
+    FILE* fh = nullptr; FILE* ft = nullptr;
+    if (seqdir) {
+        char pb[512];
+        snprintf(pb, sizeof pb, "%s/hiddens.bin", seqdir); fh = fopen(pb, "wb");
+        snprintf(pb, sizeof pb, "%s/tokens.txt", seqdir);  ft = fopen(pb, "w");
+    }
+    auto dump_step = [&](const void* hid, int pos_, int tok_in, int tok_out) {
+        if (!fh || !ft) return;
+        std::vector<uint16_t> hb(cfg.hidden);
+        cudaMemcpy(hb.data(), hid, hb.size() * 2, cudaMemcpyDeviceToHost);
+        fwrite(hb.data(), 2, hb.size(), fh);
+        fprintf(ft, "%d %d %d\n", pos_, tok_in, tok_out);
+    };
+
     printf("wiring: hidden=%s  concat=%s\n",
            post_norm ? "POST-final-norm" : "pre-final-norm",
            swap_cat ? "[hidden;embedding]" : "[embedding;hidden]");
@@ -123,6 +142,7 @@ int main(int argc, char** argv) {
     int pos = 0;
     for (; pos + 1 < (int)prompt.size(); pos++) {
         if (model.forward_token(prompt[pos], pos, false) < 0) { printf("[FAIL] prefill\n"); return 1; }
+        dump_step(model.final_hidden(!post_norm), pos, prompt[pos], prompt[pos + 1]);
         int warm = -1;
         if (!mtp.forward(model.final_hidden(!post_norm), prompt[pos + 1], pos, &warm, nullptr, swap_cat)) {
             printf("[FAIL] mtp prefill at pos %d\n", pos);
@@ -161,6 +181,7 @@ int main(int argc, char** argv) {
                        lm_argmax, next, lm_argmax == next ? "MATCH" : "MISMATCH");
         }
 
+        dump_step(model.final_hidden(!post_norm), pos, tok, next);
         // Propose token pos+2 from (hidden at pos, embedding of the just-committed token).
         const void* h = model.final_hidden(!post_norm);
         // Is the hidden actually live? MTP proposing a pure function of the token id (same id ->
@@ -193,6 +214,8 @@ int main(int argc, char** argv) {
         pos++;
     }
 
+    if (fh) fclose(fh);
+    if (ft) fclose(ft);
     const double rate = total ? (double)agree / total : 0.0;
     printf("MTP_AGREE %d/%d = %.3f   (this is the acceptance rate a greedy spec loop would get)\n",
            agree, total, rate);
