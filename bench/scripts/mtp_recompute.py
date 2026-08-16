@@ -129,3 +129,34 @@ for name, g in (("per-head[0]=gate", gate_first_half), ("per-head[1]=gate", gate
     cmp(f"{name} sigmoid", sig, post)
     cmp(f"{name} silu", silu, post)
 print(f"\ngate stats: half0 mean={gate_first_half.mean():+.3f}  half1 mean={gate_second_half.mean():+.3f}")
+
+# ---- downstream of the gate -------------------------------------------------------------------
+# The dump above is pos=0, where attention is exactly checkable: one KV entry means softmax==1, so
+# the attention output must equal V itself (broadcast across each GQA group). That turns the whole
+# remaining chain -- attention, wo, FFN, final norm -- into a closed-form comparison.
+if meta["pos"] == 0:
+    n_kv = kvdim // 256
+    v = W["mtp.layers.0.self_attn.v_proj.weight"] @ normed          # [kvdim]
+    grp = n_heads // n_kv
+    v_bcast = np.repeat(v.reshape(n_kv, 256), grp, axis=0).ravel()  # [qdim]
+    print("\ndownstream (pos=0, softmax==1 so attn output == V):")
+    cmp("attn_pregate", v_bcast, pre)
+
+    gate = qg[:, 1, :].ravel()
+    gated = pre * (1.0 / (1.0 + np.exp(-gate.astype(np.float64))))
+    x_attn = W["mtp.layers.0.self_attn.o_proj.weight"] @ gated + x
+
+    n2 = rms_norm(x_attn.astype(np.float32),
+                  W["mtp.layers.0.post_attention_layernorm.weight"], eps)
+    g_ = W["mtp.layers.0.mlp.gate_proj.weight"] @ n2
+    u_ = W["mtp.layers.0.mlp.up_proj.weight"] @ n2
+    h_ = (g_ / (1.0 + np.exp(-g_.astype(np.float64)))) * u_          # SwiGLU
+    cmp("ffn_h", h_, bf16_file(f"{dump}/07_ffn_h.bin", (ffn,)))
+
+    x_ffn = W["mtp.layers.0.mlp.down_proj.weight"] @ h_ + x_attn
+    final = rms_norm(x_ffn.astype(np.float32), W["mtp.norm.weight"], eps)
+    cmp("prelm_normed", final, bf16_file(f"{dump}/08_prelm_normed.bin", (H,)))
+
+    lg = np.fromfile(f"{dump}/09_logits.bin", dtype=np.float32)
+    print(f"\nsparkinfer logits: argmax={int(lg.argmax())} max={lg.max():.3f} "
+          f"finite={np.isfinite(lg).all()}")
