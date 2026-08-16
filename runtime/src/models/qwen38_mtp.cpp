@@ -249,6 +249,20 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     const int kvdim = c.n_kv_heads * c.head_dim;
     cudaStream_t st = stream;
 
+    // SPARKINFER_MTP_DEBUG=1: sync + check after every launch so a fault names the kernel that
+    // caused it. Without this an illegal access surfaces at the next sync, which is wherever the
+    // caller happens to synchronise -- the first report was "[FAIL] mtp forward", which says only
+    // that something in this function went wrong, not what.
+    static const bool dbg = [] { const char* e = getenv("SPARKINFER_MTP_DEBUG"); return e && e[0] == '1'; }();
+    auto ck = [&](const char* tag) {
+        if (!dbg) return true;
+        cudaStreamSynchronize(st);
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { fprintf(stderr, "[mtp-dbg] FAULT at %s: %s\n", tag, cudaGetErrorString(e)); return false; }
+        fprintf(stderr, "[mtp-dbg] ok %s\n", tag);
+        return true;
+    };
+
     // --- fusion: x = fc([norm_e(embed[next]) ; norm_h(target_hidden)]) ---
     // Concat order is EMBEDDING first, hidden second -- sglang's qwen3_next_mtp.py does
     // fc(cat((input_embeds, hidden_states))). fc is [hidden, 2*hidden], so the shape cannot
@@ -259,9 +273,11 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     void* hid_slot = swap_cat ? s.cat : (void*)((char*)s.cat + (size_t)H * 2);
     cudaMemcpyAsync(s.d_token, &next_token_id, sizeof(int), cudaMemcpyHostToDevice, st);
     kernels::launch_embedding(s.d_token, s.embed, emb_slot, 1, H, st);
+    if (!ck("embedding")) return false;
     kernels::launch_rmsnorm(emb_slot, s.pre_fc_norm_embedding, emb_slot, 1, H, c.rms_eps, st);
     kernels::launch_rmsnorm(target_hidden, s.pre_fc_norm_hidden, hid_slot, 1, H, c.rms_eps, st);
     kernels::launch_gemv(s.cat, s.fc, s.x, H, 2 * H, st);
+    if (!ck("fc")) return false;
 
     // --- decoder layer 0: pre-attention norm, then gated attention ---
     cudaMemcpyAsync(s.resid, s.x, (size_t)H * 2, cudaMemcpyDeviceToDevice, st);
@@ -272,15 +288,18 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     kernels::launch_gemv(s.normed, s.wv, s.v, kvdim, H, st);
     // q_proj packs [q|gate] PER HEAD (2*qdim rows); split before anything touches Q.
     kernels::launch_qwen36_split_q_gate(s.qraw, s.q, s.qgate, c.n_q_heads, c.head_dim, st);
+    if (!ck("split_q_gate")) return false;
 
     kernels::launch_rmsnorm_qk(s.q, s.k, s.q_norm, s.k_norm,
                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+    if (!ck("rmsnorm_qk")) return false;
     // NeoX (split-half) RoPE, matching the target's own full-attention layers -- the "normal"
     // consecutive-pair variant is Muse Glimmer only (qwen35.cpp's rope branch).
     cudaMemcpyAsync(s.d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice, st);
     kernels::launch_rope_kv_append(s.q, s.k, s.v, s.k_pool, s.v_pool, s.d_block_table, s.d_pos,
                                    1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_theta,
                                    Impl::kBlock, s.max_blocks, st);
+    if (!ck("rope_kv_append")) return false;
 
     const int seq = pos + 1;
     cudaMemcpyAsync(s.d_seq_len, &seq, sizeof(int), cudaMemcpyHostToDevice, st);
@@ -290,9 +309,11 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
                                        1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                                        Impl::kBlock, s.max_blocks, s.n_splits, scale, st,
                                        /*out_q8=*/nullptr, /*seqlen=*/seq);
+    if (!ck("flash_decode_split")) return false;
     // SIGMOID, not silu -- despite text_config's output_gate_type: "swish". silu sign-flips this
     // (gate mean ~ -4.5); same trap as the target's full-attention layers.
     kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, qdim, st);
+    if (!ck("mul_sigmoid")) return false;
     kernels::launch_gemv(s.attn, s.wo, s.x, H, qdim, st);
     kernels::launch_prefill_add(s.x, s.resid, s.x, H, st);
 
@@ -302,6 +323,7 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     kernels::launch_gemv(s.normed, s.gate_proj, s.ffn_gate, c.intermediate, H, st);
     kernels::launch_gemv(s.normed, s.up_proj,   s.ffn_up,   c.intermediate, H, st);
     kernels::launch_prefill_swiglu(s.ffn_gate, s.ffn_up, s.ffn_gate, c.intermediate, st);
+    if (!ck("swiglu")) return false;
     kernels::launch_gemv(s.ffn_gate, s.down_proj, s.x, H, c.intermediate, st);
     kernels::launch_prefill_add(s.x, s.resid, s.x, H, st);
 
@@ -310,6 +332,7 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     if (s.lm_head_type == 0) kernels::launch_gemv_f32(s.normed, s.lm_head, s.logits, c.vocab, H, st);
     else kernels::launch_gemv_q_f32(s.normed, s.lm_head, s.lm_head_type, s.logits, c.vocab, H, st);
     kernels::launch_argmax(s.logits, s.d_argmax, 1, c.vocab, st);
+    if (!ck("argmax")) return false;
 
     cudaMemcpyAsync(out_argmax, s.d_argmax, sizeof(int), cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
