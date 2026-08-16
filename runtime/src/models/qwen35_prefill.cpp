@@ -2411,6 +2411,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             kernels::launch_add_rmsnorm2_q8_rows(h, routed, nn, x, xn, q81,
                                                  N, H, c.rms_eps, st);
             q81_src = xn; q81_k = H;
+            // capture(L) MUST still run: it is the last statement of the layer loop and it is what
+            // hands this layer's hidden state to the draft. An earlier revision of this branch used
+            // a bare `continue` and skipped it for every layer, so the draft was fed a stale capture
+            // buffer -- proposals became garbage (tau pinned at 1.0) and the emitted stream
+            // degenerated into one token repeated. Fall through instead of jumping.
+            capture(L);
             continue;
         }
 
