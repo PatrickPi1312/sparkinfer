@@ -72,6 +72,12 @@ struct Qwen38MtpHead::Impl {
     void *x = nullptr, *cat = nullptr, *normed = nullptr, *resid = nullptr;
     void *qraw = nullptr, *q = nullptr, *qgate = nullptr, *k = nullptr, *v = nullptr, *attn = nullptr;
     void *ffn_gate = nullptr, *ffn_up = nullptr;
+    // Flash-decode split scratch. The generic launch_flash_decode is NOT usable here: the target
+    // never calls it, and driving head_dim=256 through it faults (illegal memory access on the
+    // first MTP step). launch_flash_decode_split is the kernel the target's own full-attention
+    // layers use, and it requires these three fp32 partials.
+    float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
+    int   n_splits = 4;
     float* logits = nullptr;
     int*   d_argmax = nullptr;
     bool   rt_ready = false;
@@ -199,7 +205,11 @@ bool Qwen38MtpHead::init_runtime(int max_seq) {
     s.attn     = s.alloc((size_t)qdim * 2);
     s.ffn_gate = s.alloc((size_t)c.intermediate * 2);
     s.ffn_up   = s.alloc((size_t)c.intermediate * 2);
-    s.logits   = (float*)s.alloc((size_t)c.vocab * sizeof(float));
+    const size_t nparts = (size_t)c.n_q_heads * s.n_splits;
+    s.fa_m   = (float*)s.alloc(nparts * sizeof(float));
+    s.fa_l   = (float*)s.alloc(nparts * sizeof(float));
+    s.fa_acc = (float*)s.alloc(nparts * c.head_dim * sizeof(float));
+    s.logits = (float*)s.alloc((size_t)c.vocab * sizeof(float));
     s.d_block_table = (int*)s.alloc((size_t)s.max_blocks * sizeof(int));
     s.d_pos      = (int*)s.alloc(sizeof(int));
     s.d_seq_len  = (int*)s.alloc(sizeof(int));
@@ -275,9 +285,11 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     const int seq = pos + 1;
     cudaMemcpyAsync(s.d_seq_len, &seq, sizeof(int), cudaMemcpyHostToDevice, st);
     const float scale = 1.0f / std::sqrt((float)c.head_dim);
-    kernels::launch_flash_decode(s.q, s.k_pool, s.v_pool, s.d_block_table, s.d_seq_len, s.attn,
-                                 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                                 Impl::kBlock, s.max_blocks, scale, st);
+    kernels::launch_flash_decode_split(s.q, s.k_pool, s.v_pool, s.d_block_table, s.d_seq_len, s.attn,
+                                       s.fa_m, s.fa_l, s.fa_acc,
+                                       1, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                                       Impl::kBlock, s.max_blocks, s.n_splits, scale, st,
+                                       /*out_q8=*/nullptr, /*seqlen=*/seq);
     // SIGMOID, not silu -- despite text_config's output_gate_type: "swish". silu sign-flips this
     // (gate mean ~ -4.5); same trap as the target's full-attention layers.
     kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, qdim, st);
