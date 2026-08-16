@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 int main(int argc, char** argv) {
     if (argc < 5) {
@@ -100,6 +101,16 @@ int main(int argc, char** argv) {
 
     size_t n = std::min(ar.size(), spec.size()), same = 0;
     while (same < n && ar[same] == spec[same]) same++;
+    // A speculative path is lossless BY CONSTRUCTION -- every emitted token is a target argmax --
+    // so a mismatch at index 0 does not mean "poor acceptance", it means one of these two runs is
+    // not doing what it claims. Print both prefixes so the failing side is identifiable instead of
+    // inferred: if AR here disagrees with a fresh AR run, the reference teardown is at fault; if
+    // the speculative side is the odd one out, tokens are being committed unverified.
+    printf("  AR  [");
+    for (size_t i = 0; i < std::min<size_t>(8, ar.size()); i++) printf(" %d", ar[i]);
+    printf(" ]\n  SPEC[");
+    for (size_t i = 0; i < std::min<size_t>(8, spec.size()); i++) printf(" %d", spec[i]);
+    printf(" ]\n");
     printf("DSPARK tau=%.3f  steps=%d  tokens=%zu  decode_s=%.3f\n",
            stats.mean_accept, stats.steps, spec.size(), stats.decode_s);
     printf("DSPARK lossless=%s  matched %zu/%zu\n", same == n ? "YES" : "NO", same, n);
