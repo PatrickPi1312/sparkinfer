@@ -233,6 +233,21 @@ bool Qwen38MtpHead::init_runtime(int max_seq) {
     return true;
 }
 
+bool Qwen38MtpHead::lm_head_argmax(const void* hidden_bf16, int* out_argmax, cudaStream_t stream) {
+    Impl& s = *p_;
+    if (!ready() || !s.rt_ready || !hidden_bf16 || !out_argmax) return false;
+    cudaStream_t st = stream;
+    if (s.lm_head_type == 0)
+        kernels::launch_gemv_f32(hidden_bf16, s.lm_head, s.logits, s.cfg.vocab, s.cfg.hidden, st);
+    else
+        kernels::launch_gemv_q_f32(hidden_bf16, s.lm_head, s.lm_head_type, s.logits,
+                                   s.cfg.vocab, s.cfg.hidden, st);
+    kernels::launch_argmax(s.logits, s.d_argmax, 1, s.cfg.vocab, st);
+    cudaMemcpyAsync(out_argmax, s.d_argmax, sizeof(int), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 void Qwen38MtpHead::reset() { p_->kv_len = 0; }
 void Qwen38MtpHead::crop(int keep) { if (keep >= 0 && keep < p_->kv_len) p_->kv_len = keep; }
 int  Qwen38MtpHead::seq_len() const { return p_->kv_len; }

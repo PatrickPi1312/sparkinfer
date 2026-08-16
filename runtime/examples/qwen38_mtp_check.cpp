@@ -148,6 +148,19 @@ int main(int argc, char** argv) {
                        prev_proposal == next ? "HIT" : "");
         }
 
+        // lm_head isolation. Every MTP stage up to prelm_normed matches a NumPy recomputation from
+        // the checkpoint bytes, so if the head still disagrees with the target the fault is either
+        // the shared lm_head invocation or this harness's own semantics. Drive the SAME lm_head
+        // call MTP uses with the TARGET's post-final-norm hidden: the target just produced `next`
+        // from exactly that vector, so a correct call must reproduce it. A mismatch indicts the
+        // lm_head path; a match clears it and points at the t+1-vs-t+2 semantics instead.
+        if (getenv("SPARKINFER_MTP_LMCHECK") && total <= 4) {
+            int lm_argmax = -1;
+            if (mtp.lm_head_argmax(model.final_hidden(false), &lm_argmax))
+                printf("    lm_head(target_xn) -> %d   target committed %d   %s\n",
+                       lm_argmax, next, lm_argmax == next ? "MATCH" : "MISMATCH");
+        }
+
         // Propose token pos+2 from (hidden at pos, embedding of the just-committed token).
         const void* h = model.final_hidden(!post_norm);
         // Is the hidden actually live? MTP proposing a pure function of the token id (same id ->

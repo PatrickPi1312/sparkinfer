@@ -124,6 +124,11 @@ public:
     // Drop the draft's KV back to `keep` tokens after a rejected proposal. Without this the draft
     // desynchronises from the target on the first mismatch and every later proposal is scored
     // against a history the target never had.
+    // Diagnostic: run ONLY the shared lm_head (no mtp.norm) on a caller-supplied [hidden] bf16
+    // vector and return its greedy argmax. Lets the lm_head invocation be tested against the
+    // target's own hidden, isolating it from the rest of the head.
+    bool lm_head_argmax(const void* hidden_bf16, int* out_argmax, cudaStream_t stream = nullptr);
+
     void crop(int keep);
     void reset();
     int  seq_len() const;
