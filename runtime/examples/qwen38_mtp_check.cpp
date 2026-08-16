@@ -122,7 +122,15 @@ int main(int argc, char** argv) {
         if (next < 0) { printf("[FAIL] target forward at pos %d\n", pos); return 1; }
 
         // Score the PREVIOUS step's proposal: it predicted this position's token.
-        if (prev_proposal >= 0) { total++; if (prev_proposal == next) agree++; }
+        if (prev_proposal >= 0) {
+            total++;
+            if (prev_proposal == next) agree++;
+            // A degenerate head (same id every step, or an id outside the vocab) is a different
+            // failure from a merely inaccurate one, and the aggregate rate cannot tell them apart.
+            if (getenv("SPARKINFER_MTP_DEBUG") && total <= 12)
+                printf("  step %2d: target=%-7d mtp=%-7d %s\n", total, next, prev_proposal,
+                       prev_proposal == next ? "HIT" : "");
+        }
 
         // Propose token pos+2 from (hidden at pos, embedding of the just-committed token).
         const void* h = model.final_hidden(!post_norm);
