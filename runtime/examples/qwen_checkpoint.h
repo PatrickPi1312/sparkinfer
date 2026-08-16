@@ -7,8 +7,11 @@
 //   *.gguf                     -> config from GGUF metadata      -> Qwen35Model::load_gguf
 //   dir with quantization_config in config.json
 //                              -> config from HF config.json     -> load_compressed_tensors
-//                                 (HuggingFace "compressed-tensors" mixed FP8/NVFP4, e.g.
-//                                  unsloth/Qwen3.8-27B-NVFP4)
+//                                 (an HF quantized checkout; the loader routes each tensor by
+//                                  the bytes present, so this covers both llm-compressor's
+//                                  "compressed-tensors" mixed FP8/NVFP4 -- e.g.
+//                                  unsloth/Qwen3.8-27B-NVFP4 -- and NVIDIA ModelOpt's uniform
+//                                  NVFP4 -- e.g. gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)
 //   dir with a legacy config.txt
 //                              -> flat key=value + .bin blobs    -> load_weights
 //                                 (runtime/tools/convert_qwen35.py output)
@@ -105,7 +108,7 @@ inline bool qwen_checkpoint_load(sparkinfer::Qwen35Model& model,
 inline const char* qwen_checkpoint_kind_label(QwenCheckpointKind kind) {
     switch (kind) {
         case QwenCheckpointKind::Gguf:              return "native GGUF, experts quantized";
-        case QwenCheckpointKind::CompressedTensors: return "compressed-tensors NVFP4/FP8";
+        case QwenCheckpointKind::CompressedTensors: return "HF quantized (NVFP4/FP8)";
         case QwenCheckpointKind::LegacyWeightDir:   return "bf16";
     }
     return "?";

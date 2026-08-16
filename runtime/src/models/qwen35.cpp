@@ -4642,12 +4642,25 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     // Checkpoint NVFP4 kept native for decode (SI_QTYPE_NVFP4 -> launch_gemv_nvfp4). This is
     // keep_fp8's policy above, carried across the format change: the ModelOpt checkpoint stores
     // the GDN projections as NVFP4 where compressed-tensors stored them as FP8, and requantizing
-    // an already-4-bit weight lands its values between Q4_K's own grid points -- adding a second
-    // helping of quantization noise on 48 of 64 layers, in a format whose whole premise is that
-    // 4 bits are already as coarse as the model tolerates. (The FFN below still takes a Q4_K
-    // decode copy: there the NVFP4 payload stays resident anyway for batched prefill, so the copy
-    // buys decode speed rather than costing accuracy for nothing.)
-    // SPARKINFER_Q38_GDN_NVFP4=0 requantizes to Q4_K instead, for A/B.
+    // an already-4-bit weight lands its values between Q4_K's own grid points, on 48 of 64 layers.
+    //
+    // Measured both ways on the RTX 5090 box -- 101 teacher-forced positions of eval_text.txt,
+    // scored against the same independent reference (the llama.cpp-derived Qwen3.8-27B-Q4_K_M
+    // GGUF of this model), and benched on the same build:
+    //
+    //                     top1     KL      PPL  | decode@128  decode@16k  prefill@16k   VRAM
+    //   GDN native NVFP4  0.851   0.247   3.235 |  78.4 t/s    67.3 t/s    9894 t/s   29.3 GB
+    //   GDN -> Q4_K       0.822   0.300   3.352 |  96.7 t/s    80.3 t/s    9977 t/s   29.3 GB
+    //
+    // The requant buys 19-23% decode and costs real accuracy -- and costs it for nothing in VRAM,
+    // because Q4_K (144 B per 256 weights) and this NVFP4 payload (4 bits plus one UE4M3 per 16)
+    // are both exactly 4.5 bits per weight. Comparing the two dumps against each other isolates
+    // the choice from the rest of the pipeline: KL 0.050 nats, with 8% of positions changing
+    // their argmax purely from the second quantization. Native is the default because it is the
+    // only one of the two that is free, and because accuracy at 4 bits is this checkpoint's
+    // entire proposition. (The FFN below still takes a Q4_K decode copy: there the NVFP4 payload
+    // stays resident anyway for batched prefill, so the copy costs no VRAM either.)
+    // SPARKINFER_Q38_GDN_NVFP4=0 takes the speed end of that trade instead.
     static const bool gdn_keep_nvfp4 = [] {
         const char* e = getenv("SPARKINFER_Q38_GDN_NVFP4");
         return !(e && e[0] == '0');
