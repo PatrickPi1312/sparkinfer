@@ -3225,6 +3225,22 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             }
         }
         if (vfail) { fprintf(stderr, "[dflash] verify failed at start=%d\n", start); break; }
+        // SPARKINFER_DFLASH_TRACE=1: per-step loop state. Eight hypotheses about this loop were
+        // wrong when inferred from the emitted stream alone; the emitted token is block[0], which
+        // is two assignments removed from what the target actually returned, so the output cannot
+        // distinguish "target repeated itself" from "block[0] never advanced".
+        static const bool trace = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_TRACE");
+            return e && e[0] == '1';
+        }();
+        if (trace && step_no < 6) {
+            fprintf(stderr, "[trace] step=%d start=%d compact=%d block0=%d p0=%d post0=%d "
+                            "keep=%d accept=%d draft=[%d %d %d]\n",
+                    step_no, start, (int)compact_verify, block[0], p0, posterior[0], keep, accept,
+                    kProposalDepth >= 1 ? draft_ids[1] : -1,
+                    kProposalDepth >= 2 ? draft_ids[2] : -1,
+                    kProposalDepth >= 3 ? draft_ids[3] : -1);
+        }
         // Climb on a full-block accept, decay on anything less. The old rule latched the score at
         // the engage threshold for any partial accept of >= 2 tokens, which kept the batched path
         // armed through low-acceptance stretches -- precisely where it costs throughput. Decaying
