@@ -3182,23 +3182,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             p0 = forward_token(block[0], start, true);
             s.defer_decode_sync = false;
         }
-        // Run the draft on a DEDICATED stream, not the NULL stream.
-        //
-        // forward_block ends in cudaStreamSynchronize to read its argmax back to the host. Passed
-        // nullptr it runs on the LEGACY DEFAULT stream, which implicitly joins any capture in
-        // progress on other blocking streams -- so the moment the target has a graph capture open
-        // (the deferred verify-token-0 path, or the batched verifier), that readback sync becomes
-        // "operation not permitted when stream is capturing" and poisons the capture. Every
-        // subsequent op on that stream then fails, which is how this surfaced: a stream of one
-        // repeated token rather than an error at the point of the violation.
-        //
-        // stream_v is an existing side stream and is never captured. The event orders the draft
-        // after the target work that produced draft_hidden; the draft's own sync then only ever
-        // waits on stream_v.
-        cu(cudaEventRecord(s.ev_pipe_fork, s.stream), "draft fork record");
-        cu(cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0), "draft fork wait");
         const bool draft_ok = draft.forward_block(
-            draft_hidden, th_len, block.data(), start, draft_ids.data(), s.stream_v, kProposalDepth);
+            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth);
         if (!compact_verify && p0 == kDFlashDeferred) {
             cu(cudaStreamSynchronize(s.stream), "verify0 sync");
             s.decode_pending = false;
