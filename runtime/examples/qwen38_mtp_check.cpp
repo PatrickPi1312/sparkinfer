@@ -243,7 +243,7 @@ int main(int argc, char** argv) {
     // dflash_verify_short_run is the throughput step; this proves the loop is lossless first.
     if (const char* sp = getenv("SPARKINFER_MTP_SPEC")) {
         const int want = atoi(sp);
-        kv.free(0); model.release_prefix_session(); model.invalidate_decode_graph(); mtp.reset();
+        kv.free(0); model.release_prefix_session(); mtp.reset();
         if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv realloc\n"); return 1; }
         std::vector<int> ar, spec;
         // reference: plain AR greedy
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
         t2 = prompt.back();
         for (int i = 0; i < want; i++) { int nx = model.forward_token(t2, p2, true); ar.push_back(nx); t2 = nx; p2++; }
 
-        kv.free(0); model.release_prefix_session(); model.invalidate_decode_graph(); mtp.reset();
+        kv.free(0); model.release_prefix_session(); mtp.reset();
         if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv realloc 2\n"); return 1; }
         int p3 = 0;
         for (; p3 + 1 < (int)prompt.size(); p3++) {
