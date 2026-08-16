@@ -254,6 +254,26 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     // caller happens to synchronise -- the first report was "[FAIL] mtp forward", which says only
     // that something in this function went wrong, not what.
     static const bool dbg = [] { const char* e = getenv("SPARKINFER_MTP_DEBUG"); return e && e[0] == '1'; }();
+
+    // SPARKINFER_MTP_DUMP=<dir>: write every intermediate of the FIRST forward to <dir>/<tag>.bin,
+    // together with the input that produced them. A NumPy recomputation from the checkpoint bytes,
+    // SEEDED WITH THIS EXACT INPUT, then names the first stage that diverges. Seeding matters: it
+    // separates "my weights/maths are wrong" from "my input is wrong", which is the distinction
+    // that cracked the target's transpose and sigmoid-gate bugs. Black-box agreement sweeps cannot
+    // make it -- every remaining suspect here (gate, RoPE, fa scratch, fc operand layout, lm_head
+    // path) produces structured, confidently wrong logits and looks identical from outside.
+    static const char* dump_dir = getenv("SPARKINFER_MTP_DUMP");
+    static bool dumped = false;
+    const bool do_dump = dump_dir && !dumped;
+    auto dump = [&](const char* tag, const void* dev, size_t nbytes) {
+        if (!do_dump) return;
+        std::vector<char> host(nbytes);
+        cudaStreamSynchronize(st);
+        if (cudaMemcpy(host.data(), dev, nbytes, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+        char pathbuf[512];
+        snprintf(pathbuf, sizeof pathbuf, "%s/%s.bin", dump_dir, tag);
+        if (FILE* f = fopen(pathbuf, "wb")) { fwrite(host.data(), 1, nbytes, f); fclose(f); }
+    };
     auto ck = [&](const char* tag) {
         if (!dbg) return true;
         cudaStreamSynchronize(st);
@@ -274,10 +294,13 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     cudaMemcpyAsync(s.d_token, &next_token_id, sizeof(int), cudaMemcpyHostToDevice, st);
     kernels::launch_embedding(s.d_token, s.embed, emb_slot, 1, H, st);
     if (!ck("embedding")) return false;
+    dump("00_in_hidden", target_hidden, (size_t)H * 2);
     kernels::launch_rmsnorm(emb_slot, s.pre_fc_norm_embedding, emb_slot, 1, H, c.rms_eps, st);
     kernels::launch_rmsnorm(target_hidden, s.pre_fc_norm_hidden, hid_slot, 1, H, c.rms_eps, st);
     kernels::launch_gemv(s.cat, s.fc, s.x, H, 2 * H, st);
     if (!ck("fc")) return false;
+    dump("01_cat", s.cat, (size_t)H * 2 * 2);
+    dump("02_x_fc", s.x, (size_t)H * 2);
 
     // --- decoder layer 0: pre-attention norm, then gated attention ---
     cudaMemcpyAsync(s.resid, s.x, (size_t)H * 2, cudaMemcpyDeviceToDevice, st);
@@ -289,6 +312,8 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     // q_proj packs [q|gate] PER HEAD (2*qdim rows); split before anything touches Q.
     kernels::launch_qwen36_split_q_gate(s.qraw, s.q, s.qgate, c.n_q_heads, c.head_dim, st);
     if (!ck("split_q_gate")) return false;
+    dump("03_normed_in", s.normed, (size_t)H * 2);
+    dump("04_qraw", s.qraw, (size_t)qdim * 2 * 2);
 
     kernels::launch_rmsnorm_qk(s.q, s.k, s.q_norm, s.k_norm,
                                c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
@@ -310,10 +335,12 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
                                        Impl::kBlock, s.max_blocks, s.n_splits, scale, st,
                                        /*out_q8=*/nullptr, /*seqlen=*/seq);
     if (!ck("flash_decode_split")) return false;
+    dump("05_attn_pregate", s.attn, (size_t)qdim * 2);
     // SIGMOID, not silu -- despite text_config's output_gate_type: "swish". silu sign-flips this
     // (gate mean ~ -4.5); same trap as the target's full-attention layers.
     kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, qdim, st);
     if (!ck("mul_sigmoid")) return false;
+    dump("06_attn_postgate", s.attn, (size_t)qdim * 2);
     kernels::launch_gemv(s.attn, s.wo, s.x, H, qdim, st);
     kernels::launch_prefill_add(s.x, s.resid, s.x, H, st);
 
@@ -324,6 +351,7 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     kernels::launch_gemv(s.normed, s.up_proj,   s.ffn_up,   c.intermediate, H, st);
     kernels::launch_prefill_swiglu(s.ffn_gate, s.ffn_up, s.ffn_gate, c.intermediate, st);
     if (!ck("swiglu")) return false;
+    dump("07_ffn_h", s.ffn_gate, (size_t)c.intermediate * 2);
     kernels::launch_gemv(s.ffn_gate, s.down_proj, s.x, H, c.intermediate, st);
     kernels::launch_prefill_add(s.x, s.resid, s.x, H, st);
 
@@ -333,7 +361,18 @@ bool Qwen38MtpHead::forward(const void* target_hidden, int next_token_id, int po
     else kernels::launch_gemv_q_f32(s.normed, s.lm_head, s.lm_head_type, s.logits, c.vocab, H, st);
     kernels::launch_argmax(s.logits, s.d_argmax, 1, c.vocab, st);
     if (!ck("argmax")) return false;
+    dump("08_prelm_normed", s.normed, (size_t)H * 2);
+    dump("09_logits", s.logits, (size_t)c.vocab * 4);
 
+    if (do_dump) {
+        char pb[512]; snprintf(pb, sizeof pb, "%s/meta.txt", dump_dir);
+        if (FILE* f = fopen(pb, "w")) {
+            fprintf(f, "next_token_id %d\npos %d\nhidden %d\nqdim %d\nkvdim %d\nffn %d\nvocab %d\nswap_cat %d\n",
+                    next_token_id, pos, H, qdim, kvdim, c.intermediate, c.vocab, swap_cat ? 1 : 0);
+            fclose(f);
+        }
+        dumped = true;
+    }
     cudaMemcpyAsync(out_argmax, s.d_argmax, sizeof(int), cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
     if (pos + 1 > s.kv_len) s.kv_len = pos + 1;
