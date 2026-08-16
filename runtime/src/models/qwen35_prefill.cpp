@@ -2007,14 +2007,27 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only) {
     const Qwen35Config& c = s.cfg;
-    if (!token_ids || !out_argmax || n < 1 || n > 8 || !s.gguf || !c.hybrid || c.dense_ffn) {
-        fprintf(stderr, "[dflash-verify] base unsupported n=%d gguf=%d hybrid=%d dense=%d\n",
-                n, (int)s.gguf, (int)c.hybrid, (int)c.dense_ffn);
+    // dense_ffn (Qwen3.8-27B) is accepted alongside the 256-expert MoE (Qwen3.6-35B-A3B) it was
+    // written for. A dense SwiGLU is an MoE with ONE expert: AR decode already routes it through
+    // launch_moe_expert_ffn_q4k with a constant expert id 0 and weight 1.0 (qwen35.cpp's
+    // c.dense_ffn branch, and the mf_ids/mf_weights seeding at model construction), so the
+    // verifier's FFN stage needs the router skipped and those constants supplied -- not a separate
+    // dense implementation.
+    //
+    // This is a CORRECTNESS prerequisite, not a throughput one: with these guards rejecting the
+    // model, dflash_generate falls back to a token-loop path that is not lossless here (it emits
+    // unverified draft tokens -- observed echoing the prompt back), so DSpark cannot work at all
+    // until this branch exists.
+    const bool dense = c.dense_ffn;
+    if (!token_ids || !out_argmax || n < 1 || n > 8 || !s.gguf || !c.hybrid) {
+        fprintf(stderr, "[dflash-verify] base unsupported n=%d gguf=%d hybrid=%d\n",
+                n, (int)s.gguf, (int)c.hybrid);
         return -1;
     }
-    if (c.head_dim != 256 || c.linear_head_dim != 128 || c.n_experts != 256 || c.top_k <= 0) {
-        fprintf(stderr, "[dflash-verify] shape unsupported hd=%d lhd=%d experts=%d topk=%d\n",
-                c.head_dim, c.linear_head_dim, c.n_experts, c.top_k);
+    if (c.head_dim != 256 || c.linear_head_dim != 128 || c.top_k <= 0 ||
+        (!dense && c.n_experts != 256)) {
+        fprintf(stderr, "[dflash-verify] shape unsupported hd=%d lhd=%d experts=%d topk=%d dense=%d\n",
+                c.head_dim, c.linear_head_dim, c.n_experts, c.top_k, (int)dense);
         return -1;
     }
     const int H = c.hidden, N = n, qdim = s.qdim, kvdim = s.kvdim;
@@ -2361,6 +2374,31 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         kernels::launch_add_rmsnorm2_q8_rows(x, ao, w.post_attn_norm, h, hn, q81,
                                              N, H, c.rms_eps, st);
         q81_src = hn; q81_k = H;
+
+        // Dense FFN: one expert, no router, no shared expert. Seed ids/weights with the same
+        // constants AR uses (expert 0, weight 1.0) and run the identical expert kernel at N rows,
+        // then skip straight past the MoE routing/shared machinery below.
+        if (dense) {
+            if (!w.gate_q || !w.up_q || !w.down_q) {
+                fprintf(stderr, "[dflash-verify] dense layer=%d missing gate/up/down\n", L);
+                supported = false; break;
+            }
+            pf_cu(cudaMemsetAsync(expert_ids, 0, (size_t)N * topk * sizeof(int), st),
+                  "dense expert ids");
+            std::vector<float> ones((size_t)N * topk, 1.0f);
+            pf_cu(cudaMemcpyAsync(expert_w, ones.data(), ones.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice, st), "dense expert w");
+            kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
+                                               w.gate_qtype, w.up_qtype, w.down_qtype,
+                                               expert_ids, expert_w, routed, moe_h, moe_out,
+                                               N, topk, H, ffn, q81, st);
+            // Residual + next-layer norm, matching the MoE branch's tail.
+            const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+            kernels::launch_add_rmsnorm2_q8_rows(h, routed, nn, x, xn, q81,
+                                                 N, H, c.rms_eps, st);
+            q81_src = xn; q81_k = H;
+            continue;
+        }
 
         if (!w.gate_q || !w.router_w ||
             !w.shared_gate_q || !w.shared_up_q || !w.shared_down_q ||
