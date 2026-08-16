@@ -179,7 +179,12 @@ int main(int argc, char** argv) {
                    sqrt(acc), nz, (int)probe.size(), probe[0], probe[1], probe[2], probe[3]);
         }
         int proposal = -1;
-        if (!mtp.forward(h, next, pos, &proposal, nullptr, swap_cat)) {
+        // MTP fuses h_pos with emb(t_{pos+1}) to predict t_{pos+2}, so the fused vector arguably
+        // sits at position pos+1, not pos. RoPE phase is the one remaining un-verified input:
+        // everything downstream matches NumPy exactly, and a wrong phase yields well-formed,
+        // confidently wrong logits -- the signature actually observed.
+        static const int pos_off = [] { const char* e = getenv("SPARKINFER_MTP_POS_OFFSET"); return e ? atoi(e) : 0; }();
+        if (!mtp.forward(h, next, pos + pos_off, &proposal, nullptr, swap_cat)) {
             printf("[FAIL] mtp forward at pos %d\n", pos);
             return 1;
         }
