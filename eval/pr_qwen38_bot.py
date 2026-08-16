@@ -141,6 +141,10 @@ MODEL_WEIGHT_FILE = os.environ.get("QWEN38_MODEL_WEIGHT_FILE",
                                    os.path.join(MODEL_DIR, "model.safetensors"))
 BENCH_TOKENS = int(os.environ.get("QWEN38_BENCH_TOKENS", "128"))
 ACC_TOPK = int(os.environ.get("QWEN38_ACC_TOPK", "128"))
+# Batched-prefill parity floor: the fraction of the continuation that batched prefill must still
+# generate identically to the token loop. Absolute, not PR-vs-main -- see the PREFILL_PARITY block
+# in the remote script for why a differential gate cannot catch this class of bug.
+PARITY_BAR = float(os.environ.get("QWEN38_PARITY_BAR", "0.75"))
 # Score dumps for the differential accuracy gate. main's is written once per round by
 # measure_main_baseline(); each PR compares its own dump against it. Kept on the box (not shipped
 # back over ssh) because a 128-deep top-k dump over the whole corpus is megabytes.
@@ -476,6 +480,7 @@ def _remote_script(ref: str, role: str = "pr") -> str:
     ref_q = shlex.quote(ref)
     ntok = BENCH_TOKENS
     topk = ACC_TOPK
+    parity_bar = PARITY_BAR
     eval_text = shlex.quote(EVAL_TEXT)
     dump_self = shlex.quote(SCORE_DUMP_MAIN if role == "main" else SCORE_DUMP_PR)
     dump_main = shlex.quote(SCORE_DUMP_MAIN)
@@ -520,6 +525,7 @@ REPO={repo}
 MODEL_DIR={model_dir}
 NTOK={ntok}
 TOPK={topk}
+PARITY_BAR={parity_bar}
 EVAL_TEXT={eval_text}
 DUMP_SELF={dump_self}
 DUMP_MAIN={dump_main}
@@ -546,7 +552,7 @@ test -f "$MODEL_DIR/config.json" || {{ echo "FAIL $MODEL_DIR has no config.json"
 # underneath it (the sibling bots hit exactly this, #693/#694).
 mkdir -p build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/q38_cmake.log 2>&1
-cmake --build build --target qwen3_gguf_bench qwen3_gguf_score -j"$(nproc)" >/tmp/q38_build.log 2>&1 || {{
+cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_generate -j"$(nproc)" >/tmp/q38_build.log 2>&1 || {{
   echo "BUILD_FAILED -- tail of /tmp/q38_build.log:" >&2
   tail -80 /tmp/q38_build.log >&2
   exit 1
@@ -638,6 +644,26 @@ build/runtime/qwen3_gguf_score "$MODEL_DIR" "$TOPK" $IDS > "$DUMP_SELF" 2>/tmp/q
 }}
 echo "ACCURACY_STAGE_DONE"
 
+# --- batched-prefill parity (see bench/scripts/prefill_parity_check.py) ---
+# The accuracy gate above CANNOT see batched prefill: qwen3_gguf_score teacher-forces through
+# forward_token() and never enters prefill_batched_run(), while bench_sweep_run right above it
+# reports prefill@128 and prefill@16k measured on exactly that path. That blind spot let the FP4
+# FFN arm drop the entire FFN contribution from the residual stream from #837 until 2026-08-16 --
+# twelve perf PRs, all green, all scored against a wrong state. Throughput is what selected for
+# the bug, so throughput alone must not be able to pass a prefill PR again.
+#
+# Absolute, not differential: unlike the top1/KL gate this compares batched prefill against the
+# TOKEN LOOP in the same build, so it catches a defect already present on main rather than only a
+# newly introduced divergence. A run where main is equally broken must still fail.
+wait_gpu_clear
+if PARITY_BAR="$PARITY_BAR" python3 bench/scripts/prefill_parity_check.py \
+     "$MODEL_DIR" "$MODEL_DIR/tokenizer.json" 32,128 > /tmp/q38_parity.txt 2>&1; then
+  echo "PREFILL_PARITY_OK"
+else
+  echo "PREFILL_PARITY_FAILED" >&2
+fi
+grep -E "^PARITY|^n=" /tmp/q38_parity.txt || tail -20 /tmp/q38_parity.txt
+
 if [ "$IS_PR" = "1" ]; then
   if [ -s "$DUMP_MAIN" ]; then
     python3 bench/scripts/accuracy_compare_pair.py "$DUMP_SELF" "$DUMP_MAIN" || true
@@ -688,6 +714,15 @@ def _parse_remote(stdout: str) -> dict:
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
+        elif line.startswith("PREFILL_PARITY_OK"):
+            out["parity_ok"] = True
+        elif line.startswith("PREFILL_PARITY_FAILED"):
+            out["parity_ok"] = False
+        elif line.startswith("PARITY worst="):
+            try:
+                out["parity_worst"] = float(line.split("worst=")[1].split()[0])
+            except (ValueError, IndexError):
+                pass
         elif line.startswith("RESULT_DECODE128_TPS "):
             try:
                 out["decode128_tps"] = float(line.split()[1])
@@ -990,6 +1025,27 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         acc_reason = (f"accuracy gate failed vs main: top1={pr_top1:.4f} (bar >={ACC_TOP1_BAR}) "
                       f"kl={pr_kl:.5f} (bar <={ACC_KL_BAR})")
         reason = f"{acc_reason} | speed: {speed_reason}"
+        label = "REJECT"
+        passed = False
+
+    # Batched-prefill parity. ABSOLUTE, not differential: it compares batched prefill against the
+    # token loop inside the PR's own build, so unlike the accuracy gate above it fails a run whose
+    # defect is already present on main. That is the whole point -- the FP4 FFN arm dropped the
+    # entire FFN contribution from the residual stream from #837 to 2026-08-16 and every one of the
+    # twelve PRs in between passed, because qwen3_gguf_score never enters prefill_batched_run()
+    # while bench_sweep_run measures prefill on exactly that path.
+    #
+    # Missing => fail, matching check_q36_guard's fail-closed handling of an absent measurement: a
+    # parity result that did not run is not evidence that prefill is sound, and treating it as a
+    # pass would restore the blind spot this gate exists to close.
+    parity_ok = pr.get("parity_ok")
+    if parity_ok is not True:
+        pw = pr.get("parity_worst")
+        par_reason = ("batched-prefill parity failed (bar >=%.2f%s): batched prefill does not "
+                      "reproduce the token loop" % (
+                          PARITY_BAR,
+                          ", worst=%.3f" % pw if isinstance(pw, float) else ", not measured"))
+        reason = f"{par_reason} | {reason}"
         label = "REJECT"
         passed = False
 
