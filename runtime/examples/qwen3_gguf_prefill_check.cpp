@@ -7,7 +7,20 @@
 //   BATCHED : prefill_batched() over the prompt
 // Reports top-1 agreement and mean KL(token || batched) over the continuation positions.
 //
-// Usage: qwen3_gguf_prefill_check <model.gguf> [prefix_len=4096] [cont_len=16]
+// Usage: qwen3_gguf_prefill_check <model.gguf|checkpoint_dir> [prefix_len=4096] [cont_len=16]
+//                                 [id0 id1 ...]
+//
+// Pass REAL token ids to make the comparison sharp. With none given this falls back to the
+// synthetic `100 + (i % 20000)` prompt it has always used, which is not text: the logits it
+// produces are near-uniform, so argmax flips on ordinary numerical noise and this harness reports
+// 0.6-0.9 top-1 at EVERY length, including lengths where the path is provably exact. That noise
+// floor is wide enough to hide a real defect, so treat a synthetic-prompt run as a smoke test
+// only. With real ids the distribution is peaked and disagreement means something.
+//
+// Comparing LOGITS rather than generated text is the point of this harness: greedy generation
+// cascades from a single differing seed token, so two states that agree almost everywhere can
+// produce completely different-looking text. Teacher-forcing the same continuation through both
+// states measures the states themselves.
 
 #include "sparkinfer/runtime.h"
 #include "sparkinfer/kv_cache.h"
@@ -15,6 +28,7 @@
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
 #include "qwen3_gguf_config.h"
+#include "qwen_checkpoint.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -50,13 +64,24 @@ int main(int argc, char** argv) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
     const std::string path = argv[1];
-    const int P = argc > 2 ? atoi(argv[2]) : 4096;
+    int P = argc > 2 ? atoi(argv[2]) : 4096;
     const int C = argc > 3 ? atoi(argv[3]) : 16;
+    std::vector<int> real_ids;
+    for (int i = 4; i < argc; i++) real_ids.push_back(atoi(argv[i]));
+    // Real ids supply the prompt AND the teacher-forced continuation, so P+C of them are needed.
+    if (!real_ids.empty() && (int)real_ids.size() < P + C) {
+        printf("[FAIL] need >= P+C = %d real ids, got %zu\n", P + C, real_ids.size());
+        return 2;
+    }
 
     sparkinfer::GGUF g;
-    if (!g.open(path)) { printf("[FAIL] open %s\n", path.c_str()); return 1; }
     sparkinfer::Qwen35Config cfg;
-    qwen3_config_from_gguf(g, cfg);
+    QwenCheckpointKind kind{};
+    std::string open_err;
+    if (!qwen_checkpoint_open(path, cfg, g, kind, open_err)) {
+        printf("[FAIL] %s\n", open_err.c_str());
+        return 1;
+    }
     cfg.max_seq = P + C + 16;
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
@@ -75,11 +100,12 @@ int main(int argc, char** argv) {
     mc.ffn_dim = cfg.moe_ffn; mc.num_layers = cfg.n_layers;
     auto engine = sparkinfer::moe::MoEEngine::create(mc);
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
-    if (!model.load_gguf(path)) { printf("[FAIL] load_gguf\n"); return 1; }
+    if (!qwen_checkpoint_load(model, path, kind)) { printf("[FAIL] load\n"); return 1; }
 
     std::vector<int> prompt(P), cont(C);
-    for (int i = 0; i < P; i++) prompt[i] = 100 + (i % 20000);
-    for (int j = 0; j < C; j++) cont[j] = 100 + ((P + j) % 20000);
+    for (int i = 0; i < P; i++) prompt[i] = real_ids.empty() ? 100 + (i % 20000) : real_ids[i];
+    for (int j = 0; j < C; j++)
+        cont[j] = real_ids.empty() ? 100 + ((P + j) % 20000) : real_ids[P + j];
 
     const int V = cfg.vocab;
     std::vector<std::vector<float>> LA(C, std::vector<float>(V)), LB(C, std::vector<float>(V));
@@ -103,7 +129,8 @@ int main(int argc, char** argv) {
         if (argmax(LA[j]) == argmax(LB[j])) top1++;
         sumkl += kl(LA[j], LB[j]);
     }
-    printf("prefix=%d cont=%d int8_kv=%d\n", P, C, kvc.int8_kv ? 1 : 0);
+    printf("prefix=%d cont=%d int8_kv=%d ids=%s\n", P, C, kvc.int8_kv ? 1 : 0,
+           real_ids.empty() ? "synthetic(NOISY -- smoke test only)" : "real");
     printf("TOP1  %d/%d %.4f\n", top1, C, (double)top1 / C);
     printf("KL    %.5f (mean over %d positions)\n", sumkl / C, C);
     printf("seed(batched)=%d\n", seed);
