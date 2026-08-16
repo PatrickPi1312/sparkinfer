@@ -89,15 +89,22 @@ int main(int argc, char** argv) {
            dc.n_layers, dc.block_size, dc.target_layer_ids.size(),
            cfg.n_layers, (int)cfg.dense_ffn, cfg.n_experts);
 
+    // AR reference FIRST, on clean state. Taking it afterwards produced an EMPTY reference:
+    // dflash_generate opens its own session via open_session(), so a following generate() starts
+    // against a pool that still holds it, and freeing session 0 (which dflash never used) does not
+    // release it. Ordering the runs this way avoids depending on teardown semantics the harness
+    // does not control.
+    model.set_dflash_draft(nullptr);
+    model.set_dflash_capture(false, {}, 0);
+    const std::vector<int> ar = model.generate(prompt, max_new);
+    if (ar.empty()) { printf("[FAIL] AR reference produced nothing\n"); return 1; }
+
+    model.set_dflash_draft(&draft);
+    model.set_dflash_capture(true, dc.target_layer_ids, dc.block_size);
+    draft.reset();
     sparkinfer::Qwen35Model::DFlashStats stats;
     const std::vector<int> spec = model.dflash_generate(prompt, max_new, &stats);
     if (spec.empty()) { printf("[FAIL] dflash_generate produced nothing\n"); return 1; }
-
-    // Losslessness: greedy speculative decoding must reproduce plain AR exactly.
-    model.set_dflash_draft(nullptr);
-    model.set_dflash_capture(false, {}, 0);
-    kv.free(0); model.release_prefix_session();
-    const std::vector<int> ar = model.generate(prompt, (int)spec.size());
 
     // An empty AR reference must FAIL, not pass vacuously: min(0, k) == 0 makes "matched 0/0"
     // satisfy same==n and report lossless=YES while comparing nothing at all. Observed for real --
