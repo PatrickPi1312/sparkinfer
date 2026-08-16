@@ -4545,22 +4545,70 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes, cudaMemcpyHostToDevice);
         cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
-        s.owned.push_back(payload);
-        fp4_alpha = (global_scale != 0.f) ? (1.f / global_scale) : 1.f;
-        const void* packed = static_cast<char*>(payload) + hdr + scale_bytes;
+        // NOT registered in s.owned: with the requantized operand below, this payload is only the
+        // SOURCE for the Q4_K decode copy, and the caller frees it once that is built. Both forms
+        // are 4.5 bits per weight, so holding the checkpoint bytes as well would add ~9.6 GB
+        // across the FFN -- straight past a 32 GB card. The ct_native_b arm below, where the
+        // payload IS the operand, registers it instead.
+        // The batched-prefill B operand is REQUANTIZED from bf16 through the same
+        // launch_prefill_nvfp4_quant_b that Muse Glimmer uses, rather than handing CUTLASS the
+        // checkpoint's own packed bytes with their scales scattered into SFB by
+        // launch_ct_nvfp4_pack_sfb. The checkpoint-native operand is what corrupted the prefilled
+        // state (see qwen35_prefill.cpp's SPARKINFER_Q38_NVFP4 comment for the measurements):
+        // that path is reachable ONLY from this loader, while Muse -- which shares every other
+        // line of the GEMM sequence -- was always correct, so the defect lives in the operand, not
+        // in the GEMM. Requantizing routes Qwen3.8 onto Muse's proven, exercised construction.
+        //
+        // The extra quantization is close to free in accuracy terms: the source here is already
+        // NVFP4, so re-fitting it to a fresh 16-wide block scale mostly reproduces the grid it
+        // came from -- unlike the Q4_K decode copy below, which moves to a genuinely different
+        // grid. It costs one bf16 materialization per tensor at load, and the checkpoint payload
+        // is freed straight after (only the requantized operand and the Q4_K copy stay resident),
+        // so steady-state VRAM is unchanged.
+        // SPARKINFER_Q38_NVFP4_CT_B=1 restores the checkpoint-native operand for debugging the
+        // underlying pack_sfb/GEMM defect, which is still unfixed.
+        static const bool ct_native_b = [] {
+            const char* e = getenv("SPARKINFER_Q38_NVFP4_CT_B");
+            return e && e[0] == '1';
+        }();
+        fp4_alpha = 1.f;
         if (kernels::prefill_nvfp4_supported(128, rows, cols)) {
             void* sf = nullptr;
             const size_t sf_bytes = kernels::prefill_nvfp4_scale_bytes_b(rows, cols);
-            if (sf_bytes && cudaMalloc(&sf, sf_bytes) == cudaSuccess &&
-                kernels::launch_ct_nvfp4_pack_sfb(static_cast<char*>(payload) + hdr, sf,
-                                                  rows, cols, s.stream) &&
-                cudaStreamSynchronize(s.stream) == cudaSuccess) {
-                s.owned.push_back(sf);
-                *fp4 = packed;
-                *fp4_sf = sf;
-            } else if (sf) {
-                cudaFree(sf);
+            if (ct_native_b) {
+                s.owned.push_back(payload);   // the payload IS the operand on this arm
+                fp4_alpha = (global_scale != 0.f) ? (1.f / global_scale) : 1.f;
+                if (sf_bytes && cudaMalloc(&sf, sf_bytes) == cudaSuccess &&
+                    kernels::launch_ct_nvfp4_pack_sfb(static_cast<char*>(payload) + hdr, sf,
+                                                      rows, cols, s.stream) &&
+                    cudaStreamSynchronize(s.stream) == cudaSuccess) {
+                    s.owned.push_back(sf);
+                    *fp4 = static_cast<char*>(payload) + hdr + scale_bytes;
+                    *fp4_sf = sf;
+                } else if (sf) {
+                    cudaFree(sf);
+                }
+                return payload;
             }
+            void *bf = nullptr, *pk = nullptr;
+            if (cudaMalloc(&bf, (size_t)rows * cols * 2) == cudaSuccess &&
+                cudaMalloc(&pk, packed_bytes) == cudaSuccess &&
+                sf_bytes && cudaMalloc(&sf, sf_bytes) == cudaSuccess) {
+                kernels::launch_ct_dequant_nvfp4(
+                    static_cast<char*>(payload) + hdr + scale_bytes,
+                    static_cast<char*>(payload) + hdr, global_scale, bf, rows, cols, s.stream);
+                if (kernels::launch_prefill_nvfp4_quant_b(bf, pk, sf, rows, cols, s.stream) &&
+                    cudaStreamSynchronize(s.stream) == cudaSuccess) {
+                    s.owned.push_back(pk);
+                    s.owned.push_back(sf);
+                    *fp4 = pk;
+                    *fp4_sf = sf;
+                    pk = nullptr; sf = nullptr;
+                }
+            }
+            if (bf) cudaFree(bf);
+            if (pk) cudaFree(pk);
+            if (sf) cudaFree(sf);
         }
         return payload;
     };
@@ -4777,6 +4825,15 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.gate_q = q4k_from_nvfp4(g_pay, c.moe_ffn, H, w.gate_qtype);
             w.up_q = q4k_from_nvfp4(u_pay, c.moe_ffn, H, w.up_qtype);
             w.down_q = q4k_from_nvfp4(d_pay, H, c.moe_ffn, w.down_qtype);
+            // Both derived copies (requantized NVFP4 for prefill, Q4_K for decode) are built, so
+            // the checkpoint payload is dead. keep_nvfp4 deliberately left it out of s.owned on
+            // this arm -- see its comment -- so freeing here is what keeps the FFN's second 4.5
+            // bits/weight from staying resident. No-op when the ct_native_b arm owns it instead.
+            if (!getenv("SPARKINFER_Q38_NVFP4_CT_B")) {
+                cudaFree(const_cast<void*>(g_pay));
+                cudaFree(const_cast<void*>(u_pay));
+                cudaFree(const_cast<void*>(d_pay));
+            }
             if (w.gate_fp4 && w.up_fp4) ++gu_ready;
         }
         if (!w.gate_q || !w.up_q || !w.down_q) return false;
