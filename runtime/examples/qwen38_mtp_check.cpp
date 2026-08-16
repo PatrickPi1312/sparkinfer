@@ -38,6 +38,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 
 int main(int argc, char** argv) {
     if (argc < 4) {
@@ -246,11 +247,16 @@ int main(int argc, char** argv) {
         kv.free(0); model.release_prefix_session(); mtp.reset();
         if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv realloc\n"); return 1; }
         std::vector<int> ar, spec;
-        // reference: plain AR greedy
+        // reference: plain AR greedy, timed over the decode loop only (prefill excluded from both)
         int p2 = 0, t2 = prompt[0];
         for (; p2 + 1 < (int)prompt.size(); p2++) model.forward_token(prompt[p2], p2, false);
         t2 = prompt.back();
+        cudaDeviceSynchronize();
+        auto ar_t0 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < want; i++) { int nx = model.forward_token(t2, p2, true); ar.push_back(nx); t2 = nx; p2++; }
+        cudaDeviceSynchronize();
+        const double ar_s = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - ar_t0).count();
 
         kv.free(0); model.release_prefix_session(); mtp.reset();
         if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv realloc 2\n"); return 1; }
@@ -261,13 +267,19 @@ int main(int argc, char** argv) {
         }
         int t3 = prompt.back();
         long long forwards = 0;
+        double draft_s = 0;
+        cudaDeviceSynchronize();
+        auto sp_t0 = std::chrono::high_resolution_clock::now();
         while ((int)spec.size() < want) {
             const int committed = model.forward_token(t3, p3, true);   // token at p3+1
             forwards++;
             spec.push_back(committed);
             if ((int)spec.size() >= want) break;
             int prop = -1;
+            auto d0 = std::chrono::high_resolution_clock::now();
             if (!mtp.forward(model.final_hidden(true), committed, p3, &prop, nullptr, false)) break;
+            draft_s += std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - d0).count();
             // verify the proposal: the target's own next token from `committed`
             const int truth = model.forward_token(committed, p3 + 1, true);
             forwards++;
@@ -282,12 +294,27 @@ int main(int argc, char** argv) {
             t3 = truth;
             p3 += 2;
         }
+        cudaDeviceSynchronize();
+        const double sp_s = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - sp_t0).count();
         size_t nmin = std::min(ar.size(), spec.size());
         size_t same = 0; while (same < nmin && ar[same] == spec[same]) same++;
         printf("SPEC lossless=%s  matched %zu/%zu tokens   accepted_steps=%d   target_forwards=%lld\n",
                same == nmin ? "YES" : "NO", same, nmin, accepted_steps, forwards);
         printf("SPEC tau=%.3f  (tokens per target forward; >1 needs the BATCHED verify)\n",
                forwards ? (double)spec.size() / forwards : 0.0);
+        const double ar_tps = ar.size() / ar_s, sp_tps = spec.size() / sp_s;
+        printf("SPEED  AR %.2f tok/s   MTP %.2f tok/s   ratio %.3fx\n", ar_tps, sp_tps, sp_tps / ar_tps);
+        printf("SPEED  draft %.1f ms total, %.2f ms/step, = %.1f%% of the MTP loop\n",
+               draft_s * 1e3, forwards ? draft_s * 1e3 / (forwards / 2.0) : 0.0, 100.0 * draft_s / sp_s);
+        // c = draft cost as a fraction of ONE target forward. The batched-verify projection is
+        // speedup = (1 + acceptance) / (1 + c), so this is the term that decides whether the
+        // remaining work is worth doing.
+        const double per_target_fwd = ar_s / ar.size();
+        printf("SPEED  c = draft/target_forward = %.4f  -> projected batched speedup %.3fx at tau %.2f\n",
+               (draft_s / (forwards / 2.0)) / per_target_fwd,
+               (1.0 + (double)accepted_steps / (forwards / 2.0)) / (1.0 + (draft_s / (forwards / 2.0)) / per_target_fwd),
+               1.0 + (double)accepted_steps / (forwards / 2.0));
     }
 
     const double rate = total ? (double)agree / total : 0.0;
