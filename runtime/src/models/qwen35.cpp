@@ -3168,7 +3168,17 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int p0 = -1;
         if (!compact_verify) {
             set_dflash_capture_row(0);
-            s.defer_decode_sync = true;
+            // SPARKINFER_DFLASH_DEFER=0 disables the deferred collect. The deferral exists purely
+            // to overlap the target's verify-token-0 forward with the draft's ~100 launches; it is
+            // a latency optimisation with no effect on results. It is also the ONLY remaining
+            // difference between plain capture-enabled decode (verified token-identical to AR) and
+            // the speculative loop (which degenerates to one repeated token on Qwen3.8), so it
+            // needs to be switchable to be ruled in or out.
+            static const bool defer_ok = [] {
+                const char* e = getenv("SPARKINFER_DFLASH_DEFER");
+                return !(e && e[0] == '0');
+            }();
+            s.defer_decode_sync = defer_ok;
             p0 = forward_token(block[0], start, true);
             s.defer_decode_sync = false;
         }
