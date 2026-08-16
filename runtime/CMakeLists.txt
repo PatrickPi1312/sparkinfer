@@ -100,7 +100,11 @@ if(BUILD_EXAMPLES)
 
     add_executable(qwen3_gguf_prefill_check examples/qwen3_gguf_prefill_check.cpp)
     target_include_directories(qwen3_gguf_prefill_check PRIVATE include)
-    target_link_libraries(qwen3_gguf_prefill_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    # nlohmann_json: same reason as qwen3_gguf_bench above -- this tool now routes through
+    # qwen_checkpoint.h so it can A/B batched prefill on a compressed-tensors checkpoint, which is
+    # the only place the FP4 FFN prefill arm is reachable.
+    target_link_libraries(qwen3_gguf_prefill_check PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(qwen3_gguf_dflash_check examples/qwen3_gguf_dflash_check.cpp)
     target_include_directories(qwen3_gguf_dflash_check PRIVATE include)
     target_link_libraries(qwen3_gguf_dflash_check PRIVATE sparkinfer_runtime CUDA::cudart)
