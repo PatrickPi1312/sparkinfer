@@ -4457,6 +4457,16 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     // scatters the UE4M3 scales into SFB; the tensor-wide global_scale becomes
     // GEMM alpha (1/global), matching launch_ct_dequant_nvfp4's divide. The
     // header is 256 B so the packed region stays TMA-aligned.
+    // SPARKINFER_QWEN38_PREFILL_NVFP4=0 drops the checkpoint-native NVFP4 copies once they have
+    // been consumed to build the Q4_K decode weights. They exist ONLY to make batched prefill
+    // faster -- decode always reads gate_q/up_q/down_q -- and they are not small: the FFN is
+    // 56 layers x 3 x 17408 x 5120 ~ 15 G params, so the packed payload plus scales is ~8 GB held
+    // resident purely for prefill throughput. Turning them off trades prefill speed for VRAM,
+    // which is what makes a second resident model (a speculative draft) fit on a 32 GB card at all.
+    static const bool keep_prefill_fp4 = [] {
+        const char* e = getenv("SPARKINFER_QWEN38_PREFILL_NVFP4");
+        return !(e && e[0] == '0');
+    }();
     auto keep_nvfp4 = [&](const std::string& prefix, int rows, int cols,
                           const void** fp4, const void** fp4_sf, float& fp4_alpha) -> const void* {
         const STTensor* wp = st.tensor(prefix + ".weight_packed");
@@ -4481,10 +4491,13 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         cudaMemcpy(static_cast<char*>(payload) + hdr, gs->data, scale_bytes, cudaMemcpyHostToDevice);
         cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, wp->data, packed_bytes,
                    cudaMemcpyHostToDevice);
-        s.owned.push_back(payload);
+        // When the prefill copies are disabled the payload is transient: it is still needed as the
+        // SOURCE for q4k_from_nvfp4 below, then freed by the caller. Keeping it out of s.owned is
+        // what makes that early free safe (nothing double-frees at teardown).
+        if (keep_prefill_fp4) s.owned.push_back(payload);
         fp4_alpha = (global_scale != 0.f) ? (1.f / global_scale) : 1.f;
         const void* packed = static_cast<char*>(payload) + hdr + scale_bytes;
-        if (kernels::prefill_nvfp4_supported(128, rows, cols)) {
+        if (keep_prefill_fp4 && kernels::prefill_nvfp4_supported(128, rows, cols)) {
             void* sf = nullptr;
             const size_t sf_bytes = kernels::prefill_nvfp4_scale_bytes_b(rows, cols);
             if (sf_bytes && cudaMalloc(&sf, sf_bytes) == cudaSuccess &&
@@ -4599,6 +4612,13 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.gate_q = q4k_from_nvfp4(g_pay, c.moe_ffn, H, w.gate_qtype);
             w.up_q = q4k_from_nvfp4(u_pay, c.moe_ffn, H, w.up_qtype);
             w.down_q = q4k_from_nvfp4(d_pay, H, c.moe_ffn, w.down_qtype);
+            if (!keep_prefill_fp4) {
+                // Payloads were deliberately not registered in s.owned; the Q4_K decode copies
+                // above are built, so release the NVFP4 source now rather than at teardown.
+                cudaFree(const_cast<void*>(g_pay));
+                cudaFree(const_cast<void*>(u_pay));
+                cudaFree(const_cast<void*>(d_pay));
+            }
             if (w.gate_fp4 && w.up_fp4) ++gu_ready;
         }
         if (!w.gate_q || !w.up_q || !w.down_q) return false;
