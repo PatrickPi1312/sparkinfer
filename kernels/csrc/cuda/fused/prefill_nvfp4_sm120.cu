@@ -432,13 +432,21 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
 // this runtime's OWN from-bf16 quantizers (quant_rows above, or the Q4_K requant path) rather than
 // needing the GEMM kernels above to understand a second, foreign two-level scale scheme.
 namespace {
+// global_scale_dev, when non-null, supplies the global scale from device memory instead of the
+// host-side scalar. Callers that hold the checkpoint payload (whose header carries the scale on
+// the device) need this: reading it back to the host would mean a D2H copy, and these launches
+// happen inside batched prefill, which runs under CUDA graph capture -- a synchronizing copy
+// there is not merely slow, it is illegal and aborts the capture.
 __global__ void ct_dequant_nvfp4_kernel(const unsigned char* __restrict__ packed,
                                         const unsigned char* __restrict__ group_scale,
-                                        float global_scale, __nv_bfloat16* __restrict__ out,
+                                        float global_scale,
+                                        const float* __restrict__ global_scale_dev,
+                                        __nv_bfloat16* __restrict__ out,
                                         int rows, int cols) {
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     const long n = (long)rows * cols;
     if (i >= n) return;
+    if (global_scale_dev) global_scale = *global_scale_dev;
     const int r = (int)(i / cols);
     const int c = (int)(i - (long)r * cols);
     const unsigned char byte = packed[(size_t)r * (cols / 2) + (c >> 1)];
@@ -456,16 +464,30 @@ __global__ void ct_dequant_nvfp4_kernel(const unsigned char* __restrict__ packed
 }
 } // namespace
 
-void launch_ct_dequant_nvfp4(const void* packed_u8, const void* group_scale_ue4m3,
-                             float global_scale, void* out_bf16, int rows, int cols,
-                             cudaStream_t stream) {
+static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_scale_ue4m3,
+                                    float global_scale, const float* global_scale_dev,
+                                    void* out_bf16, int rows, int cols, cudaStream_t stream) {
     const long n = (long)rows * cols;
     const int threads = 256;
     const long blocks = (n + threads - 1) / threads;
     ct_dequant_nvfp4_kernel<<<(unsigned)blocks, threads, 0, stream>>>(
         reinterpret_cast<const unsigned char*>(packed_u8),
-        reinterpret_cast<const unsigned char*>(group_scale_ue4m3), global_scale,
+        reinterpret_cast<const unsigned char*>(group_scale_ue4m3), global_scale, global_scale_dev,
         reinterpret_cast<__nv_bfloat16*>(out_bf16), rows, cols);
+}
+
+void launch_ct_dequant_nvfp4(const void* packed_u8, const void* group_scale_ue4m3,
+                             float global_scale, void* out_bf16, int rows, int cols,
+                             cudaStream_t stream) {
+    ct_dequant_nvfp4_launch(packed_u8, group_scale_ue4m3, global_scale, nullptr, out_bf16,
+                            rows, cols, stream);
+}
+
+void launch_ct_dequant_nvfp4_dev(const void* packed_u8, const void* group_scale_ue4m3,
+                                 const float* global_scale_dev, void* out_bf16, int rows, int cols,
+                                 cudaStream_t stream) {
+    ct_dequant_nvfp4_launch(packed_u8, group_scale_ue4m3, 1.f, global_scale_dev, out_bf16,
+                            rows, cols, stream);
 }
 
 template <class Layout>

@@ -28,4 +28,12 @@ void launch_ct_dequant_nvfp4(const void* packed_u8, const void* group_scale_ue4m
                              float global_scale, void* out_bf16, int rows, int cols,
                              cudaStream_t stream = nullptr);
 
+// Same dequant, but the global scale is read from device memory. For callers holding an
+// SI_QTYPE_NVFP4 payload (whose 256 B header stores the scale on the device) inside batched
+// prefill: fetching it host-side would need a D2H copy, which under the CUDA graph capture that
+// prefill runs in is illegal, not merely slow.
+void launch_ct_dequant_nvfp4_dev(const void* packed_u8, const void* group_scale_ue4m3,
+                                 const float* global_scale_dev, void* out_bf16, int rows, int cols,
+                                 cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels
