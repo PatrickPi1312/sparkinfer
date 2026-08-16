@@ -84,7 +84,11 @@ int main(int argc, char** argv) {
     // Capture layers come from the CHECKPOINT, not from this runtime's Qwen3.6 default: DSpark
     // projects [4,16,28,40,52] and its fc is sized n_cap*hidden accordingly.
     model.set_dflash_draft(&draft);
-    model.set_dflash_capture(true, dc.target_layer_ids, dc.block_size);
+    // max_rows: use the API default (16), NOT block_size. dflash_generate writes capture rows
+    // 0..kProposalDepth, and kProposalDepth is chosen from the SEQUENCE LENGTH (5 short / 7 long),
+    // not from the draft's block_size -- so sizing this buffer from block_size is sizing it from
+    // the wrong quantity entirely, and it can be overrun.
+    model.set_dflash_capture(true, dc.target_layer_ids);
     printf("draft: layers=%d B=%d n_cap=%zu  target: layers=%d dense_ffn=%d experts=%d\n",
            dc.n_layers, dc.block_size, dc.target_layer_ids.size(),
            cfg.n_layers, (int)cfg.dense_ffn, cfg.n_experts);
@@ -100,7 +104,7 @@ int main(int argc, char** argv) {
     if (ar.empty()) { printf("[FAIL] AR reference produced nothing\n"); return 1; }
 
     model.set_dflash_draft(&draft);
-    model.set_dflash_capture(true, dc.target_layer_ids, dc.block_size);
+    model.set_dflash_capture(true, dc.target_layer_ids);
     draft.reset();
     sparkinfer::Qwen35Model::DFlashStats stats;
     const std::vector<int> spec = model.dflash_generate(prompt, max_new, &stats);
