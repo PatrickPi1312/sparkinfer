@@ -484,13 +484,38 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // Muse keeps N==128 (its scored shape). Qwen3.8 now runs batched prefill at the
     // scored ctx=128 too (bf16 KV + NeoX rope, see the !kv8 arm below) as well as
     // ctx>=4096 (int8 KV). CUTLASS accepts any m%8==0, n/k%128==0.
-    // SPARKINFER_Q38_NVFP4=0 restores the int8/bf16 FFN.
+    // DEFAULT OFF since 2026-08-16: this leg leaves the prefilled state WRONG, and does so on
+    // every Qwen3.8 compressed-tensors checkpoint at every context length. Measured with
+    // qwen3_gguf_prefill_check on real token ids (KV int8 off, 16 teacher-forced continuation
+    // positions), unsloth/Qwen3.8-27B-NVFP4, comparing batched prefill against the token loop:
+    //
+    //     prompt   this leg ON            this leg OFF
+    //       32     top1 12/16  KL 0.990   top1 16/16  KL 0.0024
+    //      128     top1  8/16  KL 2.321   top1 16/16  KL 0.0007
+    //      512     top1  6/16  KL 3.491   top1 16/16  KL 0.0026
+    //
+    // Off, batched prefill is exact at every length; on, the state is badly wrong and gets worse
+    // with context. Turning ONLY this off also restores the ModelOpt checkpoint (KL 1.073 ->
+    // 0.009), and the same model loaded from GGUF was always exact (KL 0.011) because load_gguf
+    // never builds the *_fp4 operands -- which is precisely why this hid for so long.
+    //
+    // Nothing tested it: the PR accuracy gate runs qwen3_gguf_score.cpp, which teacher-forces
+    // through forward_token() and never enters prefill_batched_run(), while the bench beside it
+    // reports prefill throughput measured on exactly this path. Every prefill@128 / prefill@16k
+    // number from #837 onward was measured against a wrong state.
+    //
+    // The defect is inside the NVFP4 GEMM sequence itself (activation quant -> gate/up GEMM ->
+    // swiglu -> down GEMM), not in the weights: the same packed bytes dequantize correctly for
+    // decode, and this branch is bypassed, not changed, by turning the flag off. Re-enabling it
+    // needs the kernel fixed and prefill_check green at 32/128/512 -- do not flip this default
+    // back on a throughput result alone, because throughput is what selected for the bug.
+    // SPARKINFER_Q38_NVFP4=1 re-enables it for that debugging.
     const bool q38_nvfp4 = [&] {
         if (!c.dense_ffn || c.muse_glimmer || s.w.layers.empty() || !s.w.layers[0].gate_fp4)
             return false;
         if (!kernels::prefill_nvfp4_supported(N, ffn, H)) return false;
         const char* e = getenv("SPARKINFER_Q38_NVFP4");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     const bool gu_nvfp4 = muse_nvfp4 || q38_nvfp4;
     // FP4 activation staging is sized by the FFN CHUNK, not the prompt: every consumer of these
