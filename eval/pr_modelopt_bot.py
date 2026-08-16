@@ -1206,6 +1206,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "token_count": pr.get("token_count"),
         "accuracy_ok": accuracy_ok,
         "q36_guard_ok": q36_ok,
+        "q38_guard_ok": q38_ok,
+        "parity_ok": parity_ok is True,
         "q36_guard_problems": q36_problems,
         "q36_guard": pr.get("guard36"),
         "q36_guard_main": main.get("guard36"),
@@ -1503,7 +1505,9 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
           f"from={res.get('scored_dimension')}  "
           f"top1={res.get('pr_top1')} kl={res.get('pr_kl')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
-          f"q36_guard_ok={res.get('q36_guard_ok')}")
+          f"q36_guard_ok={res.get('q36_guard_ok')} "
+          f"q38_guard_ok={res.get('q38_guard_ok')} "
+          f"parity_ok={res.get('parity_ok')}")
     if dry_run:
         print(body[:500])
         return
