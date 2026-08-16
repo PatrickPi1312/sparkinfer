@@ -150,7 +150,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    int agree = 0, total = 0;
+    int agree = 0, total = 0, accepted_steps = 0;
     int prev_proposal = -1;
     tok = prompt.back();
     for (int step = 0; step < n_steps; step++) {
@@ -234,6 +234,62 @@ int main(int argc, char** argv) {
 
     if (fh) fclose(fh);
     if (ft) fclose(ft);
+    // ---- speculative accept loop (--spec N) ---------------------------------------------------
+    // Correctness first: does MTP speculation reproduce plain autoregressive greedy decoding
+    // EXACTLY, and what tau does the accept/crop path actually achieve? Throughput is a separate
+    // question -- verify_block runs one target forward per verified token, so this loop is
+    // deliberately NOT faster than AR. DFlash's own comments record why: only a row-BATCHED verify
+    // collapses those forwards into one pass and pays for the draft. Swapping in
+    // dflash_verify_short_run is the throughput step; this proves the loop is lossless first.
+    if (const char* sp = getenv("SPARKINFER_MTP_SPEC")) {
+        const int want = atoi(sp);
+        kv.free(0); model.release_prefix_session(); model.invalidate_decode_graph(); mtp.reset();
+        if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv realloc\n"); return 1; }
+        std::vector<int> ar, spec;
+        // reference: plain AR greedy
+        int p2 = 0, t2 = prompt[0];
+        for (; p2 + 1 < (int)prompt.size(); p2++) model.forward_token(prompt[p2], p2, false);
+        t2 = prompt.back();
+        for (int i = 0; i < want; i++) { int nx = model.forward_token(t2, p2, true); ar.push_back(nx); t2 = nx; p2++; }
+
+        kv.free(0); model.release_prefix_session(); model.invalidate_decode_graph(); mtp.reset();
+        if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv realloc 2\n"); return 1; }
+        int p3 = 0;
+        for (; p3 + 1 < (int)prompt.size(); p3++) {
+            model.forward_token(prompt[p3], p3, false);
+            int w2 = -1; mtp.forward(model.final_hidden(true), prompt[p3 + 1], p3, &w2, nullptr, false);
+        }
+        int t3 = prompt.back();
+        long long forwards = 0;
+        while ((int)spec.size() < want) {
+            const int committed = model.forward_token(t3, p3, true);   // token at p3+1
+            forwards++;
+            spec.push_back(committed);
+            if ((int)spec.size() >= want) break;
+            int prop = -1;
+            if (!mtp.forward(model.final_hidden(true), committed, p3, &prop, nullptr, false)) break;
+            // verify the proposal: the target's own next token from `committed`
+            const int truth = model.forward_token(committed, p3 + 1, true);
+            forwards++;
+            spec.push_back(truth);
+            if (prop == truth) {
+                // accepted: the draft was right, so this step emitted 2 tokens for 2 forwards --
+                // a batched verify would have made it 2 tokens for ONE.
+                accepted_steps++;
+            } else {
+                mtp.crop(p3 + 1);   // rejected: roll the draft KV back or it desynchronises
+            }
+            t3 = truth;
+            p3 += 2;
+        }
+        size_t nmin = std::min(ar.size(), spec.size());
+        size_t same = 0; while (same < nmin && ar[same] == spec[same]) same++;
+        printf("SPEC lossless=%s  matched %zu/%zu tokens   accepted_steps=%d   target_forwards=%lld\n",
+               same == nmin ? "YES" : "NO", same, nmin, accepted_steps, forwards);
+        printf("SPEC tau=%.3f  (tokens per target forward; >1 needs the BATCHED verify)\n",
+               forwards ? (double)spec.size() / forwards : 0.0);
+    }
+
     const double rate = total ? (double)agree / total : 0.0;
     printf("MTP_AGREE %d/%d = %.3f   (this is the acceptance rate a greedy spec loop would get)\n",
            agree, total, rate);
