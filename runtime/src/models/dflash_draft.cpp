@@ -177,6 +177,14 @@ bool parse_config_json(const std::string& path, DFlashDraftConfig& cfg) {
     find_int("sliding_window", cfg.sliding_window);
     find_float("rms_norm_eps", cfg.rms_eps);
     find_int("block_size", cfg.block_size);
+    // YaRN lives under "rope_parameters". Only applied when rope_type is actually yarn -- a
+    // checkpoint carrying factor but rope_type "linear"/"default" must not silently get YaRN.
+    if (j.find("\"yarn\"") != std::string::npos) {
+        find_float("factor", cfg.yarn_factor);
+        find_int("original_max_position_embeddings", cfg.yarn_orig_max_pos);
+        find_float("beta_fast", cfg.yarn_beta_fast);
+        find_float("beta_slow", cfg.yarn_beta_slow);
+    }
     find_int("mask_token_id", cfg.mask_token_id);
 
     // DSpark (RadixArk/Qwen3.8-27B-DSpark) nests the draft-specific settings under
@@ -290,6 +298,9 @@ struct DFlashDraftModel::Impl {
     DFlashDraftConfig cfg;
     std::vector<LayerWeights> layers;
     bf16* fc = nullptr;           // [H, n_cap * H] as [out, in] for gemv
+    // YaRN rotary table (null unless the checkpoint configures rope_type "yarn").
+    float* d_yarn_inv_freq = nullptr;   // [head_dim/2]
+    float  yarn_att_scale = 1.0f;
     bf16* hidden_norm = nullptr;
     bf16* final_norm = nullptr;
     std::vector<void*> owned;
@@ -515,6 +526,37 @@ int DFlashDraftModel::seq_len() const { return p_->seq_len; }
 
 const float* DFlashDraftModel::last_logits() const { return p_->logits; }
 
+// YaRN inverse-frequency table, computed exactly as HuggingFace's _compute_yarn_parameters does
+// (transformers/modeling_rope_utils.py) -- the reference dspark.py/dflash.py do not implement RoPE
+// themselves, they inherit transformers' Qwen3 classes, so that IS the authority here.
+//   inv_freq[i] = interp*(1-ramp_i) + extrap*ramp_i, ramp over the NTK-by-parts correction range
+//   att_scale   = 0.1*ln(factor) + 1
+static void compute_yarn_inv_freq(const DFlashDraftConfig& cfg, std::vector<float>& inv_freq,
+                                  float& att_scale) {
+    const int d = cfg.head_dim, half = d / 2;
+    const double base = cfg.rope_theta, factor = cfg.yarn_factor;
+    const double orig = cfg.yarn_orig_max_pos > 0 ? cfg.yarn_orig_max_pos : 8192.0;
+    auto find_dim = [&](double nrot) {
+        return (d * std::log(orig / (nrot * 2.0 * M_PI))) / (2.0 * std::log(base));
+    };
+    double low  = std::floor(find_dim(cfg.yarn_beta_fast));
+    double high = std::ceil (find_dim(cfg.yarn_beta_slow));
+    low  = std::max(low, 0.0);
+    high = std::min(high, (double)d - 1.0);
+    if (high - low < 1e-3) high = low + 1e-3;   // guard the degenerate range
+    inv_freq.resize(half);
+    for (int i = 0; i < half; i++) {
+        const double pos_freq = std::pow(base, (2.0 * i) / (double)d);
+        const double extrap = 1.0 / pos_freq;
+        const double interp = 1.0 / (factor * pos_freq);
+        double ramp = ((double)i - low) / (high - low);
+        ramp = std::min(std::max(ramp, 0.0), 1.0);
+        const double extrap_w = 1.0 - ramp;     // 1 => untouched band, 0 => fully interpolated
+        inv_freq[i] = (float)(interp * (1.0 - extrap_w) + extrap * extrap_w);
+    }
+    att_scale = (float)(0.1 * std::log(factor) + 1.0);
+}
+
 bool DFlashDraftModel::load(const std::string& dir) {
     Impl& s = *p_;
     const std::string cfg_path = dir + "/config.json";
@@ -538,6 +580,21 @@ bool DFlashDraftModel::load(const std::string& dir) {
     const int I = s.cfg.intermediate;
     const int n_cap = (int)s.cfg.target_layer_ids.size();
     const int B = s.cfg.block_size;
+
+    if (s.cfg.yarn_factor > 1.0f) {
+        std::vector<float> ifreq;
+        compute_yarn_inv_freq(s.cfg, ifreq, s.yarn_att_scale);
+        if (cudaMalloc(&s.d_yarn_inv_freq, ifreq.size() * sizeof(float)) == cudaSuccess) {
+            cudaMemcpy(s.d_yarn_inv_freq, ifreq.data(), ifreq.size() * sizeof(float),
+                       cudaMemcpyHostToDevice);
+            fprintf(stderr, "[dflash] YaRN: factor=%.1f orig_max=%d att_scale=%.4f "
+                            "(inv_freq[0]=%.3e inv_freq[%d]=%.3e)\n",
+                    s.cfg.yarn_factor, s.cfg.yarn_orig_max_pos, s.yarn_att_scale,
+                    ifreq.front(), (int)ifreq.size() - 1, ifreq.back());
+        } else {
+            fprintf(stderr, "[dflash] YaRN table alloc failed -- falling back to plain RoPE\n");
+        }
+    }
 
     auto* fc = require("fc.weight");
     auto* hn = require("hidden_norm.weight");
@@ -941,11 +998,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                                          c.rms_eps, k_pos0 + ctx_skip,
                                                          c.rope_theta, st);
         } else {
+            // s.d_yarn_inv_freq is null unless the checkpoint configures rope_type "yarn", in
+            // which case these two calls are the ONLY behavioural change -- Q and K must be
+            // rotated with the same table or their relative phase is wrong.
             dflash_kernels::launch_rms_heads_rope(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
-                                                 q_pos0, c.rope_theta, st);
+                                                 q_pos0, c.rope_theta, st,
+                                                 s.d_yarn_inv_freq, s.yarn_att_scale);
             dflash_kernels::launch_rms_heads_rope(kdst + (size_t)ctx_skip * kvdim, w.k_norm,
                                                  new_len - ctx_skip, c.n_kv_heads, d,
-                                                 c.rms_eps, k_pos0 + ctx_skip, c.rope_theta, st);
+                                                 c.rms_eps, k_pos0 + ctx_skip, c.rope_theta, st,
+                                                 s.d_yarn_inv_freq, s.yarn_att_scale);
         }
 
         // K/V are already in the cache at offset `past` -- attend over the full past+new.

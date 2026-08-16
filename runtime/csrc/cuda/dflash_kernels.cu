@@ -125,8 +125,18 @@ __global__ void k_rms_heads(bf16* x, const bf16* w, int seq, int n_heads, int d,
 // two per layer for q and k is 24 launches a draft block spends on ~37 us of work; the draft is
 // launched eagerly (no graph), so each one also pays a full launch gap. One warp per (token, head)
 // as in k_rms_heads, then the same rotation k_rope applies, in the same order per element.
+// inv_freq (optional, [d/2]): precomputed per-dimension rotary frequencies. Null keeps the
+// original inline theta^(-2i/d), so every existing caller is bit-identical. Non-null is how YaRN
+// is expressed: its NTK-by-parts ramp scales each frequency band differently, so it CANNOT be
+// folded into a single theta. Measured for RadixArk/Qwen3.8-27B-DSpark (factor 32, orig_max 8192):
+// 36 of 64 bands are divided by 32 and only 15 are untouched, so running plain RoPE here leaves
+// the draft's attention badly mis-phased -- the silent failure mode that shows up purely as a
+// collapsed acceptance rate.
+// att_scale: YaRN's attention_factor (0.1*ln(factor)+1 = 1.3466 here), a magnitude scaling on
+// cos/sin. 1.0f for non-YaRN callers.
 __global__ void k_rms_heads_rope(bf16* x, const bf16* w, int seq, int n_heads, int d,
-                                 float eps, int pos0, float theta) {
+                                 float eps, int pos0, float theta,
+                                 const float* inv_freq, float att_scale) {
     const int idx = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (idx >= seq * n_heads) return;
     bf16* h = x + (size_t)idx * d;
@@ -145,9 +155,10 @@ __global__ void k_rms_heads_rope(bf16* x, const bf16* w, int seq, int n_heads, i
     const int pos = pos0 + (idx / n_heads);
     const int half = d / 2;
     for (int i = lane; i < half; i += 32) {
-        const float freq = 1.f / powf(theta, (float)(2 * i) / (float)d);
+        const float freq = inv_freq ? inv_freq[i]
+                                    : 1.f / powf(theta, (float)(2 * i) / (float)d);
         const float ang = (float)pos * freq;
-        const float c = cosf(ang), sn = sinf(ang);
+        const float c = cosf(ang) * att_scale, sn = sinf(ang) * att_scale;
         const float x0 = b2f(h[i]), x1 = b2f(h[i + half]);
         h[i] = f2b(x0 * c - x1 * sn);
         h[i + half] = f2b(x0 * sn + x1 * c);
@@ -1195,12 +1206,13 @@ void launch_add_rms(const void* a, const void* b, void* sum, const void* w, void
 }
 
 void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
-                           int pos0, float theta, cudaStream_t stream) {
+                           int pos0, float theta, cudaStream_t stream,
+                           const float* inv_freq, float att_scale) {
     if (seq <= 0 || n_heads <= 0) return;
     constexpr int WPB = 4;
     const int total = seq * n_heads;
     k_rms_heads_rope<<<(total + WPB - 1) / WPB, WPB * 32, 0, stream>>>(
-        (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta);
+        (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta, inv_freq, att_scale);
 }
 
 // See k_rms_heads_rope_normal for why Muse Glimmer's DFlash draft needs this consecutive-pair

@@ -122,8 +122,12 @@ void launch_rms_heads(void* x, const void* w, int seq, int n_heads, int d,
 
 // Per-head RMSNorm followed by RoPE, same buffer, one launch. Same math and order as calling
 // launch_rms_heads then launch_rope_seq.
+// inv_freq (optional, [d/2]) + att_scale carry YaRN. Null/1.0f => the original inline
+// theta^(-2i/d), bit-identical for every pre-existing caller. YaRN's NTK-by-parts ramp scales each
+// frequency band differently, so it cannot be folded into theta; see k_rms_heads_rope.
 void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
-                           int pos0, float theta, cudaStream_t stream);
+                           int pos0, float theta, cudaStream_t stream,
+                           const float* inv_freq = nullptr, float att_scale = 1.0f);
 
 // Same as launch_rms_heads_rope, but "normal" (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE
 // pairing instead of NeoX split-half. Needed for the Muse Glimmer DFlash draft checkpoint --
