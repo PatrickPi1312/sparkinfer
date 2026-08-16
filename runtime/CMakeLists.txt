@@ -101,6 +101,11 @@ if(BUILD_EXAMPLES)
     add_executable(qwen3_gguf_dflash_bench examples/qwen3_gguf_dflash_bench.cpp)
     target_include_directories(qwen3_gguf_dflash_bench PRIVATE include)
     target_link_libraries(qwen3_gguf_dflash_bench PRIVATE sparkinfer_runtime CUDA::cudart)
+    # DSpark draft load check: exercises DFlashDraftModel::load() against the
+    # RadixArk/Qwen3.8-27B-DSpark checkpoint and prints the parsed config.
+    add_executable(dspark_load_check examples/dspark_load_check.cpp)
+    target_include_directories(dspark_load_check PRIVATE include)
+    target_link_libraries(dspark_load_check PRIVATE sparkinfer_runtime CUDA::cudart)
     add_executable(thermal_sweep examples/thermal_sweep.cpp)   # force each thermal mode, measure W/°C/tok/s
     target_include_directories(thermal_sweep PRIVATE include)
     target_link_libraries(thermal_sweep PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
