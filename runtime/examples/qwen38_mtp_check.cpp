@@ -99,6 +99,14 @@ int main(int argc, char** argv) {
            post_norm ? "POST-final-norm" : "pre-final-norm",
            swap_cat ? "[hidden;embedding]" : "[embedding;hidden]");
 
+    // Allocate the target's KV for the default sequence (Impl::active_seq_id == 0) BEFORE any
+    // forward_token. Every in-tree caller does this -- bench_decode, generate, cache_prefix all
+    // call kv->allocate(active_seq_id, max_seq) first. Skipping it leaves the block table
+    // unpopulated, and the target's attention then walks off it: an illegal memory access inside
+    // the TARGET's prefill, which surfaces as "[FAIL] mtp forward" at the caller's next sync and
+    // reads like an MTP bug. It is not.
+    if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv allocate\n"); return 1; }
+
     // Prefill: run the prompt through the target, no sampling until the last token.
     int tok = prompt[0];
     int pos = 0;
