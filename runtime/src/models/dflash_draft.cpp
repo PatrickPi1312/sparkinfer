@@ -176,6 +176,34 @@ bool parse_config_json(const std::string& path, DFlashDraftConfig& cfg) {
     find_int("vocab_size", cfg.vocab);
     find_int("sliding_window", cfg.sliding_window);
     find_float("rms_norm_eps", cfg.rms_eps);
+    find_int("block_size", cfg.block_size);
+    find_int("mask_token_id", cfg.mask_token_id);
+
+    // DSpark (RadixArk/Qwen3.8-27B-DSpark) nests the draft-specific settings under
+    // "dflash_config", and its target_layer_ids differ from this struct's Qwen3.6 default both in
+    // VALUE and in COUNT: [4,16,28,40,52] (5 captures) vs {1,6,11,16,22,27,32,37} (8). The count
+    // is load-bearing -- fc.weight is [hidden, n_cap*hidden], so leaving the default in place
+    // makes the loader demand a [5120, 40960] projector against the checkpoint's [5120, 25600]
+    // and fail outright. Parse the list rather than inheriting it.
+    {
+        size_t p = j.find("\"target_layer_ids\"");
+        if (p != std::string::npos) {
+            size_t a = j.find('[', p), b = j.find(']', a);
+            if (a != std::string::npos && b != std::string::npos) {
+                std::vector<int> ids;
+                const char* q = j.c_str() + a + 1;
+                const char* end = j.c_str() + b;
+                while (q < end) {
+                    char* nx = nullptr;
+                    long v = strtol(q, &nx, 10);
+                    if (nx == q) { q++; continue; }
+                    ids.push_back((int)v);
+                    q = nx;
+                }
+                if (!ids.empty()) cfg.target_layer_ids = ids;
+            }
+        }
+    }
     // rope_theta nested
     size_t rp = j.find("\"rope_theta\"");
     if (rp != std::string::npos) {
