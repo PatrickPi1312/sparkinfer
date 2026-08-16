@@ -260,14 +260,34 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
       kvc.int8_kv = e ? (e[0] != '0')
                       : (impl_->cfg.muse_glimmer ? false
                          : impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
+    // Only the full-attention layers get a pool slot. The Gated-DeltaNet layers of a hybrid model
+    // carry a recurrent state and never read paged KV, so a slot for them is pure waste -- on
+    // Qwen3.8-27B that is 16 slots of 64, i.e. the pool was 4x larger than the model can use.
+    // Every example main (qwen3_gguf_bench, qwen3_gguf_prefill_check, ...) has always set this;
+    // the server never did, so the process that actually serves traffic was the one paying for it.
+    // Left empty for non-hybrid models, where hybrid_kv_layer_slots gives every layer a slot
+    // anyway and the behaviour is unchanged.
+    kvc.layer_slot = sparkinfer::hybrid_kv_layer_slots(impl_->cfg.n_layers, impl_->cfg.hybrid,
+                                                       impl_->cfg.full_attn_interval);
+    const int kvL = sparkinfer::kv_slot_count(kvc.layer_slot, impl_->cfg.n_layers);
     const size_t epb = (size_t)16 * impl_->cfg.n_kv_heads * impl_->cfg.head_dim;
     const size_t blocks = (size_t)impl_->cfg.max_seq / 16 + 8;
+    // pool_bytes is a bf16-DENOMINATED BUDGET, not an allocation: KVCacheManager derives
+    // total_blocks = pool_bytes / (n_slots * 2 * bf16_bytes_per_block) and then mallocs at the
+    // real element width (int8 just mallocs less). So the `* 2` here is the bf16 element size and
+    // is correct as written -- it must stay even when int8_kv is on, or capacity halves. What has
+    // to match kvc.layer_slot is the SLOT COUNT: passing n_layers while the manager counts 16
+    // slots would hand out 4x the blocks for the same memory rather than shrinking the pool.
     impl_->kv = std::make_unique<sparkinfer::KVCacheManager>(
-        kvc, (size_t)impl_->cfg.n_layers * 2 * epb * 2 * blocks);
+        kvc, (size_t)kvL * 2 * epb * 2 * blocks);
 
-    fprintf(stderr, "[sparkinfer-server] kv_cache: int8=%d blocks=%zu pool_budget=%.1f GiB\n",
-            kvc.int8_kv ? 1 : 0, blocks,
-            (double)impl_->cfg.n_layers * 2.0 * epb * 2.0 * blocks / (1024.0 * 1024.0 * 1024.0));
+    // Reports the slot count actually used, and the resident bytes rather than the bf16 budget --
+    // the old line multiplied by n_layers (all 64) and by 2 regardless of int8, so it overstated
+    // a hybrid int8 pool by 8x and was the number anyone sizing a deployment would have read.
+    fprintf(stderr, "[sparkinfer-server] kv_cache: int8=%d slots=%d/%d blocks=%zu resident=%.1f GiB\n",
+            kvc.int8_kv ? 1 : 0, kvL, impl_->cfg.n_layers, blocks,
+            (double)kvL * 2.0 * epb * (kvc.int8_kv ? 1.0 : 2.0) * blocks
+                / (1024.0 * 1024.0 * 1024.0));
 
     sparkinfer::moe::MoEConfig mc;
     mc.num_experts = impl_->cfg.n_experts;
