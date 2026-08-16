@@ -36,6 +36,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cmath>
+#include <cstdint>
 
 int main(int argc, char** argv) {
     if (argc < 4) {
@@ -134,6 +136,21 @@ int main(int argc, char** argv) {
 
         // Propose token pos+2 from (hidden at pos, embedding of the just-committed token).
         const void* h = model.final_hidden(!post_norm);
+        // Is the hidden actually live? MTP proposing a pure function of the token id (same id ->
+        // same proposal at different positions) is what a zero/stale hidden looks like from the
+        // outside, so check the buffer directly rather than inferring.
+        if (getenv("SPARKINFER_MTP_DEBUG") && total <= 3) {
+            std::vector<uint16_t> probe(cfg.hidden);
+            cudaMemcpy(probe.data(), h, probe.size() * 2, cudaMemcpyDeviceToHost);
+            double acc = 0; int nz = 0;
+            for (uint16_t bits : probe) {
+                uint32_t f = (uint32_t)bits << 16;   // bf16 -> f32
+                float val; memcpy(&val, &f, 4);
+                acc += (double)val * val; nz += (bits != 0);
+            }
+            printf("    hidden: l2=%.4f nonzero=%d/%d  first=[%u %u %u %u]\n",
+                   sqrt(acc), nz, (int)probe.size(), probe[0], probe[1], probe[2], probe[3]);
+        }
         int proposal = -1;
         if (!mtp.forward(h, next, pos, &proposal, nullptr, swap_cat)) {
             printf("[FAIL] mtp forward at pos %d\n", pos);
