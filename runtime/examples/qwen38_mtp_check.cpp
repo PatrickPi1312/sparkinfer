@@ -181,6 +181,24 @@ int main(int argc, char** argv) {
                        lm_argmax, next, lm_argmax == next ? "MATCH" : "MISMATCH");
         }
 
+        // Validate the ONE input neither the stage recomputation nor the reference isolates: both
+        // consume this same dumped hidden, so if it is not what it is assumed to be, both fail
+        // identically -- which is the observed pattern. final_hidden(false)=xn is proven correct
+        // (the lm_head test reproduces the target's tokens from it). final_hidden(true)=x is
+        // assumed to be the pre-final-norm residual, i.e. xn == RMSNorm(x)*final_norm. Never checked.
+        if (getenv("SPARKINFER_MTP_XCHECK") && total <= 2) {
+            std::vector<uint16_t> xb(cfg.hidden), xnb(cfg.hidden);
+            cudaMemcpy(xb.data(),  model.final_hidden(true),  xb.size() * 2,  cudaMemcpyDeviceToHost);
+            cudaMemcpy(xnb.data(), model.final_hidden(false), xnb.size() * 2, cudaMemcpyDeviceToHost);
+            auto f32 = [](uint16_t b) { uint32_t u = (uint32_t)b << 16; float v; memcpy(&v, &u, 4); return v; };
+            double nx = 0, nxn = 0, dot = 0;
+            for (size_t i = 0; i < xb.size(); i++) {
+                double a = f32(xb[i]), c = f32(xnb[i]);
+                nx += a * a; nxn += c * c; dot += a * c;
+            }
+            printf("    x vs xn: |x|=%.3f |xn|=%.3f cos=%+.5f\n",
+                   sqrt(nx), sqrt(nxn), dot / (sqrt(nx) * sqrt(nxn) + 1e-9));
+        }
         dump_step(model.final_hidden(!post_norm), pos, tok, next);
         // Propose token pos+2 from (hidden at pos, embedding of the just-committed token).
         const void* h = model.final_hidden(!post_norm);
