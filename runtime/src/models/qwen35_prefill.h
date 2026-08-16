@@ -41,7 +41,22 @@ struct Qwen35PrefillCtx {
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
 // Returns the argmax at the last prompt position (seed for the first decode step), or -1 if the
 // batched path is unsupported for this model/config (caller falls back to the token loop).
-int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n);
+// out_row_argmax (optional, [n]): greedy argmax for EVERY row, not just the seed row. Needed for
+// speculative verification, which has to know what the target would have produced at each
+// speculated position, not only the last one.
+//
+// Exists because dflash_verify_short_run -- the existing row-batched verifier -- rejects this
+// model outright: its guards require !c.dense_ffn and c.n_experts == 256 (it was written for
+// Qwen3.6-35B-A3B's MoE), while Qwen3.8-27B is dense_ffn with n_experts == 1. prefill_batched_run
+// is the only batched path that accepts a dense FFN, and it already computes every row's final
+// hidden -- it simply discards all but the last before the head.
+//
+// nullptr (the default) leaves this function byte-identical to before: the extra rows are scored
+// only when asked for, after the captured graph has run, using the SAME head branch the seed uses
+// so per-row logits match AR bit-for-bit. Scoring against a differently-quantized head is what
+// broke DFlash's lossless guarantee in #712/#716 -- see dflash_verify_short_run's own note.
+int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
+                        int* out_row_argmax = nullptr);
 
 // Exact short-block DFlash verifier. It evaluates all candidate rows from the live hybrid state,
 // commits only the accepted prefix, and leaves rejected KV rows outside the logical sequence.

@@ -75,7 +75,8 @@ struct Arena {
 };
 } // namespace
 
-int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n) {
+int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
+                        int* out_row_argmax) {
     const Qwen35Config& c = s.cfg;
     // Batched prefill supports the Qwen3.5 dense-hybrid (Qwythos) AND the Qwen3.6-35B-A3B MoE hybrid.
     // Both share the GDN + full-attention batched kernels (identical math at 128/16/32 GDN dims and
@@ -1959,6 +1960,31 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "prefill seed");
     pf_cu(cudaStreamSynchronize(st), "prefill sync");
     int seed = *s.h_out_id;
+
+    // Per-row argmax for speculative verification. Placed AFTER the graph has run and synced (xn
+    // holds real results by now) but BEFORE the arena cleanup below, which may free xn outright.
+    // The head branch here mirrors the seed's exactly -- including the Q4_K pre-quantized dp4a
+    // path -- because a verifier that scores rows through a different head representation than AR
+    // uses will disagree with AR on a fraction of steps and silently break losslessness.
+    if (out_row_argmax) {
+        for (int r = 0; r < N; r++) {
+            const bf16* xr = xn + (size_t)r * H;
+            if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
+                kernels::launch_quantize_q8_1(xr, lm_q8, lm_ad, lm_as, H, st);
+                kernels::launch_gemv_q_dp4a_pq_f32(lm_q8, lm_ad, lm_as, s.w.lm_head, s.logits, c.vocab, H, st);
+            } else if (s.w.lm_head_type) {
+                kernels::launch_gemv_q_f32(xr, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
+            } else {
+                kernels::launch_gemv_f32(xr, s.w.lm_head, s.logits, c.vocab, H, st);
+            }
+            if (c.muse_glimmer && c.final_logit_softcapping > 0.f)
+                kernels::launch_logit_softcap(s.logits, 1, c.vocab, c.logit_scale, c.final_logit_softcapping, st);
+            kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+            pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "pfb row argmax");
+            pf_cu(cudaStreamSynchronize(st), "pfb row sync");
+            out_row_argmax[r] = *s.h_out_id;
+        }
+    }
 
     // Release rather than hold when this call's scratch is too big to keep resident.
     if (!arena_reuse ||
