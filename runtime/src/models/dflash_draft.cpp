@@ -468,7 +468,13 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
     // native [vocab,hidden] ("out,in") layout -- dflash_kernels::launch_gemv_batched16_f32
     // reads W the same way a single-row GEMV does, so no relayout is needed. Lets
     // forward_block score a whole block with one batched GEMV instead of a per-token loop.
-    if (!p_->lm_head_bf16 && vocab > 0 && hidden > 0) {
+    // ONLY the BW==16 batched-head path (launch_gemv_batched16_f32 below) reads this bf16 copy;
+    // every other block width already scores against the target's QUANTIZED head on-read, via
+    // launch_gemv_q4k_dp4a_multirow_f32 or the per-row launch_gemv_q_f32 fallback. Materializing
+    // it regardless costs vocab*hidden*2 bytes for nothing at any other block size -- 2.54 GB for
+    // DSpark (V=248320, H=5120), which is precisely what pushed Qwen3.8-27B + DSpark past 32 GB
+    // and made the draft OOM in its own lm_head dequant while the weights themselves fit.
+    if (p_->cfg.block_size == 16 && !p_->lm_head_bf16 && vocab > 0 && hidden > 0) {
         p_->lm_head_bf16 = p_->alloc<bf16>((size_t)vocab * hidden);
         if (lm_head_type != 0) {
             kernels::launch_gguf_dequant(lm_head_type, lm_head, p_->lm_head_bf16,
