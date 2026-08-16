@@ -553,7 +553,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         ? kernels::prefill_nvfp4_workspace_bytes(N, H, qdim) : 0;
     const bool muse_nvfp4_down = muse_nvfp4 && s.w.layers[0].down_fp4 &&
                                  kernels::prefill_nvfp4_supported(N, H, ffn);
-    const bool q38_nvfp4_down = q38_nvfp4 && s.w.layers[0].down_fp4 &&
+    // ffn_down on NVFP4 is DEFAULT OFF, the same call Muse Glimmer already made: #816 put down
+    // (and wo) on NVFP4 for Muse, it broke batched-prefill accuracy while passing the eval bot's
+    // own gate, and #819 reverted it. The note a few lines above -- "Down stays on the
+    // higher-fidelity #808 quantized path because its error enters the residual directly" -- is
+    // that revert's conclusion, and it applies to Qwen3.8 for the same structural reason: down's
+    // output is added straight into the residual stream, so its error is not attenuated by a
+    // later norm the way gate/up's is, and it compounds across 64 layers and every token.
+    // Qwen3.8 nevertheless kept this leg on, which is what corrupts the prefilled state.
+    // SPARKINFER_Q38_NVFP4_DOWN=1 re-enables it (reproduces the corruption).
+    static const bool q38_down_fp4 = [] {
+        const char* e = getenv("SPARKINFER_Q38_NVFP4_DOWN");
+        return e && e[0] == '1';
+    }();
+    const bool q38_nvfp4_down = q38_down_fp4 && q38_nvfp4 && s.w.layers[0].down_fp4 &&
                                 kernels::prefill_nvfp4_supported(N, H, ffn);
     const bool nvfp4_down = muse_nvfp4_down || q38_nvfp4_down;
     // Same correction as fp4_down_a below: the down GEMM runs at m = fn <= FC, never at m = N.
