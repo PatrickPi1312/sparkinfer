@@ -60,6 +60,29 @@ def embed_rows(path, ids, hidden):
     return rows
 
 
+def lm_head_rows(path, ids, hidden):
+    """Real lm_head rows: FP8 E4M3 weights with a per-output-channel BF16 scale.
+    row = float(e4m3(weight[r])) * scale[r]. float8_e4m3fn is the right dtype -- plain
+    'float8_e4m3' decodes this checkpoint's bytes to NaN."""
+    import ml_dtypes
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        hdr = json.loads(f.read(n))
+        base = 8 + n
+        wk = next(k for k in hdr if k.endswith("lm_head.weight"))
+        sk = next(k for k in hdr if k.endswith("lm_head.weight_scale"))
+        assert hdr[wk]["dtype"] == "F8_E4M3", hdr[wk]["dtype"]
+        w_off, s_off = hdr[wk]["data_offsets"][0], hdr[sk]["data_offsets"][0]
+        out = np.empty((len(ids), hidden), dtype=np.float32)
+        for j, r in enumerate(ids):
+            f.seek(base + w_off + r * hidden)
+            raw = np.frombuffer(f.read(hidden), dtype=np.uint8)
+            f.seek(base + s_off + r * 2)
+            sc = (np.frombuffer(f.read(2), dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)[0]
+            out[j] = raw.view(ml_dtypes.float8_e4m3fn).astype(np.float32) * sc
+    return out
+
+
 def rms(x, w):
     return (x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + EPS)).astype(np.float32) * w
 
@@ -134,18 +157,18 @@ for neox in (True, False):
     xf = hh.astype(np.float32) @ W["mtp.layers.0.mlp.down_proj.weight"].T + xa
     fin = rms(xf, W["mtp.norm.weight"])
 
-    # lm_head is FP8 in the main shard; use the tied embedding matrix rows we already have as a
-    # cheap proxy is NOT valid, so instead report the top-1 over a candidate set: the tokens the
-    # target actually produced. If MTP is right, argmax over {t_{i+2}} vs other positions' tokens
-    # should pick t_{i+2} far more often than chance.
+    # Score with the REAL lm_head, not embedding rows. tie_word_embeddings is False for this
+    # checkpoint, so an embedding-row proxy is an unrelated matrix and produces pure noise -- an
+    # earlier revision of this script did exactly that and its ~0 result meant nothing. Only the
+    # rows for observed tokens are needed, so the 248320x5120 FP8 matrix is read by offset.
     cand = np.array(sorted(set(tok_out)))
-    cand_emb = embed_rows(f"{ckpt}/model.safetensors", cand.tolist(), H)
-    logit = fin @ cand_emb.T
+    cand_w = lm_head_rows(f"{ckpt}/model.safetensors", cand.tolist(), H)
+    logit = fin @ cand_w.T
     pick = cand[logit.argmax(-1)]
     hit2 = sum(1 for i in range(n - 2) if pick[i] == tok_out[i + 2])
     hit1 = sum(1 for i in range(n - 1) if pick[i] == tok_out[i + 1])
     print(f"  RoPE={'NEOX' if neox else 'NORMAL'}:  predict t+2 {hit2}/{n-2} = {hit2/(n-2):.3f}"
           f"   predict t+1 {hit1}/{n-1} = {hit1/(n-1):.3f}")
-print("\nNOTE: scoring uses tied-embedding rows as a proxy head over the observed-token candidate\n"
-      "set, not the real FP8 lm_head -- absolute rates understate, but a correct pairing should\n"
-      "still stand out sharply against the wrong one.")
+print("\nNOTE: scored with the REAL FP8 lm_head, restricted to the observed-token candidate set.\n"
+      "Restricting the candidates inflates absolute rates versus a full 248320-way argmax, so read\n"
+      "these as SEPARATION between variants, not as the achievable acceptance rate.")
