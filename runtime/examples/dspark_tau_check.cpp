@@ -103,8 +103,19 @@ int main(int argc, char** argv) {
     const std::vector<int> ar = model.generate(prompt, max_new);
     if (ar.empty()) { printf("[FAIL] AR reference produced nothing\n"); return 1; }
 
-    model.set_dflash_draft(&draft);
+    // Isolation: does hidden-state CAPTURE alone perturb the target's decode? The speculative
+    // loop differs from plain AR in exactly two ways -- capture is on, and a draft proposes. If AR
+    // with capture enabled already diverges from AR without it, the fault is in the capture path
+    // and nothing about the draft or the verify is implicated.
     model.set_dflash_capture(true, dc.target_layer_ids);
+    const std::vector<int> ar_cap = model.generate(prompt, max_new);
+    size_t capn = std::min(ar.size(), ar_cap.size()), capsame = 0;
+    while (capsame < capn && ar[capsame] == ar_cap[capsame]) capsame++;
+    printf("CAPTURE-only AR: matched %zu/%zu vs plain AR  [", capsame, capn);
+    for (size_t i = 0; i < std::min<size_t>(8, ar_cap.size()); i++) printf(" %d", ar_cap[i]);
+    printf(" ]\n");
+
+    model.set_dflash_draft(&draft);
     draft.reset();
     sparkinfer::Qwen35Model::DFlashStats stats;
     const std::vector<int> spec = model.dflash_generate(prompt, max_new, &stats);
