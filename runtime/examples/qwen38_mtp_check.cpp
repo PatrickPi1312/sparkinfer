@@ -109,11 +109,25 @@ int main(int argc, char** argv) {
     // reads like an MTP bug. It is not.
     if (!kv.allocate(0, cfg.max_seq)) { printf("[FAIL] kv allocate\n"); return 1; }
 
-    // Prefill: run the prompt through the target, no sampling until the last token.
+    // Prefill: run the prompt through the target, AND run the MTP head in lockstep so its own KV
+    // is populated over the same positions.
+    //
+    // This is not optional bookkeeping. mtp.layers.0 is a full-attention layer that attends over
+    // ITS OWN K/V history, and flash_decode_split reads seq_len = pos+1 entries. Writing only the
+    // current position leaves every earlier slot uninitialized, so the draft attends over garbage
+    // and produces structured-but-wrong proposals -- which is precisely the 0/63 with a live,
+    // varying target hidden that this check first measured. In a real speculative loop the head
+    // runs at every committed position anyway, so its KV fills naturally; the harness has to do
+    // the same or it is not measuring the same thing.
     int tok = prompt[0];
     int pos = 0;
     for (; pos + 1 < (int)prompt.size(); pos++) {
         if (model.forward_token(prompt[pos], pos, false) < 0) { printf("[FAIL] prefill\n"); return 1; }
+        int warm = -1;
+        if (!mtp.forward(model.final_hidden(!post_norm), prompt[pos + 1], pos, &warm, nullptr, swap_cat)) {
+            printf("[FAIL] mtp prefill at pos %d\n", pos);
+            return 1;
+        }
     }
 
     int agree = 0, total = 0;
