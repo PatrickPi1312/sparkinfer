@@ -1257,7 +1257,28 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // so the FFN residual can ride the residual-fused GEMM straight into x per chunk.
             // Muse Glimmer must NOT residual-fuse: the post-FFN sandwich (norm_then_add below) needs
             // the RAW FFN output in `ao`, and the residual it adds onto is `h` (not x).
-            const bool ffn_fused = !c.muse_glimmer && resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
+            // The FP4 arm below writes the RAW FFN output to `ao` and never folds the residual --
+            // it ends in `continue`, skipping every fused-residual path in this loop. So the fused
+            // decision has to account for it, or the post-loop
+            //     } else if (!ffn_fused) { x += ao; }
+            // is skipped on the belief the down GEMM already accumulated into x, and the whole FFN
+            // contribution is dropped from the residual stream, on every one of 64 layers, for
+            // every token of every prefill. Fluent output, wrong content, worse with context.
+            //
+            // Muse Glimmer shares the same FP4 arm and was never affected: c.muse_glimmer already
+            // forces ffn_fused false, and its sandwich norm consumes `ao` explicitly, so its FP4
+            // output was always read back. That asymmetry is why this looked like a Qwen3.8 kernel
+            // bug -- the NVFP4 GEMM is exact to ~0.14 rel err at both models' shapes
+            // (runtime/examples/nvfp4_gemm_check.cpp); the residual bookkeeping around it was not.
+            //
+            // Keyed on whether the arm CAN run, not on whether a given chunk took it: chunks would
+            // otherwise mix fused and unfused within one layer and a single post-loop add could not
+            // be right for both. With this false the non-FP4 chunks write `ao` too, so one add at
+            // the end covers every chunk.
+            const bool ffn_fp4_possible = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
+                                          w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as;
+            const bool ffn_fused = !c.muse_glimmer && !ffn_fp4_possible &&
+                                   resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
