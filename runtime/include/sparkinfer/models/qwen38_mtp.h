@@ -98,6 +98,32 @@ public:
 
     size_t vram_bytes() const;
 
+    // Allocates scratch + the head's OWN paged KV cache. Must be called once before forward().
+    // The MTP layer is a full-attention layer with its own K/V history, entirely separate from
+    // the target's: it attends over the draft's own accepted prefix, so it cannot share the
+    // target's pool. ~67 MiB bf16 at max_seq=16384 (4 kv heads * 256 * 2 * 16384 * 2B).
+    bool init_runtime(int max_seq);
+
+    // One draft step.
+    //   target_hidden : [hidden] bf16, the target's FINAL hidden state at position `pos`
+    //                   (post-last-layer, PRE final norm -- the target's own norm is not applied,
+    //                   MTP has its own pre_fc_norm_hidden for this branch).
+    //   next_token_id : the token the target just committed at position `pos`+1, whose embedding
+    //                   is the second fc input. MTP predicts the token AFTER it.
+    //   pos           : absolute position for the MTP layer's RoPE and KV write.
+    //   out_argmax    : host, [1]. The proposed token id.
+    // Greedy only -- speculative decoding needs exact argmax determinism to stay lossless, the
+    // same constraint dflash_generate documents.
+    bool forward(const void* target_hidden, int next_token_id, int pos,
+                 int* out_argmax, cudaStream_t stream = nullptr);
+
+    // Drop the draft's KV back to `keep` tokens after a rejected proposal. Without this the draft
+    // desynchronises from the target on the first mismatch and every later proposal is scored
+    // against a history the target never had.
+    void crop(int keep);
+    void reset();
+    int  seq_len() const;
+
 private:
     struct Impl;
     Impl* p_;
