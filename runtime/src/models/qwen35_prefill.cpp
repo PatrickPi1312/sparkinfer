@@ -2189,6 +2189,20 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (type == 0) {
             return kernels::launch_gemv_rows(in, w, out, N, no, k, st);
         }
+        // SI_QTYPE_FP8: the GDN projections have been checkpoint-native FP8 since #832 ("native
+        // FP8 GDN GEMV"), which this verifier predates -- it only knew bf16/Q8_0/Q4_K/Q6_K, so a
+        // Qwen3.8 verify died here after clearing the dense-FFN stage.
+        //
+        // Row loop rather than a batched FP8 GEMM, deliberately: AR decode drives exactly this
+        // kernel at one row, so N one-row calls are bit-identical to N AR steps by construction.
+        // A batched variant would change the reduction order and put losslessness back at risk for
+        // a saving on the GDN projections, which are a small share of the layer. Correctness first;
+        // this can be widened later against a known-lossless baseline.
+        if (type == kernels::SI_QTYPE_FP8) {
+            for (int r = 0; r < N; ++r)
+                kernels::launch_gemv_fp8(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
+            return true;
+        }
         if (type != 8 && type != 12 && type != 14) {
             fprintf(stderr, "[dflash-verify] unsupported projection type=%d N=%d K=%d\n", type, no, k);
             return false;

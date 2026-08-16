@@ -99,6 +99,14 @@ int main(int argc, char** argv) {
     kv.free(0); model.release_prefix_session();
     const std::vector<int> ar = model.generate(prompt, (int)spec.size());
 
+    // An empty AR reference must FAIL, not pass vacuously: min(0, k) == 0 makes "matched 0/0"
+    // satisfy same==n and report lossless=YES while comparing nothing at all. Observed for real --
+    // generate() returned no tokens and the run still claimed success.
+    if (ar.empty() || spec.empty() || ar.size() < spec.size()) {
+        printf("DSPARK lossless=UNKNOWN  ar=%zu spec=%zu -- reference unusable, not a pass\n",
+               ar.size(), spec.size());
+        return 1;
+    }
     size_t n = std::min(ar.size(), spec.size()), same = 0;
     while (same < n && ar[same] == spec[same]) same++;
     // A speculative path is lossless BY CONSTRUCTION -- every emitted token is a target argmax --
