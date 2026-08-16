@@ -89,9 +89,66 @@ static bool run_case(const Shape& s, int m, double& rel_out) {
     return true;
 }
 
+// Self-test: at a tiny shape, check BOTH the bf16 reference and the NVFP4 sequence against a CPU
+// matmul. Without this the harness cannot tell "the kernel is wrong" from "I drove the reference
+// GEMM with the wrong operand layout" -- and those two look identical in the output.
+static void cpu_selftest() {
+    const int m = 8, n = 128, k = 128;
+    std::mt19937 rng(7u);
+    std::normal_distribution<float> nd(0.f, 0.05f);
+    std::vector<__nv_bfloat16> hA((size_t)m * k), hW((size_t)n * k);
+    std::vector<float> fA(hA.size()), fW(hW.size());
+    for (size_t i = 0; i < hA.size(); i++) { fA[i] = nd(rng); hA[i] = __float2bfloat16(fA[i]); }
+    for (size_t i = 0; i < hW.size(); i++) { fW[i] = nd(rng); hW[i] = __float2bfloat16(fW[i]); }
+    std::vector<double> cpu((size_t)m * n, 0.0);
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++) {
+            double acc = 0;
+            for (int t = 0; t < k; t++)
+                acc += (double)__bfloat162float(hA[(size_t)i * k + t]) *
+                       (double)__bfloat162float(hW[(size_t)j * k + t]);
+            cpu[(size_t)i * n + j] = acc;
+        }
+    void *dA = nullptr, *dW = nullptr, *dRef = nullptr, *dOut = nullptr;
+    void *qa = nullptr, *sa = nullptr, *qb = nullptr, *sb = nullptr, *ws = nullptr;
+    cudaMalloc(&dA, hA.size() * 2); cudaMalloc(&dW, hW.size() * 2);
+    cudaMalloc(&dRef, (size_t)m * n * 2); cudaMalloc(&dOut, (size_t)m * n * 2);
+    cudaMalloc(&qa, sparkinfer::kernels::prefill_nvfp4_data_bytes(m, k));
+    cudaMalloc(&sa, sparkinfer::kernels::prefill_nvfp4_scale_bytes_a(m, k));
+    cudaMalloc(&qb, sparkinfer::kernels::prefill_nvfp4_data_bytes(n, k));
+    cudaMalloc(&sb, sparkinfer::kernels::prefill_nvfp4_scale_bytes_b(n, k));
+    const size_t wsb = sparkinfer::kernels::prefill_nvfp4_workspace_bytes(m, n, k);
+    if (wsb) cudaMalloc(&ws, wsb);
+    cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(dW, hW.data(), hW.size() * 2, cudaMemcpyHostToDevice);
+    GemmConfig cfg; cfg.layout_a = GemmLayout::ROW_MAJOR; cfg.layout_b = GemmLayout::COL_MAJOR;
+    sparkinfer::kernels::launch_gemm(dA, dW, dRef, m, n, k, 1.f, 0.f, cfg, nullptr);
+    sparkinfer::kernels::launch_prefill_nvfp4_quant_a(dA, qa, sa, m, k, nullptr);
+    sparkinfer::kernels::launch_prefill_nvfp4_quant_b(dW, qb, sb, n, k, nullptr);
+    sparkinfer::kernels::launch_prefill_nvfp4_gemm(qa, sa, qb, sb, dOut, m, n, k, ws, nullptr, 1.f);
+    cudaDeviceSynchronize();
+    std::vector<__nv_bfloat16> hRef((size_t)m * n), hOut((size_t)m * n);
+    cudaMemcpy(hRef.data(), dRef, hRef.size() * 2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hOut.data(), dOut, hOut.size() * 2, cudaMemcpyDeviceToHost);
+    auto rel = [&](const std::vector<__nv_bfloat16>& v) {
+        double num = 0, den = 0;
+        for (size_t i = 0; i < cpu.size(); i++) {
+            const double d = cpu[i] - __bfloat162float(v[i]);
+            num += d * d; den += cpu[i] * cpu[i];
+        }
+        return std::sqrt(num / (den > 0 ? den : 1));
+    };
+    printf("cpu self-test (m=8 n=128 k=128):  bf16_gemm_vs_cpu=%.4f   nvfp4_vs_cpu=%.4f\n",
+           rel(hRef), rel(hOut));
+    printf("  (bf16 should be ~0.00; if it is ~1.41 the HARNESS drives launch_gemm wrong,\n"
+           "   not the NVFP4 kernel -- interpret the sweep below accordingly)\n");
+    for (void* p : {dA, dW, dRef, dOut, qa, sa, qb, sb, ws}) if (p) cudaFree(p);
+}
+
 int main(int argc, char** argv) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
+    cpu_selftest();
     const Shape shapes[] = {
         {"qwen3.8 gate/up", 17408, 5120},   // the broken model's FFN in-projection
         {"qwen3.8 down",     5120, 17408},
