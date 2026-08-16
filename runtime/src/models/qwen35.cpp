@@ -4545,10 +4545,28 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes, cudaMemcpyHostToDevice);
         cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
-        s.owned.push_back(payload);
+        // SPARKINFER_QWEN38_PREFILL_NVFP4=0 drops the checkpoint-native NVFP4 copies once they
+        // have been consumed to build the Q4_K decode weights. They exist ONLY to make batched
+        // prefill faster -- decode always reads gate_q/up_q/down_q -- and they are not small: at
+        // 4.5 bits per weight over a 64-layer, 17408-wide dense FFN that is ~9.6 GB held resident
+        // purely for prefill throughput, on top of the Q4_K copy's own 9.6 GB.
+        //
+        // That second residency is what puts this model at 29.7 GB on a 32.6 GB card at ctx=16k,
+        // which is why the checkpoint's own headline -- 262144-token context on a 5090 -- is out
+        // of reach here even though the weights nominally fit in ~19 GB. Turning these off trades
+        // prefill throughput for the KV headroom that long context actually needs.
+        //
+        // Registered in s.owned ONLY when kept: otherwise the payload is transient, still needed
+        // as the SOURCE for q4k_from_nvfp4 below and then freed by the caller. Keeping it out of
+        // s.owned is what makes that early free safe (nothing double-frees at teardown).
+        static const bool keep_prefill_fp4 = [] {
+            const char* e = getenv("SPARKINFER_QWEN38_PREFILL_NVFP4");
+            return !(e && e[0] == '0');
+        }();
+        if (keep_prefill_fp4) s.owned.push_back(payload);
         fp4_alpha = (global_scale != 0.f) ? (1.f / global_scale) : 1.f;
         const void* packed = static_cast<char*>(payload) + hdr + scale_bytes;
-        if (kernels::prefill_nvfp4_supported(128, rows, cols)) {
+        if (keep_prefill_fp4 && kernels::prefill_nvfp4_supported(128, rows, cols)) {
             void* sf = nullptr;
             const size_t sf_bytes = kernels::prefill_nvfp4_scale_bytes_b(rows, cols);
             if (sf_bytes && cudaMalloc(&sf, sf_bytes) == cudaSuccess &&
@@ -4777,6 +4795,15 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.gate_q = q4k_from_nvfp4(g_pay, c.moe_ffn, H, w.gate_qtype);
             w.up_q = q4k_from_nvfp4(u_pay, c.moe_ffn, H, w.up_qtype);
             w.down_q = q4k_from_nvfp4(d_pay, H, c.moe_ffn, w.down_qtype);
+            if (!w.gate_fp4) {
+                // Prefill copies disabled: the payloads were deliberately not registered in
+                // s.owned (see keep_nvfp4), the Q4_K decode copies above are built, so release the
+                // NVFP4 source now rather than at teardown. Keyed on gate_fp4 being unset, which
+                // is exactly the condition under which keep_nvfp4 skipped the push.
+                cudaFree(const_cast<void*>(g_pay));
+                cudaFree(const_cast<void*>(u_pay));
+                cudaFree(const_cast<void*>(d_pay));
+            }
             if (w.gate_fp4 && w.up_fp4) ++gu_ready;
         }
         if (!w.gate_q || !w.up_q || !w.down_q) return false;
