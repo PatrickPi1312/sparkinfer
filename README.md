@@ -78,7 +78,7 @@ marginally slower on this model, so llama.cpp's better configuration is the one 
 
 | context | SparkInfer | llama.cpp | Δ |
 |---:|---:|---:|---:|
-| 128 | 2,033 tok/s | **2,782** tok/s | **−26.9%** |
+| 128 | **5,006** tok/s | 2,782 tok/s | **+79.9%** |
 | 4k | **7,548** tok/s | 3,670 tok/s | **+105.7%** |
 | 16k | **7,596** tok/s | 3,496 tok/s | **+117.2%** |
 
