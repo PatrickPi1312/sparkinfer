@@ -2424,6 +2424,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     int* btab_rows = (N > 1) ? a.alloc<int>((size_t)N * mbs) : nullptr;
     if (!a.ok) { fprintf(stderr, "[dflash-verify] block-table scratch allocation failed\n"); return -1; }
     bool supported = true;
+    int  vfail_L = -1;   // layer whose stage declined, for the bailout diagnostic below
     bool recording = false;
     // Abandon an in-progress capture so the stream is usable again. EVERY early return between
     // "verify graph begin" and "verify graph end" must call this first: cudaStreamEndCapture is
@@ -2476,6 +2477,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
     for (int L = 0; L < c.n_layers && supported; ++L) {
+        vfail_L = L;
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (w.linear_attn) {
             bf16* rq = rec_qkv + (size_t)L * N * lqkv;
@@ -2734,6 +2736,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         capture(L);
     }
     if (!supported) {
+        // Name the layer. Every decline that has an obvious cause already prints one (missing
+        // dense weights, unsupported MoE shape, unsupported projection TYPE); reaching here with
+        // none of those means a kernel launcher itself returned false, which is otherwise silent
+        // and indistinguishable from "this path is simply not implemented for your model".
+        fprintf(stderr, "[dflash-verify] declined at layer=%d (linear_attn=%d) N=%d start=%d\n",
+                vfail_L, (vfail_L >= 0 && vfail_L < (int)s.w.layers.size())
+                             ? (int)s.w.layers[vfail_L].linear_attn : -1,
+                N, start_pos);
         // Reached when a layer's projection type is one proj() cannot drive (anything but
         // 0/8/12/14 -- notably SI_QTYPE_FP8 108 and SI_QTYPE_NVFP4 109, i.e. EVERY GDN layer of a
         // compressed-tensors Qwen3.8 checkpoint). Falling back to the token loop is correct; doing
