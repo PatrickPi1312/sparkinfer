@@ -36,6 +36,31 @@ int main(int argc, char** argv) {
         printf("usage: %s <qwen38_dir> <dspark_dir> <max_new> <id0> [id1 ...]\n", argv[0]);
         return 2;
     }
+    // Flash-decode's split-K reduction is atomic and therefore order-dependent: default splits
+    // (adaptive, effectively ~32) gave 27-32/32 agreement across repeat runs of the SAME decode,
+    // vs 32/32 x3 with SPARKINFER_NSPLITS=1. A tau/lossless measurement needs the target's own
+    // AR decode to be deterministic, or a real divergence from the verify head becomes
+    // indistinguishable from ordinary split-K noise. `0` (don't overwrite) so an explicit env
+    // override still wins for anyone deliberately sweeping splits.
+    setenv("SPARKINFER_NSPLITS", "1", 0);
+    // Same story, second and third instances (2026-08-17): TWO more atomic split-K prefill GEMMs,
+    // found only after a multi-round dflash_generate run that looked individually correct at
+    // every kernel level (LM head, GDN conv/scan/commit all independently verified bit-exact
+    // against AR) still diverged nondeterministically -- different divergence points across
+    // identical repeat runs of the SAME prompt, proof it was hardware split-K noise and not a
+    // logic bug.
+    //   - prefill_gemm_i8.cu: atomicAdd into P[M,N]. int8 prefill is ON by default for dense
+    //     models (use_i8 = !moe), so this needs an explicit override.
+    setenv("SPARKINFER_PREFILL_I8", "0", 0);
+    //   - prefill_gemm_skinny.cu: a SEPARATE atomicAdd split-K path that launch_prefill_gemm
+    //     tries FIRST for narrow-N GEMMs (kernels/csrc/cuda/fused/batched_prefill.cu:1191) --
+    //     runs unconditionally for the bf16 fallback too, so disabling int8 prefill alone was not
+    //     enough (still 1/3 runs diverged). This is exactly Qwen3.8-27B's shape: its 48-v-head
+    //     ssm_alpha/ssm_beta GDN gate projections are what the kernel's own comments call out as
+    //     the motivating case. SPLITK=0 keeps the optimized narrow-N kernel, only turns off its
+    //     atomic accumulation. 5/5 lossless=YES on both the 32- and 40-token repros after both
+    //     pins landed (was still nondeterministic with only the first).
+    setenv("SPARKINFER_PREFILL_SKINNY_SPLITK", "0", 0);
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
 
@@ -49,7 +74,9 @@ int main(int argc, char** argv) {
     QwenCheckpointKind kind{};
     std::string err;
     if (!qwen_checkpoint_open(tpath, cfg, g, kind, err)) { printf("[FAIL] %s\n", err.c_str()); return 1; }
-    cfg.max_seq = std::max(2048, (int)prompt.size() + max_new + 64);
+    const char* min_maxseq_env = getenv("SPARKINFER_DSPARK_MIN_MAXSEQ");
+    cfg.max_seq = std::max(min_maxseq_env ? atoi(min_maxseq_env) : 2048,
+                           (int)prompt.size() + max_new + 64);
 
     auto rt = sparkinfer::Runtime::create({}); rt->initialize();
     sparkinfer::KVCacheConfig kvc;
@@ -141,6 +168,14 @@ int main(int argc, char** argv) {
     printf(" ]\n  SPEC[");
     for (size_t i = 0; i < std::min<size_t>(8, spec.size()); i++) printf(" %d", spec[i]);
     printf(" ]\n");
+    if (same < n) {
+        size_t lo = same >= 3 ? same - 3 : 0, hi = std::min(n, same + 5);
+        printf("  first divergence at index %zu, window [%zu,%zu):\n  AR  [", same, lo, hi);
+        for (size_t i = lo; i < hi; i++) printf(" %d", ar[i]);
+        printf(" ]\n  SPEC[");
+        for (size_t i = lo; i < hi; i++) printf(" %d", spec[i]);
+        printf(" ]\n");
+    }
     printf("DSPARK tau=%.3f  steps=%d  tokens=%zu  decode_s=%.3f\n",
            stats.mean_accept, stats.steps, spec.size(), stats.decode_s);
     printf("DSPARK lossless=%s  matched %zu/%zu\n", same == n ? "YES" : "NO", same, n);
