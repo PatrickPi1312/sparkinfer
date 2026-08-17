@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -258,6 +259,29 @@ def _save_scores(data):
         print(f">> modelopt scores save skipped: {e}")
 
 
+def _report_pct(pct: float, reject: bool = False) -> float:
+    """Round a delta so the number shown can never contradict the label it produced.
+
+    round() breaks that: PR #863 gained 9.9996% on decode@16k, which is BELOW the 10% L threshold
+    and correctly scored M -- but round(9.9996, 1) prints "10.0%", so the comment read
+    "delta=10.0%  eval-modelopt:M" and looked like an off-by-one in the buckets. (It missed L by
+    0.0004 points: it needed 90.17404 tok/s and measured 90.1737.) More decimals do not help --
+    that value reads as 10.0 / 10.00 / 10.000 and only separates at the fourth.
+
+    Which way to break the tie depends on which side the result landed, and getting only one side
+    right just moves the confusion:
+
+      PASSING (none/XS/S/M/L/XL) -> truncate TOWARD zero. A gain then never displays into a bucket
+      it did not earn (9.9996 -> 9.9), and a small negative that still cleared the -2% floor never
+      displays AT the floor (-1.96 -> -1.9) and so never reads as a REJECT it isn't.
+
+      REJECT -> truncate AWAY from zero (-2.04 -> -2.1), so the regression that triggered it never
+      displays milder than the threshold it broke.
+    """
+    scaled = pct * 10.0
+    return (math.floor(scaled) if reject else math.trunc(scaled)) / 10.0
+
+
 def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
     """Return (label, delta_pct, pass_ok, reason). Identical logic to pr_dflash_bot.py's
     tier_from_gain — same bucket thresholds, same no-regression floor. `metric` only affects the
@@ -268,11 +292,11 @@ def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
         return "REJECT", 0.0, False, f"main {metric} baseline is 0"
     if pr_tps < REGRESS_TOL * main_tps:
         pct = 100.0 * (pr_tps - main_tps) / main_tps
-        return "REJECT", round(pct, 1), False, (
+        return "REJECT", _report_pct(pct, reject=True), False, (
             f"{metric} regression: {pr_tps:.2f} < {100 * REGRESS_TOL:.0f}% of main {main_tps:.2f}"
         )
     g = (pr_tps - main_tps) / main_tps
-    pct = round(100.0 * g, 1)
+    pct = _report_pct(100.0 * g)
     if g < SIG:
         return "none", pct, True, f"within significance gate — not a verified {metric} improvement"
     for thr, name in BUCKETS:
