@@ -3200,10 +3200,43 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // draft block on its own stream. Ordering matters: the target must be in flight before
         // the draft's launches start, or the draft queues ahead of it. A deferred collect also
         // avoids spawning and joining a std::thread on every decode step.
+        // Overlap DEFAULT OFF (2026-08-17): leaving verify row 0 in flight while the draft issues
+        // its block on another stream breaks DFlash's lossless guarantee. Measured on
+        // Qwen3.8-27B + DSpark by repeating the SAME speculative generation in one process
+        // (dspark_tau_check's SPARKINFER_DSPARK_SPEC_REPS): 5-7 of 40 repeats emitted a different
+        // token sequence, and those repeats also stopped matching plain AR. Serialising here --
+        // the ONLY change -- gives 0 of 40 on the same prompt, twice, on two different prompts.
+        //
+        // What the overlap perturbs is the ACCEPT GROUPING, and that is why this hid for so long:
+        // in the token loop a different grouping is invisible, because every emitted token is a
+        // target argmax at its own position either way, so the output is identical and only `keep`
+        // moves. The adaptive gate is what turns it into a correctness bug -- compact_score arms
+        // the batched verify on a full-block accept, so a grouping that races into keep ==
+        // kProposalDepth+1 switches the next step's verify path and changes what is emitted.
+        // Consistent with every bisection result: the compact path alone (which never overlaps)
+        // was clean 0/25, the token loop alone was clean 0/40 despite ALSO overlapping (grouping
+        // varies but tokens do not), and only the adaptive mix flaked.
+        //
+        // Ruled out first, each with its own experiment: uninitialised capture buffers (poisoning
+        // dflash_hidden/dflash_context/th_scratch with 0x00 and 0xff both still flaked), the GDN
+        // projection fork onto stream_k (SPARKINFER_DFLASH_SHARED_STREAM=0 still flaked 7/40),
+        // mid-stream entry into the batched verify (forced at steps 0/1/3/8: all lossless), a
+        // single armed compact step followed by a return to the token loop (lossless), the plain
+        // AR path (30 in-process repeats plus 20 fresh processes, identical) and the capture-ON
+        // target path with no draft at all (40 repeats, identical).
+        //
+        // The exact racing object is NOT yet identified, so this disables the optimisation rather
+        // than claiming to have repaired it. Cost, measured: decode 1.322 -> 1.376 s on the prose
+        // prompt (+4.1%) and 1.303 -> 1.347 s on the numeric one (+3.4%), tau unchanged in both.
+        // SPARKINFER_DFLASH_OVERLAP=1 restores it for anyone measuring that trade deliberately.
+        static const bool overlap_on = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_OVERLAP");
+            return e && e[0] == '1';
+        }();
         int p0 = -1;
         if (!compact_verify) {
             set_dflash_capture_row(0);
-            s.defer_decode_sync = true;
+            s.defer_decode_sync = overlap_on;
             p0 = forward_token(block[0], start, true);
             s.defer_decode_sync = false;
         }

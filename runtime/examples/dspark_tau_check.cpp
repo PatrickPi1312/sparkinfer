@@ -273,11 +273,78 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < std::min<size_t>(8, ar_cap.size()); i++) printf(" %d", ar_cap[i]);
     printf(" ]\n");
 
+    // Capture-ON AR determinism probe (SPARKINFER_DSPARK_ARCAP_REPS=N). AR-REPS above runs with
+    // capture OFF, so it exercises the plain decode graph -- but the token-loop VERIFY drives
+    // forward_token with dflash capture ON, which is a different graph plus the extra
+    // launch_capture_rows write into dflash_hidden. The compact verify never uses that path at all
+    // (it captures inside its own batched graph instead), which is exactly the asymmetry between
+    // the two verify modes. This probe repeats the capture-ON generation with NO draft involved, so
+    // a mismatch here localises the nondeterminism to the target's own capture-decode path rather
+    // than to the draft or to the overlap between them.
+    if (const char* creps_env = getenv("SPARKINFER_DSPARK_ARCAP_REPS")) {
+        const int creps = atoi(creps_env);
+        int cmis = 0;
+        for (int r = 1; r < creps; r++) {
+            model.clear_prefix_cache();
+            const std::vector<int> again = model.generate(prompt, max_new);
+            if (again.empty()) { printf("ARCAP-REPS rep %d produced nothing\n", r); cmis++; continue; }
+            size_t nn = std::min(ar_cap.size(), again.size()), sm = 0;
+            while (sm < nn && ar_cap[sm] == again[sm]) sm++;
+            if (sm != nn || ar_cap.size() != again.size()) {
+                cmis++;
+                printf("ARCAP-REPS rep %d DIVERGED at %zu/%zu\n", r, sm, nn);
+            }
+        }
+        printf("ARCAP-REPS %d reps, %d mismatches (capture ON, no draft)\n", creps, cmis);
+    }
+
     model.set_dflash_draft(&draft);
     draft.reset();
     sparkinfer::Qwen35Model::DFlashStats stats;
     const std::vector<int> spec = model.dflash_generate(prompt, max_new, &stats);
     if (spec.empty()) { printf("[FAIL] dflash_generate produced nothing\n"); return 1; }
+
+    // Speculative determinism probe (SPARKINFER_DSPARK_SPEC_REPS=N), the mirror of AR-REPS above.
+    // The lossless verdict compares AR against SPEC, so a flake in EITHER produces the same
+    // "lossless=NO" line -- and AR-REPS already showed the reference side reproducing exactly
+    // (30/30 in-process, 20/20 across fresh processes), which leaves this side as the untested
+    // half. Each rep resets the draft and re-runs the whole speculative generation, so a rep that
+    // disagrees with the first localises a rare divergence to the draft/verify path rather than to
+    // the reference.
+    if (const char* sreps_env = getenv("SPARKINFER_DSPARK_SPEC_REPS")) {
+        const int sreps = atoi(sreps_env);
+        int smismatch = 0, vs_ar_mismatch = 0;
+        for (int r = 1; r < sreps; r++) {
+            draft.reset();
+            sparkinfer::Qwen35Model::DFlashStats st2;
+            const std::vector<int> again = model.dflash_generate(prompt, max_new, &st2);
+            if (again.empty()) { printf("SPEC-REPS rep %d produced nothing\n", r); smismatch++; continue; }
+            size_t nn = std::min(spec.size(), again.size()), sm = 0;
+            while (sm < nn && spec[sm] == again[sm]) sm++;
+            if (sm != nn || spec.size() != again.size()) {
+                smismatch++;
+                printf("SPEC-REPS rep %d DIFFERS from first spec at %zu/%zu (tau %.3f vs %.3f)\n",
+                       r, sm, nn, stats.mean_accept, st2.mean_accept);
+                size_t lo = sm >= 3 ? sm - 3 : 0, hi = std::min(nn, sm + 5);
+                printf("  spec0 [");
+                for (size_t i = lo; i < hi; i++) printf(" %d", spec[i]);
+                printf(" ]\n  rep   [");
+                for (size_t i = lo; i < hi; i++) printf(" %d", again[i]);
+                printf(" ]\n");
+            }
+            // Independently of matching the first spec run, every rep must still match AR --
+            // that is the actual lossless guarantee, and a rep could in principle drift from
+            // spec0 while both remain valid only if AR itself moved (which AR-REPS rules out).
+            size_t an = std::min(ar.size(), again.size()), am = 0;
+            while (am < an && ar[am] == again[am]) am++;
+            if (am != an) {
+                vs_ar_mismatch++;
+                printf("SPEC-REPS rep %d NOT LOSSLESS vs AR at %zu/%zu\n", r, am, an);
+            }
+        }
+        printf("SPEC-REPS %d reps, %d differ-from-first, %d not-lossless-vs-AR\n",
+               sreps, smismatch, vs_ar_mismatch);
+    }
 
     // An empty AR reference must FAIL, not pass vacuously: min(0, k) == 0 makes "matched 0/0"
     // satisfy same==n and report lossless=YES while comparing nothing at all. Observed for real --
