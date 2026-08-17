@@ -2473,6 +2473,25 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     }
     recording = graph_warm || capture_only;
     if (recording)
+    // Dense FFN seeds: expert 0, weight 1.0 -- the same constants AR uses. Written ONCE, here,
+    // SYNCHRONOUSLY, and deliberately BEFORE the capture begins.
+    //
+    // This used to live inside the layer loop as a cudaMemcpyAsync from a `std::vector<float>`
+    // declared in that block. Two independent defects: the vector destructs while an async copy
+    // from pageable host memory may still be in flight, and -- fatally -- under stream capture the
+    // copy is RECORDED with that host pointer, so every graph replay reads a long-dead stack
+    // buffer. The expert weights came back as garbage and the FFN output as zeros. It never showed
+    // until the mmvq K=5120 instantiation landed, because before that the verify declined at layer
+    // 3 and this code had never actually run.
+    //
+    // Hoisting also makes it correct by construction rather than by care: these values are
+    // constant across layers and across replays, so there is nothing for the graph to capture.
+    if (dense && expert_ids && expert_w) {
+        std::vector<float> ones((size_t)N * topk, 1.0f);
+        pf_cu(cudaMemset(expert_ids, 0, (size_t)N * topk * sizeof(int)), "dense expert ids seed");
+        pf_cu(cudaMemcpy(expert_w, ones.data(), ones.size() * sizeof(float),
+                         cudaMemcpyHostToDevice), "dense expert w seed");
+    }
         pf_cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "verify graph begin");
     pf_cu(cudaMemcpyAsync(ids, ph_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify ids");
     pf_cu(cudaMemcpyAsync(pos, ph_pos, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify pos");
@@ -2602,11 +2621,6 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 fprintf(stderr, "[dflash-verify] dense layer=%d missing gate/up/down\n", L);
                 supported = false; break;
             }
-            pf_cu(cudaMemsetAsync(expert_ids, 0, (size_t)N * topk * sizeof(int), st),
-                  "dense expert ids");
-            std::vector<float> ones((size_t)N * topk, 1.0f);
-            pf_cu(cudaMemcpyAsync(expert_w, ones.data(), ones.size() * sizeof(float),
-                                  cudaMemcpyHostToDevice, st), "dense expert w");
             kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                expert_ids, expert_w, routed, moe_h, moe_out,
