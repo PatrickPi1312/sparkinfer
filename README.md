@@ -17,7 +17,7 @@ SparkInfer focuses on the models driving the future of AI — not thousands of l
 | Model | Role |
 |---|---|
 | [**Qwen3.6-35B-A3B**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | Primary SOTA — hybrid Gated-DeltaNet + full-attention MoE |
-| [**Qwen3.8-27B**](https://huggingface.co/Qwen/Qwen3.8-27B) | Dense hybrid Gated-DeltaNet — native NVFP4/FP8, current eval scope |
+| [**Qwen3.8-27B**](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090) | Dense hybrid Gated-DeltaNet — **our own NVFP4 Blackwell quantization**, current eval scope |
 | [**Qwythos 9B**](https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF) | Mythos-level reasoning · long-context guard |
 | [**SparkDistill**](https://github.com/gittensor-model-hub/SparkDistill/) | Fable 5 / OpenAI 5.6-level CoT *(coming soon)* |
 | [**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) | Open MoE frontier *(next)* |
@@ -88,23 +88,34 @@ omitted: at ctx=128 there is not enough work to fill the GPU with one batched GE
 per-pass overhead sparkinfer pays to be fast at 4k/16k is not yet amortised. It is a live
 optimisation target, tracked by the same automated eval that gates every PR.
 
-**What actually ships is faster than either column above.** sparkinfer serves Qwen3.8-27B from a
-native [NVFP4 checkpoint](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)
-(uniform NVFP4 on every `Linear`), not from a GGUF — same box, same commit:
+### Native NVFP4 — [our own Blackwell checkpoint](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)
 
-| context | decode | vs GGUF path | prefill | vs GGUF path |
+The GGUF numbers above exist to make the engine comparison fair. They are **not** how sparkinfer
+runs this model. We quantize Qwen3.8-27B ourselves —
+[**gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090**](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090),
+uniform NVFP4 on every `Linear`, built with NVIDIA ModelOpt and tuned for the RTX 5090's FP4 tensor
+cores — and that is the checkpoint the automated eval scores every PR against:
+
+| context | decode | prefill | vs same-GGUF sparkinfer | vs llama.cpp |
 |---:|---:|---:|---:|---:|
-| 128 | **95.8** tok/s | +10.2% | **6,546** tok/s | +222.0% |
-| 4k | **93.7** tok/s | +10.0% | **10,021** tok/s | +32.8% |
-| 16k | **90.1** tok/s | +9.4% | **9,749** tok/s | +28.4% |
+| 128 | **95.8** tok/s | **6,546** tok/s | +10.2% dec · +222% pp | +19.4% dec · **+135%** pp |
+| 4k | **93.7** tok/s | **10,021** tok/s | +10.0% dec · +32.8% pp | +21.7% dec · **+173%** pp |
+| 16k | **90.1** tok/s | **9,749** tok/s | +9.4% dec · +28.4% pp | +22.0% dec · **+179%** pp |
 
-This is the path the automated eval scores every PR against, and it wins on *both* axes — including
-the short-context prefill the GGUF path loses: 6,546 pp at ctx=128 against llama.cpp's 2,782.
+Same weights the model was released with, re-quantized for the hardware it runs on: **+9–10% decode
+and +28–222% prefill over the same engine reading a Q4_K_M GGUF**, and it erases the one dimension
+llama.cpp wins above — 6,546 pp at ctx=128 against 2,782.
 
-That table carries **no llama.cpp column on purpose**: llama.cpp cannot read NVFP4
-compressed-tensors, so putting it beside a Q4_K_M GGUF would be a quantization comparison wearing
-an engine comparison's clothes. The head-to-head above deliberately runs sparkinfer on the *same
-file* as llama.cpp so the only variable is the runtime.
+The upstream [unsloth NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) build (NVFP4 FFN +
+FP8 attention) is supported too and measures 84.9 / 83.2 / 80.6 tok/s decode and 5,031 / 9,548 /
+8,727 pp prefill at the same contexts. The eval scores PRs on our checkpoint and runs a *separate*
+no-regression guard on that one, so an optimisation cannot win on the scored build by pessimising
+the other.
+
+Read that last column for what it is. llama.cpp cannot load NVFP4 compressed-tensors at all, so
+`vs llama.cpp` there is **each engine on the format it actually runs** — our NVFP4 against
+llama.cpp's best GGUF result — not a same-weights benchmark. The same-weights comparison is the
+one at the top of this section, GGUF on both sides, prefill@128 loss included.
 
 Runtime footprint (excluding model weights):
 
