@@ -2269,6 +2269,20 @@ void Qwen35Model::invalidate_decode_graph() {
         s.dflash_graph_attn_mode = -1;
         s.dflash_graph_sparse = false;
     }
+    // The PREFILL graph has to go too, for the same reason as the two above: every attention
+    // kernel node in it was captured with `btable` (kv->block_table(active_seq_id)) baked in as a
+    // literal argument, so replaying it after the active session changed reads and appends KV
+    // through the OLD session's block table -- which by then is typically freed. This function is
+    // what activate_session() calls precisely to mean "the session identity underneath the graphs
+    // just moved", and leaving one of the three graphs behind made that promise false.
+    if (s.graph_prefill_ready) {
+        cudaGraphExecDestroy(s.cu_prefill_exec);
+        cudaGraphDestroy(s.cu_prefill_graph);
+        s.cu_prefill_exec = nullptr;
+        s.cu_prefill_graph = nullptr;
+        s.graph_prefill_ready = false;
+        s.graph_prefill_attn_mode = -1;
+    }
 }
 
 bool Qwen35Model::prompt_matches_prefix(const std::vector<int>& prompt) const {

@@ -173,6 +173,94 @@ int main(int argc, char** argv) {
     const std::vector<int> ar = model.generate(prompt, max_new);
     if (ar.empty()) { printf("[FAIL] AR reference produced nothing\n"); return 1; }
 
+    // AR determinism probe (SPARKINFER_DSPARK_AR_REPS=N). Repeats the SAME reference generation in
+    // this one already-loaded process and reports any rep that disagrees with the first -- the
+    // cheap way to chase a rare flake, since a fresh process per attempt spends ~25s reloading 22GB
+    // of weights to get one sample. Exists because a prose run reported lossless=NO while tau was
+    // bit-identical to its clean repeats: tau is a property of the speculative side alone, so an
+    // unchanged tau alongside a changed verdict points at the REFERENCE having moved, not the
+    // draft. This probe is what tells those two apart instead of inferring it.
+    //
+    // Each rep clears the prefix cache first, so every rep runs the identical no-reuse path that
+    // produced `ar` above; SPARKINFER_DSPARK_AR_REPS_KEEP_PREFIX=1 leaves it warm instead, which
+    // deliberately lets generate()'s prompt_matches_prefix() reuse branch run -- a different code
+    // path, and worth testing separately rather than conflating with raw kernel determinism.
+    if (const char* reps_env = getenv("SPARKINFER_DSPARK_AR_REPS")) {
+        const int reps = atoi(reps_env);
+        const bool keep_prefix = getenv("SPARKINFER_DSPARK_AR_REPS_KEEP_PREFIX") != nullptr;
+        int mismatches = 0;
+        for (int r = 1; r < reps; r++) {
+            if (!keep_prefix) model.clear_prefix_cache();
+            const std::vector<int> again = model.generate(prompt, max_new);
+            if (again.empty()) { printf("AR-REPS rep %d produced nothing\n", r); mismatches++; continue; }
+            size_t nn = std::min(ar.size(), again.size()), same = 0;
+            while (same < nn && ar[same] == again[same]) same++;
+            if (same != nn || ar.size() != again.size()) {
+                mismatches++;
+                printf("AR-REPS rep %d DIVERGED at %zu/%zu (len %zu vs %zu)\n",
+                       r, same, nn, ar.size(), again.size());
+                size_t lo = same >= 3 ? same - 3 : 0, hi = std::min(nn, same + 5);
+                printf("  ref [");
+                for (size_t i = lo; i < hi; i++) printf(" %d", ar[i]);
+                printf(" ]\n  rep [");
+                for (size_t i = lo; i < hi; i++) printf(" %d", again[i]);
+                printf(" ]\n");
+            }
+        }
+        printf("AR-REPS %d reps, %d mismatches, keep_prefix=%d\n", reps, mismatches, (int)keep_prefix);
+    }
+
+    // Prefix-reuse GDN probe (SPARKINFER_DSPARK_PREFIX_PROBE=1). cache_prefix() is the server's
+    // warm-system-prompt path (server/src/model_engine.cpp:499), and for a hybrid model its own
+    // comment claims it "retains KV + GDN state". That holds at cache time -- the GDN recurrent
+    // state right after ingesting the prefix IS the state for that prefix. But a reuse generate()
+    // then decodes onward and ADVANCES that same state past the prefix, and nothing restores it,
+    // so the NEXT reuse re-serves prefix KV against a recurrent state belonging to a longer
+    // sequence. KV tolerates this (append-only per position, stale tail never read below seqlen);
+    // GDN cannot -- it is one running summary, not per-position.
+    //
+    // Both checks below must hold for a correct implementation:
+    //   g1 == ar : caching a prefix must not change what the model generates at all
+    //   g2 == ar : and it must still hold on the second reuse of the same prefix
+    // A g1==ar / g2!=ar split is the advance-without-restore bug specifically.
+    if (getenv("SPARKINFER_DSPARK_PREFIX_PROBE") && prompt.size() >= 4) {
+        model.set_dflash_draft(nullptr);
+        model.set_dflash_capture(false, {}, 0);
+        const std::vector<int> pfx(prompt.begin(), prompt.begin() + prompt.size() / 2);
+        if (!model.cache_prefix(pfx)) {
+            printf("PREFIX-PROBE cache_prefix(%zu) failed\n", pfx.size());
+        } else {
+            printf("PREFIX-PROBE cached %zu of %zu prompt tokens, reuse_matches=%d\n",
+                   pfx.size(), prompt.size(), (int)model.prompt_matches_prefix(prompt));
+            auto state = [&](const char* when) {
+                printf("  [state %s] reuse_matches=%d active_session=%llu\n", when,
+                       (int)model.prompt_matches_prefix(prompt),
+                       (unsigned long long)model.active_session());
+            };
+            auto cmp = [&](const char* tag, const std::vector<int>& got) {
+                size_t nn = std::min(ar.size(), got.size()), same = 0;
+                while (same < nn && ar[same] == got[same]) same++;
+                const bool ok = (same == nn && ar.size() == got.size());
+                printf("PREFIX-PROBE %s vs plain AR: %s (%zu/%zu)\n", tag,
+                       ok ? "MATCH" : "DIVERGED", same, nn);
+                if (!ok) {
+                    size_t lo = same >= 3 ? same - 3 : 0, hi = std::min(nn, same + 5);
+                    printf("  ar  [");
+                    for (size_t i = lo; i < hi; i++) printf(" %d", ar[i]);
+                    printf(" ]\n  %-4s[", tag);
+                    for (size_t i = lo; i < hi; i++) printf(" %d", got[i]);
+                    printf(" ]\n");
+                }
+            };
+            // Three reuses, not two: the original bug showed up only on the SECOND, so a fix that
+            // merely restores once needs a third to prove the state does not drift again.
+            state("before g1"); cmp("g1", model.generate(prompt, max_new));
+            state("before g2"); cmp("g2", model.generate(prompt, max_new));
+            state("before g3"); cmp("g3", model.generate(prompt, max_new));
+        }
+        model.clear_prefix_cache();
+    }
+
     // Isolation: does hidden-state CAPTURE alone perturb the target's decode? The speculative
     // loop differs from plain AR in exactly two ways -- capture is on, and a draft proposes. If AR
     // with capture enabled already diverges from AR without it, the fault is in the capture path
