@@ -2377,7 +2377,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             return false;
         }
         quant_rows(in, k);
-        return kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, st);
+        if (!kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, st)) {
+            // Distinguishes "this weight TYPE is not implemented" (handled above, prints its own
+            // message) from "the mmvq launcher refused THIS SHAPE" -- which is otherwise a silent
+            // false and reads identically at the call site.
+            fprintf(stderr, "[dflash-verify] mmvq_rows refused type=%d N=%d n_out=%d K=%d\n",
+                    type, N, no, k);
+            return false;
+        }
+        return true;
     };
     // proj() on an arbitrary stream. Callers must have `in` already quantized into q81 (checked at
     // each call site), because quantizing here would write shared scratch off the main stream.
