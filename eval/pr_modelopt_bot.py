@@ -8,13 +8,30 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               box, same round, median of 5 reps. Same tier buckets as every other bot in this
               directory (BUCKETS/SIG/REGRESS_TOL below — copied, not reinvented).
 
-              The scored checkpoint is the HuggingFace compressed-tensors DIRECTORY (mixed NVFP4
-              FFN + FP8 attention/GDN projections, unsloth/Qwen3.8-27B-NVFP4), NOT a GGUF of the
-              same model. That is deliberate: it is what sparkinfer-server actually serves, so it
-              is what a PR's speed claim should be measured against. qwen3_gguf_bench and
-              qwen3_gguf_score grew directory support for exactly this
+              The scored checkpoint is a compressed-tensors DIRECTORY, NOT a GGUF of the same
+              model. qwen3_gguf_bench and qwen3_gguf_score grew directory support for exactly this
               (runtime/examples/qwen_checkpoint.h, shared with the server so the two cannot
               disagree about how a checkpoint is configured).
+
+              sparkinfer supports TWO NVFP4 builds of Qwen3.8-27B and they are not equivalent, so
+              which one a number came from has to be stated every time:
+
+                MODEL_DIR (SCORED)   gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 -- our own
+                                     quantization, uniform NVFP4 on every Linear, built with
+                                     NVIDIA ModelOpt for the RTX 5090's FP4 tensor cores. This is
+                                     what a PR's speed claim is measured against.
+
+                Q38_GUARD_MODEL_DIR  unsloth/Qwen3.8-27B-NVFP4 -- upstream, mixed NVFP4 FFN + FP8
+                                     attention/GDN projections. Also supported, and NOT scored;
+                                     it gets a no-regression guard instead (check_q38_guard), so
+                                     an optimisation cannot win on the scored build by pessimising
+                                     this one. Both are supported targets; scoring one and
+                                     guarding the other is what keeps that honest.
+
+              Measured 2026-08-17 on the pinned box at the same commit, the gap between them is
+              real and large -- ModelOpt 95.8/93.7/90.1 tok/s decode and 6546/10021/9749 pp
+              prefill at ctx 128/4k/16k, against unsloth's 84.9/83.2/80.6 and 5031/9548/8727 --
+              so quoting a Qwen3.8 number without naming its checkpoint is meaningless.
 
               Prefill@128 is ALSO scored, from the same sweep and the same model load (no extra
               GPU time -- prefill_pp was already computed alongside decode_tps and simply
@@ -144,10 +161,14 @@ MARKER_RE = re.compile(
 # --- box paths (see .env.eval's MODELOPT_* block) ---
 # Separate clone from pr_eval_bot's /root/sparkinfer, which carries unrelated uncommitted work.
 REMOTE_REPO = os.environ.get("MODELOPT_REMOTE_REPO", "/root/sparkinfer_modelopt")
-# The scored checkpoint is a HuggingFace compressed-tensors DIRECTORY (mixed NVFP4 FFN + FP8
-# attention/GDN projections, unsloth/Qwen3.8-27B-NVFP4) -- NOT a GGUF. That is what the server
-# actually serves, so it is what gets benchmarked; qwen3_gguf_bench/qwen3_gguf_score grew
-# directory support for exactly this (runtime/examples/qwen_checkpoint.h).
+# The SCORED checkpoint: gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 -- our own uniform-NVFP4
+# ModelOpt quantization, a compressed-tensors DIRECTORY, NOT a GGUF. qwen3_gguf_bench /
+# qwen3_gguf_score grew directory support for exactly this (runtime/examples/qwen_checkpoint.h).
+#
+# NOT the same checkpoint as Q38_GUARD_MODEL_DIR below (upstream unsloth, NVFP4 FFN + FP8
+# attention). Both are supported; this one is scored and that one is guarded. They differ by
+# ~13% decode and ~30% prefill, so mixing them up silently changes every number this bot prints
+# -- which is exactly what happened while writing the Qwen3.8 README section on 2026-08-17.
 MODEL_DIR = os.environ.get("MODELOPT_MODEL_DIR", "/root/workspace/models_q38_modelopt")
 # The single weight blob inside MODEL_DIR, for the Polaris attestation ONLY. The sibling bots pass
 # their .gguf here; the analogue for a compressed-tensors checkout is the safetensors file, not the
@@ -180,10 +201,12 @@ Q36_GUARD_MODEL_REPO = os.environ.get("PRIMARY36_MODEL_REPO", "unsloth/Qwen3.6-3
 Q36_GUARD_TOK_REPO = os.environ.get("PRIMARY36_TOK_REPO", "Qwen/Qwen3.6-35B-A3B")
 GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
 
-# Qwen3.8 no-regression guard. The ModelOpt checkpoint and the shipping unsloth Qwen3.8 checkpoint
-# share load_compressed_tensors, the batched prefill and every decode kernel, so a ModelOpt
-# optimisation that speeds up its own checkpoint by pessimising the shared path is a regression --
-# and this bot's own numbers cannot see it, because it only ever benches models_q38_modelopt.
+# Qwen3.8 no-regression guard, over the OTHER supported NVFP4 build (upstream unsloth, NVFP4 FFN +
+# FP8 attention). Both builds are supported targets; this one is not scored, so without a guard
+# nothing would notice it getting slower. They share load_compressed_tensors, the batched prefill
+# and every decode kernel, so a ModelOpt optimisation that speeds up the scored checkpoint by
+# pessimising the shared path is a regression -- and this bot's own numbers cannot see it, because
+# it only ever benches models_q38_modelopt.
 # Same shape as the inherited Qwen3.6 guard below, except the subject is a compressed-tensors
 # DIRECTORY rather than a GGUF, so there is no ensure_model/ensure_tokenizer download step.
 Q38_GUARD_MODEL_DIR = os.environ.get("Q38_GUARD_MODEL_DIR", "/root/workspace/models_qwen38")
@@ -278,7 +301,8 @@ def check_q38_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
     It exists because this bot's scoring numbers come only from models_q38_modelopt, so a change
     that wins on the ModelOpt checkpoint by pessimising the shared compressed-tensors path
     (load_compressed_tensors, prefill_batched_run, the decode GEMVs) would score as an improvement
-    while making the model actually in production slower.
+    while making the OTHER supported NVFP4 build -- upstream unsloth, which nothing else here
+    measures -- slower.
 
     Iterates MAIN's contexts as the reference set and fails closed on a missing/zero PR
     measurement, for the same reason check_q36_guard does: a PR build that crashes partway through
