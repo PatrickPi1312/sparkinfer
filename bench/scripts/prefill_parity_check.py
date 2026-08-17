@@ -33,11 +33,27 @@ from tokenizers import Tokenizer
 BIN = os.environ.get("SPARKINFER_GENERATE_BIN", "build/runtime/qwen3_gguf_generate")
 NEW = int(os.environ.get("PARITY_NEW_TOKENS", "24"))
 # Ordinary prose, so the continuation is strongly determined and a disagreement means something.
+# Long enough that n=128 actually runs -- the original ~60-token version made every 128-length
+# check print "prompt corpus too short" and silently skip, leaving only n=32 as real coverage
+# right as the accuracy bar was loosened to top1 0.90 / KL 0.1 and parity became the harness
+# actually catching regressions.
 PROSE = (
     "Artificial intelligence is a field of computer science that builds systems able to perform "
     "tasks which normally require human intelligence, such as understanding language, recognising "
     "images, and making decisions under uncertainty. Researchers have pursued this goal since the "
-    "middle of the twentieth century, and progress has come in waves rather than steadily."
+    "middle of the twentieth century, and progress has come in waves rather than steadily. "
+    "Early efforts focused on symbolic reasoning and hand-written rules, which worked well in "
+    "narrow, well-defined domains but struggled to generalise to the messiness of everyday "
+    "perception and language. A shift toward statistical methods in the late twentieth century "
+    "let systems learn patterns directly from data rather than from rules an engineer wrote by "
+    "hand, and this approach scaled remarkably well as computing power and available data both "
+    "grew. The rise of deep neural networks in the following decades pushed performance further "
+    "still, first in image recognition and then in natural language processing, where models "
+    "trained on vast text corpora learned to produce fluent, contextually appropriate responses. "
+    "Despite these advances, fundamental questions remain open: how much of what looks like "
+    "understanding is genuine reasoning versus sophisticated pattern matching, how reliably these "
+    "systems generalise beyond their training distribution, and how to ensure their behaviour "
+    "stays aligned with human intent as their capabilities continue to grow."
 )
 
 
@@ -84,6 +100,17 @@ def main():
     if not rows:
         print("PARITY no lengths run")
         return 1
+    # Deliberately NOT pinning SPARKINFER_PREFILL_I8=0 / SPARKINFER_PREFILL_SKINNY_SPLITK=0 /
+    # SPARKINFER_NSPLITS=1 here, unlike dspark_tau_check.cpp's bit-exact lossless check (found
+    # 2026-08-17: both prefill_gemm_i8.cu and prefill_gemm_skinny.cu accumulate via atomicAdd,
+    # genuinely order-dependent on real hardware). Those pins are right for DSpark's verify, whose
+    # correctness guarantee REQUIRES bit-exactness -- they would be wrong here, where the whole
+    # point is to reflect production behavior: this repo's own "fine for serving, fatal for
+    # verify" split (see item 5 of the 2026-08-17 handoff) means the atomic kernels stay ON in
+    # production, so a parity check with them pinned OFF would validate a configuration nothing
+    # actually serves. The tolerant PARITY_BAR (0.75, not 1.0) already exists because SOME
+    # natural divergence is expected for exactly this reason -- treat that as the intended
+    # absorption of split-K noise, not a bar to tighten.
     bar = float(os.environ.get("PARITY_BAR", "0.75"))
     print(f"PARITY worst={worst:.3f} bar={bar} {'OK' if worst >= bar else 'FAIL'}")
     return 0 if worst >= bar else 1
