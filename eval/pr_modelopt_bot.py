@@ -103,6 +103,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -742,8 +743,15 @@ wait_gpu_clear
 # at ctx>=4096 so the BATCHED path is exercised, and a PR optimising long-context prefill shows
 # nothing at 128. PR #834 was auto-closed for exactly that blind spot -- a real 1.29x prefill@4096
 # win measured -0.0% against a 128-only metric.
-if bench_sweep_run "$MODEL_DIR" "$NTOK" 128 5 16384 5; then
+# 4096 joins the sweep purely to feed the README refresh (README_BENCH_MARK below): the published
+# Qwen3.8 table quotes 128/4k/16k, and a PR that auto-merges is what makes those numbers stale, so
+# the round has to have measured all three. Same model load as 128/16k, so it costs one extra
+# context's worth of reps and no extra load. NOT a scoring or floor dimension -- nothing reads
+# decode4k/prefill4k except the README writer.
+if bench_sweep_run "$MODEL_DIR" "$NTOK" 128 5 4096 5 16384 5; then
   DECODE128_TPS=$(_bench_sweep_get 128 decode_tps)
+  DECODE4K_TPS=$(_bench_sweep_get 4096 decode_tps)
+  PREFILL4K_PP=$(_bench_sweep_get 4096 prefill_pp)
   # Same model load, same sweep, no extra GPU time for this one: prefill_pp is already computed
   # alongside decode_tps for this context, it was simply being discarded.
   PREFILL128_PP=$(_bench_sweep_get 128 prefill_pp)
@@ -759,11 +767,15 @@ else
   PREFILL128_PP=0
   PREFILL16K_PP=0
   DECODE16K_TPS=0
+  DECODE4K_TPS=0
+  PREFILL4K_PP=0
 fi
 echo "RESULT_DECODE128_TPS ${{DECODE128_TPS:-0}}"
 echo "RESULT_PREFILL128_PP ${{PREFILL128_PP:-0}}"
 echo "RESULT_PREFILL16K_PP ${{PREFILL16K_PP:-0}}"
 echo "RESULT_DECODE16K_TPS ${{DECODE16K_TPS:-0}}"
+echo "RESULT_DECODE4K_TPS ${{DECODE4K_TPS:-0}}"
+echo "RESULT_PREFILL4K_PP ${{PREFILL4K_PP:-0}}"
 
 # --- teacher-forced score dump (differential accuracy gate, module docstring pt. 2) ---
 # llama.cpp cannot read a compressed-tensors directory, so there is no same-weights external
@@ -906,6 +918,17 @@ def _parse_remote(stdout: str) -> dict:
         elif line.startswith("RESULT_DECODE16K_TPS "):
             try:
                 out["decode16k_tps"] = float(line.split()[1])
+            except ValueError:
+                pass
+        # 4k: README-only (see README_BENCH_MARK). Never scored, never a floor.
+        elif line.startswith("RESULT_DECODE4K_TPS "):
+            try:
+                out["decode4k_tps"] = float(line.split()[1])
+            except ValueError:
+                pass
+        elif line.startswith("RESULT_PREFILL4K_PP "):
+            try:
+                out["prefill4k_pp"] = float(line.split()[1])
             except ValueError:
                 pass
         elif line.startswith("RESULT_TOKEN_COUNT "):
@@ -1291,6 +1314,10 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "main_decode16k_tps": main["decode16k_tps"],
         "decode16k_delta_pct": d16k_delta_pct,
         "decode16k_regressed": d16k_label == "REJECT",
+        # README-only, unscored: the published table quotes 128/4k/16k, and after this PR
+        # auto-merges these ARE main's numbers (squash-merge makes PR head == main content).
+        "pr_decode4k_tps": pr.get("decode4k_tps", 0.0),
+        "pr_prefill4k_pp": pr.get("prefill4k_pp", 0.0),
         # Which dimension the headline tier came from -- otherwise an XL on the comment is
         # ambiguous between a decode win and a prefill win.
         "scored_dimension": best["dim"],
@@ -1458,6 +1485,115 @@ def auto_merge_ok_qwen38(repo, num):
     return True, "ok"
 
 
+# The README's Qwen3.8 ModelOpt table is regenerated between these markers. Everything outside
+# them is prose and is never touched, so the table can be machine-written without a generator
+# owning the whole document.
+README_BENCH_MARK = ("<!-- BENCH:qwen38-modelopt:start -->", "<!-- BENCH:qwen38-modelopt:end -->")
+
+
+def refresh_readme_modelopt(res, commit, repo_root=None, push=True):
+    """Rewrite the README's ModelOpt table from a just-merged PR's own measurements.
+
+    Called ONLY after a successful auto-merge. The PR is squash-merged, so its head content IS
+    main's content -- the numbers the round measured on the PR are main's numbers, and no second
+    benchmark pass is needed. That is also why this cannot use the round's `main` baseline: that
+    was measured BEFORE the merge and is now one PR out of date.
+
+    Writes through a THROWAWAY WORKTREE of origin/main, never the bot's own checkout. The cron
+    runs this bot from whatever branch that tree happens to be on -- feat/qwen3.8-dspark at the
+    time of writing -- so committing and `push origin HEAD:main` in place would have pushed an
+    entire unmerged feature branch to main on the first auto-merge. The worktree also means a
+    half-finished refresh can never leave the bot's tree dirty mid-round.
+
+    Deliberately limited to the ModelOpt table. The GGUF head-to-head and the unsloth table are
+    left alone because nothing in a round measures them; both carry their own "measured at
+    <commit>" stamp instead. A dated number is honest, a silently stale one is not.
+
+    repo_root/push=False are for tests: they operate on the given tree and skip git entirely.
+    """
+    need = ("pr_decode_tps", "pr_decode16k_tps", "pr_prefill_pp", "pr_prefill16k_pp",
+            "pr_decode4k_tps", "pr_prefill4k_pp")
+    vals = {k: res.get(k) or 0 for k in need}
+    if not all(vals.values()):
+        missing = [k for k in need if not vals[k]]
+        print(f">> README refresh: skipped, measurement incomplete ({', '.join(missing)})",
+              file=sys.stderr)
+        return False
+
+    def _rewrite(path):
+        """Regenerate the marked block in `path`. Returns True if the file changed."""
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError as e:
+            print(f">> README refresh: cannot read {path}: {e}", file=sys.stderr)
+            return False
+        start_m, end_m = README_BENCH_MARK
+        i, j = text.find(start_m), text.find(end_m)
+        if i < 0 or j < 0 or j < i:
+            print(f">> README refresh: markers not found in {path} — leaving it alone",
+                  file=sys.stderr)
+            return False
+        rows = [("128", vals["pr_decode_tps"], vals["pr_prefill_pp"]),
+                ("4k", vals["pr_decode4k_tps"], vals["pr_prefill4k_pp"]),
+                ("16k", vals["pr_decode16k_tps"], vals["pr_prefill16k_pp"])]
+        body = [start_m, "", "| context | decode | prefill |", "|---:|---:|---:|"]
+        for ctx, dec, pp in rows:
+            body.append(f"| {ctx} | **{dec:,.1f}** tok/s | **{pp:,.0f}** tok/s |")
+        body += ["",
+                 f"<sub>Auto-refreshed by the ModelOpt eval bot at `{commit[:9]}` — these are the "
+                 f"numbers that PR measured on the pinned RTX 5090, which after squash-merge are "
+                 f"main's. Regenerated on every auto-merge, so the table cannot drift behind the "
+                 f"code.</sub>",
+                 end_m]
+        new_text = text[:i] + "\n".join(body) + text[j + len(end_m):]
+        if new_text == text:
+            print(">> README refresh: numbers unchanged")
+            return False
+        open(path, "w", encoding="utf-8").write(new_text)
+        return True
+
+    if not push:
+        return _rewrite(os.path.join(repo_root or os.path.dirname(HERE), "README.md"))
+
+    root = repo_root or os.path.dirname(HERE)
+    wt = os.path.join(tempfile.gettempdir(), f"si_readme_refresh_{os.getpid()}")
+    subprocess.run(["git", "-C", root, "worktree", "remove", "--force", wt],
+                   capture_output=True, text=True)
+    if subprocess.run(["git", "-C", root, "fetch", "-q", "origin", "main"],
+                      capture_output=True, text=True).returncode != 0:
+        print(">> README refresh: fetch origin/main failed", file=sys.stderr)
+        return False
+    mk = subprocess.run(["git", "-C", root, "worktree", "add", "--detach", wt, "origin/main"],
+                        capture_output=True, text=True)
+    if mk.returncode != 0:
+        print(f">> README refresh: worktree add failed: {(mk.stderr or '')[:200]}", file=sys.stderr)
+        return False
+    try:
+        if not _rewrite(os.path.join(wt, "README.md")):
+            return False
+        msg = (f"docs: refresh Qwen3.8 ModelOpt benchmark table ({commit[:9]})\n\n"
+               f"Auto-generated by pr_modelopt_bot after auto-merging {commit[:9]}. The numbers "
+               f"are that PR's own same-box measurements, which the squash-merge makes main's.")
+        for args in (["add", "README.md"], ["commit", "-m", msg]):
+            rc = subprocess.run(["git", "-C", wt] + args, capture_output=True, text=True)
+            if rc.returncode != 0:
+                print(f">> README refresh: git {args[0]} failed: {(rc.stderr or '')[:200]}",
+                      file=sys.stderr)
+                return False
+        rc = subprocess.run(["git", "-C", wt, "push", "origin", "HEAD:main"],
+                            capture_output=True, text=True)
+        if rc.returncode != 0:
+            print(f">> README refresh: push to main FAILED: {(rc.stderr or '')[:300]}",
+                  file=sys.stderr)
+            return False
+        print(f">> README refresh: ModelOpt table updated at {commit[:9]} and pushed to main")
+        return True
+    finally:
+        subprocess.run(["git", "-C", root, "worktree", "remove", "--force", wt],
+                       capture_output=True, text=True)
+        subprocess.run(["git", "-C", root, "worktree", "prune"], capture_output=True, text=True)
+
+
 def try_auto_merge_qwen38(repo, num):
     ok, reason = auto_merge_ok_qwen38(repo, num)
     if not ok:
@@ -1524,8 +1660,16 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
     for num, _, _ in scored[1:]:
         arb.add_label(repo, num, MODELOPT_NEEDS_REBASE)
         arb.remove_label(repo, num, MODELOPT_MERGE_FIRST)
-    if AUTO_MERGE:
-        try_auto_merge_qwen38(repo, winner)
+    if AUTO_MERGE and try_auto_merge_qwen38(repo, winner):
+        # The merge just made every published Qwen3.8 ModelOpt number one PR out of date. The
+        # winner's own scored measurements are main's numbers now (squash-merge), so refresh the
+        # README from the scores entry rather than spending another GPU pass on it.
+        won = _load_scores().get(str(winner)) or {}
+        if won:
+            refresh_readme_modelopt(won, won.get("commit", ""))
+        else:
+            print(f">> README refresh: no stored score for #{winner} — table left as-is",
+                  file=sys.stderr)
 
 
 def upload_qwen38_eval_log(repo, num, title, oid, res):
@@ -1661,6 +1805,14 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "delta_pct": res.get("delta_pct"),
             "pr_decode_tps": res.get("pr_decode_tps"),
             "main_decode_tps": res.get("main_decode_tps"),
+            # The full 128/4k/16k pair set, so refresh_readme_modelopt() can rebuild the published
+            # table from a merged PR's stored score without re-benchmarking. Only decode@16k is
+            # scored; the rest ride along from the same sweep.
+            "pr_decode16k_tps": res.get("pr_decode16k_tps"),
+            "pr_decode4k_tps": res.get("pr_decode4k_tps"),
+            "pr_prefill_pp": res.get("pr_prefill_pp"),
+            "pr_prefill4k_pp": res.get("pr_prefill4k_pp"),
+            "pr_prefill16k_pp": res.get("pr_prefill16k_pp"),
             "pr_top1": res.get("pr_top1"),
             "pr_kl": res.get("pr_kl"),
             "pass": res.get("pass"),
