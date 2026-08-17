@@ -190,9 +190,19 @@ void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaSt
 // memory (not passed by value) so a chain of calls on the same stream can each depend on the
 // previous call's own argmax result without a host round-trip in between -- required because the
 // bias for block position k conditions on position k's own token, which for k>0 is only known
-// once position k-1's (already Markov-corrected) argmax has been computed.
+// once position k-1's (already Markov-corrected) argmax has been computed. out_latent (optional,
+// nullptr to skip) receives the same [rank] latent vector this call already computed, for the
+// confidence head below to reuse instead of re-doing the embedding lookup.
 void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,
-                            float* logits, int vocab, int rank, cudaStream_t stream);
+                            float* logits, int vocab, int rank, cudaStream_t stream,
+                            float* out_latent = nullptr);
+
+// DSpark's confidence head (AcceptRatePredictor): a single linear layer over concat(hidden[H],
+// markov_latent[rank]) -> one logit, predicting this draft position's acceptance probability
+// (sigmoid it on the host if a probability is needed; raw logit is enough for threshold
+// comparisons). `latent` must already hold the SAME row's Markov latent (see out_latent above).
+void launch_confidence_head(const void* hidden, const float* latent, const void* w, float bias,
+                            int H, int rank, float* out_confidence, cudaStream_t stream);
 
 } // namespace dflash_kernels
 } // namespace sparkinfer

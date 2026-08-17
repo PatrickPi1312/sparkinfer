@@ -326,6 +326,13 @@ struct DFlashDraftModel::Impl {
     bf16* markov_w2 = nullptr;
     int markov_rank = 0;
 
+    // DSpark's confidence head (AcceptRatePredictor): predicts a per-position accept
+    // probability from concat(hidden, markov_latent). Optional -- requires the Markov head
+    // (confidence_head_with_markov=True for every DSpark checkpoint released so far).
+    bf16* confidence_w = nullptr;   // [hidden + markov_rank]
+    float confidence_bias = 0.f;    // scalar, read back to host once at load (cheap, load-time only)
+    float* markov_latent = nullptr; // [markov_rank] scratch, reused per row of the sequential loop
+
     // Scratch
     cudaStream_t stream{};
     bf16 *noise = nullptr;          // [B, H]
@@ -339,6 +346,7 @@ struct DFlashDraftModel::Impl {
     void* head_q8 = nullptr;        // [B] Q8_1 rows of xn for the multi-row head MMVQ
     int *d_ids = nullptr, *d_out = nullptr;
     int *h_out = nullptr;
+    float *d_confidence = nullptr, *h_confidence = nullptr;   // [B], confidence head output
 
     // Per-layer contiguous KV cache: [max_seq, n_kv, d]
     std::vector<bf16*> k_cache, v_cache;
@@ -420,6 +428,10 @@ struct DFlashDraftModel::Impl {
         d_ids = alloc<int>(B);
         d_out = alloc<int>(B);
         cu(cudaHostAlloc(&h_out, B * sizeof(int), cudaHostAllocDefault), "h_out");
+        if (confidence_w) {
+            d_confidence = alloc<float>(B);
+            cu(cudaHostAlloc(&h_confidence, B * sizeof(float), cudaHostAllocDefault), "h_confidence");
+        }
 
         k_cache.resize(cfg.n_layers);
         v_cache.resize(cfg.n_layers);
@@ -459,6 +471,7 @@ DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
     for (void* p : p_->owned) cudaFree(p);
     if (p_->h_out) cudaFreeHost(p_->h_out);
+    if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
     if (p_->stream) cudaStreamDestroy(p_->stream);
     delete p_;
     p_ = nullptr;
@@ -676,10 +689,36 @@ bool DFlashDraftModel::load(const std::string& dir) {
                 mw2 ? (size_t)mw2->shape[0] : 0, mw2 ? (size_t)mw2->shape[1] : 0);
     }
 
+    // Confidence head: requires the Markov head (confidence_head_with_markov=True on every
+    // DSpark checkpoint released so far concatenates the Markov latent into its input), so only
+    // look for it once the Markov head itself loaded successfully.
+    if (s.markov_w1) {
+        auto* cw = optional("confidence_head.proj.weight");
+        auto* cb = optional("confidence_head.proj.bias");
+        const int want_dim = H + s.markov_rank;
+        if (cw && cb && cw->shape.size() == 2 && cw->shape[0] == 1 &&
+            (int)cw->shape[1] == want_dim && cb->shape.size() == 1 && cb->shape[0] == 1) {
+            s.confidence_w = s.upload(*cw);
+            // Bias is a single scalar -- read it back to host once here rather than carrying a
+            // device pointer the kernel would have to dereference on every call for no reason.
+            const unsigned short raw = *reinterpret_cast<const unsigned short*>(cb->data);
+            unsigned int bits = (unsigned int)raw << 16;
+            std::memcpy(&s.confidence_bias, &bits, sizeof(float));
+            if (cudaMalloc(&s.markov_latent, (size_t)s.markov_rank * sizeof(float)) != cudaSuccess)
+                s.confidence_w = nullptr;  // can't run the head without scratch -- disable cleanly
+            else
+                s.owned.push_back(s.markov_latent);
+        } else if (cw || cb) {
+            fprintf(stderr, "[dflash] confidence_head tensors present but malformed "
+                            "(want proj.weight=[1,%d]) -- skipping\n", want_dim);
+        }
+    }
+
     // Scratch + KV cache (shared with load_gguf(), see Impl::alloc_scratch).
     s.alloc_scratch();
-    fprintf(stderr, "[dflash] loaded draft: layers=%d H=%d B=%d n_cap=%d mask=%d markov_rank=%d\n",
-            s.cfg.n_layers, H, B, n_cap, s.cfg.mask_token_id, s.markov_rank);
+    fprintf(stderr, "[dflash] loaded draft: layers=%d H=%d B=%d n_cap=%d mask=%d markov_rank=%d "
+                    "confidence=%d\n",
+            s.cfg.n_layers, H, B, n_cap, s.cfg.mask_token_id, s.markov_rank, s.confidence_w != nullptr);
     return true;
 }
 
@@ -806,7 +845,8 @@ void DFlashDraftModel::ensure_quant() { if (p_) p_->ensure_quant(); }
 
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
-                                     int* out_argmax, cudaStream_t stream, int proposals) {
+                                     int* out_argmax, cudaStream_t stream, int proposals,
+                                     float* out_confidence) {
     Impl& s = *p_;
     s.ensure_quant();
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
@@ -1187,7 +1227,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         for (int r = 1; r <= kProposalDepth; r++) {
             const int* prev = (r == 1) ? s.d_ids : (s.d_out + (r - 1));
             dflash_kernels::launch_markov_bias_add(s.markov_w1, s.markov_w2, prev,
-                                                   s.logits + (size_t)r * V, V, s.markov_rank, st);
+                                                   s.logits + (size_t)r * V, V, s.markov_rank, st,
+                                                   s.confidence_w ? s.markov_latent : nullptr);
+            // Confidence head (optional): reads THIS row's hidden state + the Markov latent the
+            // bias call above just wrote, predicting how likely this row's (about to be computed)
+            // argmax is to be accepted. Order doesn't matter relative to the argmax call below --
+            // it depends on s.xn and s.markov_latent, neither of which the argmax touches.
+            if (s.confidence_w)
+                dflash_kernels::launch_confidence_head(s.xn + (size_t)r * H, s.markov_latent,
+                                                       s.confidence_w, s.confidence_bias, H,
+                                                       s.markov_rank, s.d_confidence + r, st);
             kernels::launch_argmax(s.logits + (size_t)r * V, s.d_out + r, 1, V, st);
         }
     } else {
@@ -1198,8 +1247,14 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     cu(cudaMemcpyAsync(s.h_out, s.d_out,
                        (head_done ? kProposalDepth + 1 : B) * sizeof(int),
                        cudaMemcpyDeviceToHost, st), "argmax");
+    if (out_confidence && s.confidence_w)
+        cu(cudaMemcpyAsync(s.h_confidence + 1, s.d_confidence + 1,
+                           kProposalDepth * sizeof(float), cudaMemcpyDeviceToHost, st),
+           "confidence readback");
     cu(cudaStreamSynchronize(st), "draft sync");
     for (int t = 0; t <= kProposalDepth; t++) out_argmax[t] = s.h_out[t];
+    if (out_confidence && s.confidence_w)
+        for (int t = 1; t <= kProposalDepth; t++) out_confidence[t] = s.h_confidence[t];
 
     // Advance past the just-appended ctx+noise, then crop to `pos0` (= block start).
     // Matches z-lab dflash: past_key_values_draft.update(...) then .crop(start).

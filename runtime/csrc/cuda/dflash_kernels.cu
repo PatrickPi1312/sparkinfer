@@ -1541,20 +1541,44 @@ __global__ void k_broadcast_rows_i32(const int* __restrict__ src, int* __restric
 // bias[v] = sum_r(w1[prev_token][r] * w2[v][r]), added in place to logits[v]. rank is small
 // (256 for the checkpoints this has been measured against) so the whole latent vector for this
 // call's prev_token fits comfortably in shared memory and is reused by every thread in the block.
+// out_latent (optional, nullptr to skip) gets the same latent -- the confidence head reads it
+// back as part of its own input, so it's cheaper to save it here than re-look-up the embedding.
 __global__ void k_markov_bias_add(const bf16* __restrict__ w1, const bf16* __restrict__ w2,
                                   const int* __restrict__ prev_token, float* __restrict__ logits,
-                                  int vocab, int rank) {
+                                  int vocab, int rank, float* __restrict__ out_latent) {
     extern __shared__ float latent[];
     const int tok = *prev_token;
     const bf16* w1_row = w1 + (size_t)tok * rank;
     for (int r = threadIdx.x; r < rank; r += blockDim.x) latent[r] = b2f(w1_row[r]);
     __syncthreads();
+    if (out_latent && blockIdx.x == 0)
+        for (int r = threadIdx.x; r < rank; r += blockDim.x) out_latent[r] = latent[r];
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     if (v >= vocab) return;
     const bf16* w2_row = w2 + (size_t)v * rank;
     float acc = 0.f;
     for (int r = 0; r < rank; r++) acc += latent[r] * b2f(w2_row[r]);
     logits[v] += acc;
+}
+
+// confidence_logit = dot(hidden[H], w[0:H]) + dot(latent[rank], w[H:H+rank]) + bias -- a single
+// linear layer over the concatenation of this row's hidden state and its Markov latent, matching
+// DSpark's AcceptRatePredictor(confidence_head_with_markov=True). One block, block-wide reduction
+// (H+rank is a few thousand elements, comfortably one launch).
+__global__ void k_confidence_head(const bf16* __restrict__ hidden, const float* __restrict__ latent,
+                                  const bf16* __restrict__ w, float bias_val, int H, int rank,
+                                  float* __restrict__ out_confidence) {
+    extern __shared__ float sred[];
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) acc += b2f(hidden[i]) * b2f(w[i]);
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) acc += latent[i] * b2f(w[H + i]);
+    sred[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sred[threadIdx.x] += sred[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out_confidence = sred[0] + bias_val;
 }
 } // namespace
 
@@ -1575,12 +1599,21 @@ void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaSt
 }
 
 void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,
-                            float* logits, int vocab, int rank, cudaStream_t stream) {
+                            float* logits, int vocab, int rank, cudaStream_t stream,
+                            float* out_latent) {
     if (vocab <= 0 || rank <= 0) return;
     const int threads = 256;
     const int blocks = (vocab + threads - 1) / threads;
     k_markov_bias_add<<<blocks, threads, rank * sizeof(float), stream>>>(
-        (const bf16*)w1, (const bf16*)w2, prev_token, logits, vocab, rank);
+        (const bf16*)w1, (const bf16*)w2, prev_token, logits, vocab, rank, out_latent);
+}
+
+void launch_confidence_head(const void* hidden, const float* latent, const void* w, float bias,
+                            int H, int rank, float* out_confidence, cudaStream_t stream) {
+    if (H <= 0 || rank < 0) return;
+    const int threads = 256;
+    k_confidence_head<<<1, threads, threads * sizeof(float), stream>>>(
+        (const bf16*)hidden, latent, (const bf16*)w, bias, H, rank, out_confidence);
 }
 
 } // namespace dflash_kernels

@@ -90,10 +90,14 @@ public:
     //   proposals:     how many rows after the seed to score (0 = the built-in default). The
     //                  verifier picks this by context length, so the draft has to be told rather
     //                  than deciding for itself, or the two disagree on how long a block is.
+    //   out_confidence: optional, [1..proposals] host logits from DSpark's confidence head (raw
+    //                  logit, not sigmoid'd -- sigmoid on the caller side if a probability is
+    //                  needed). Left untouched (whatever the caller passed in) for checkpoints
+    //                  without a confidence head, or when nullptr.
     bool forward_block(const void* target_hidden, int ctx_len,
                        const int* noise_ids, int pos0,
                        int* out_argmax, cudaStream_t stream = nullptr,
-                       int proposals = 0);
+                       int proposals = 0, float* out_confidence = nullptr);
 
     // Apply target lm_head to last forward's hidden states; writes device logits [block, vocab]
     // and host argmax. Called internally by forward_block; exposed for debugging.

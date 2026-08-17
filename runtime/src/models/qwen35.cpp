@@ -3035,6 +3035,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
+    std::vector<float> draft_confidence(B + 1, 0.f);
     // Proposal depth (also sets the draft's active diffusion width, depth+1). 5 is the measured
     // optimum at short context: accept length rises only 5.33 -> 5.95 -> 6.43 going to depth 6 and
     // 7, while each extra verify row costs a flat ~0.74 ms, so depth 6 already loses there.
@@ -3193,7 +3194,13 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             s.defer_decode_sync = false;
         }
         const bool draft_ok = draft.forward_block(
-            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth);
+            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth,
+            draft_confidence.data());
+        if (getenv("SPARKINFER_DFLASH_CONFIDENCE_DEBUG")) {
+            fprintf(stderr, "[confidence-debug] start=%d confidence=[", start);
+            for (int i = 1; i <= kProposalDepth; i++) fprintf(stderr, "%.3f ", draft_confidence[i]);
+            fprintf(stderr, "]\n");
+        }
         if (!compact_verify && p0 == kDFlashDeferred) {
             cu(cudaStreamSynchronize(s.stream), "verify0 sync");
             s.decode_pending = false;
@@ -3223,8 +3230,23 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             vfail = p0 < 0;
             posterior[0] = p0;
         }
+        // Confidence-gated early stop (opt-in, off by default -- SPARKINFER_DFLASH_CONFIDENCE_GATE
+        // sets the raw-logit threshold, no default because there is no calibration data yet for
+        // this checkpoint's actual accept-rate distribution against THIS target). DSpark's
+        // confidence head predicts position i's own accept probability; comparing raw logits
+        // against a raw-logit threshold is equivalent to comparing sigmoid(logit) against
+        // sigmoid(threshold), so no sigmoid is needed here. This forfeits an occasional accept
+        // (a position gated out that would have matched) in exchange for skipping a target
+        // forward predicted unlikely to pay off -- a lossless-preserving trade since forfeiting an
+        // accept just means treating it as rejected, never emitting an unverified token.
+        static const float kConfidenceGate = []{
+            const char* e = getenv("SPARKINFER_DFLASH_CONFIDENCE_GATE");
+            return e ? (float)atof(e) : 0.f;
+        }();
+        static const bool confidence_gate_on = getenv("SPARKINFER_DFLASH_CONFIDENCE_GATE") != nullptr;
         if (!compact_verify && !vfail && block[1] == p0) {
             for (int i = 1; i <= kProposalDepth; i++) {
+                if (i > 1 && confidence_gate_on && draft_confidence[i] < kConfidenceGate) break;
                 set_dflash_capture_row(i);
                 const int p = forward_token(block[i], start + i, true);
                 if (p < 0) { vfail = true; break; }
