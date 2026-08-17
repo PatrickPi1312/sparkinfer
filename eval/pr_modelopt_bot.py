@@ -4,14 +4,22 @@
 Sibling of pr_museglimmer_bot.py / pr_dflash_bot.py, and the ONLY scored bot once Qwen3.8-27B
 becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
 
-  0. SCOPE (2026-08-17) — decode @ ctx=16k is the ONLY dimension that can earn a tier, i.e. the
-              only kind of work this bot will auto-merge. Long-context decode is the current
-              optimisation target. decode@128, prefill@128 and prefill@16k are all still measured
-              and all still act as no-regression FLOORS, so a PR cannot buy 16k decode by trading
-              any of them away; a PR that improves only a floor dimension now scores "none".
-              Costs no extra GPU time -- ctx 16384 was already swept for prefill@16k and its
-              decode_tps was computed alongside and discarded. The rest of this docstring
-              describes the machinery, which is unchanged.
+  0. SCOPE (2026-08-17) — LONG CONTEXT on the ModelOpt checkpoint is what earns a tier:
+              decode @ ctx=16k and prefill @ ctx=16k, whichever the PR moved more. Those two are
+              the only kinds of work this bot will auto-merge.
+
+              decode@128 and prefill@128 are still measured and still act as no-regression FLOORS
+              (as do the two scoring dimensions), so a PR cannot buy long-context throughput by
+              trading short-context away; a PR that improves only a 128-context dimension scores
+              "none" by design.
+
+              "The ModelOpt checkpoint" is load-bearing: this bot only ever benchmarks MODEL_DIR,
+              so every scored number is gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090's. The
+              upstream unsloth build is guarded, never scored (see Q38_GUARD_MODEL_DIR).
+
+              Costs no extra GPU time -- ctx 16384 is one sweep entry and both metrics fall out of
+              that same model load. The rest of this docstring describes the machinery, which is
+              unchanged.
 
   1. Speed — decode @ ctx=128 on the NVFP4 checkpoint, PR vs a freshly-measured origin/main, same
               box, same round, median of 5 reps. Same tier buckets as every other bot in this
@@ -126,19 +134,22 @@ SIG = 0.02
 REGRESS_TOL = 0.98
 BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 
-# The dimensions that can earn a tier. Scope narrowed to decode@16k ALONE (decision 2026-08-17):
-# long-context decode is the current optimisation target, so it is the only dimension that can
-# earn a tier and therefore the only kind of work that auto-merges.
+# The dimensions that can earn a tier: LONG CONTEXT, both axes (decision 2026-08-17). decode@16k
+# and prefill@16k are the optimisation target, so those two are what auto-merges.
 #
-# decode@128, prefill@128 and prefill@16k are all still MEASURED and all still act as
-# no-regression FLOORS -- a PR that buys 16k decode by trading away short-context decode or
-# either prefill dimension is still a hard REJECT. That separation is the pre-existing design
-# (see the floor logic below); this change only moves which dimension is allowed to score, so a
-# PR that improves one of the others while leaving decode@16k flat now scores "none" by design.
+# A PR is tiered on whichever of the two it moved MORE, not on a sum or an average -- they are
+# largely independent (decode at 16k is KV-read bound at m=1, prefill at 16k is a tensor-core GEMM
+# over the whole prompt), so a real win in one is a real win, and averaging would let an untouched
+# dimension dilute it.
 #
-# Costs no extra GPU time: ctx 16384 was already in the bench sweep for prefill@16k, and
-# decode_tps at that context was computed alongside it and discarded.
-SCORING_DIMS = ["decode@16k"]
+# decode@128 and prefill@128 stay MEASURED as no-regression FLOORS, as do these two: a PR that
+# buys long-context throughput by trading away short-context is still a hard REJECT. Floor and
+# scoring are separate lists precisely so the target can move without weakening the guard -- a PR
+# that improves only a 128-context dimension now scores "none" by design.
+#
+# Costs no extra GPU time: ctx 16384 was already in the sweep, and both metrics come out of that
+# same model load.
+SCORING_DIMS = ["decode@16k", "prefill@16k"]
 SCORING_DIM = SCORING_DIMS[0]
 
 # Accuracy gate bars. This gate is DIFFERENTIAL (PR vs origin/main on the same token stream, see
@@ -1145,7 +1156,7 @@ def measure_main_baseline(host, port):
                 "log": (r.stdout or "")[-1500:]}
     # Same fail-closed rule for the SCORING dimension, and it matters more here than for the
     # floors: a zero baseline would make tier_from_gain treat every PR as an infinite speedup on
-    # the one dimension that can earn a tier, i.e. auto-merge on a broken measurement.
+    # a dimension that can earn a tier, i.e. auto-merge on a broken measurement.
     if not main.get("decode16k_tps"):
         return {"ok": False, "reason": "main bench missing/zero decode@16k tok/s (KV pool alloc?)",
                 "log": (r.stdout or "")[-1500:]}
@@ -1217,11 +1228,11 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         speed_reason = " | ".join(s["reason"] for s in regressed)
         best = worst
     else:
-        # The tier comes from decode@16k ALONE (2026-08-17). A decode@128-only, prefill@128-only
-        # or prefill@16k-only improvement scores "none" by design -- long-context DECODE is the
-        # optimisation target. (This comment previously claimed prefill@16k was the sole scoring
-        # dimension while SCORING_DIMS actually held decode@128 + prefill@128; it is now written
-        # against SCORING_DIMS rather than restating it, so the two cannot drift again.)
+        # The tier comes from the LONG-CONTEXT pair, decode@16k and prefill@16k (2026-08-17), on
+        # the ModelOpt checkpoint this bot scores. A 128-context-only improvement scores "none" by
+        # design. Written against SCORING_DIMS rather than restating its contents, because an
+        # earlier version of this comment named a different dimension than the list actually held
+        # and nobody noticed until the two were compared by hand.
         # Best of the scoring dimensions, by measured delta. max() over deltas rather than over
         # tier letters: two dimensions can share a bucket while one is clearly the larger win, and
         # the delta is what the tier was derived from anyway.
@@ -1416,7 +1427,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{marker}\n## sparkinfer modelopt auto-eval — `eval-modelopt:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-modelopt:{lab}` |\n"
-        f"| scored at | **decode@16k only** — it alone earns the tier; decode@128, prefill@128 and prefill@16k are measured as no-regression floors |\n"
+        f"| scored at | **decode@16k + prefill@16k** on the ModelOpt checkpoint — the better of the two earns the tier; decode@128 and prefill@128 are measured as no-regression floors |\n"
         f"| tier came from | `{res.get('scored_dimension', '?')}` |\n"
         f"| **PR decode@16k tok/s** | **{res.get('pr_decode16k_tps', 0):.2f}** |\n"
         f"| **main decode@16k tok/s** | **{res.get('main_decode16k_tps', 0):.2f}** |\n"
