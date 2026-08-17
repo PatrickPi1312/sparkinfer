@@ -13,7 +13,7 @@ commits and only spin the GPU when there's new work.
 
 Needs: `gh` authenticated, VAST_API_KEY saved (vastai), and the eval:* labels (eval/setup_labels.sh).
 """
-import argparse, datetime, hashlib, json, os, re, shutil, subprocess, sys
+import argparse, datetime, hashlib, json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -316,8 +316,52 @@ AUTOMERGE_BLOCK_LABELS = {"copycat", "copycat-warn", "flagged:gaming", "penalty"
 # ...or touches any maintainer-owned / governance path (contributor speedups live in kernels|runtime|moe):
 AUTOMERGE_SENSITIVE = ("eval/", "bench/scripts/", ".gittensor/", ".github/", "dashboard/", "CODEOWNERS")
 
-def gh(args):
-    return subprocess.run(["gh"] + args, capture_output=True, text=True)
+# Transient GitHub failures worth retrying. Deliberately NOT a catch-all: a 404 (label already
+# gone) or a 422 (label already present) is a real answer and retrying it just burns time.
+_GH_TRANSIENT_RE = re.compile(
+    r"HTTP (?:429|5\d\d)"                     # 502/503/504 and secondary rate limits
+    r"|no server is currently available"      # the 503 body GitHub actually returns
+    r"|was submitted too quickly"             # secondary rate limit
+    r"|abuse detection"
+    r"|temporarily unavailable"
+    r"|timed? ?out"
+    r"|connection reset",
+    re.I)
+
+
+def gh(args, retries=4, quiet=False):
+    """Run `gh`, retrying transient GitHub failures and NEVER failing silently.
+
+    This used to be a bare `subprocess.run(...)` whose result every caller discarded, so any
+    GitHub hiccup was swallowed whole while the bot logged a clean pass. That is exactly how
+    PR #862's eval verdict went missing on 2026-08-17: the round measured the PR correctly,
+    printed its success line, closed the PR -- and the `pr comment` and the `eval:none` mirror
+    label had both silently failed against an API that was returning 503s at the time. The
+    contributor got a closed PR with no result and no credit, and nothing in the log said so.
+
+    Retries the transient classes with exponential backoff; on final failure it WARNS on stderr
+    (cron redirects that into the bot log) instead of returning quietly. Still returns the
+    CompletedProcess, so no caller has to change -- but callers that care can now check
+    .returncode and actually see a failure.
+
+    quiet=True suppresses only the warning, for probes where a non-zero exit is an expected
+    answer rather than a fault (remove_label on a label that isn't there, say).
+    """
+    delay, last = 3, None
+    for attempt in range(1, max(1, retries) + 1):
+        last = subprocess.run(["gh"] + args, capture_output=True, text=True)
+        if last.returncode == 0:
+            return last
+        blob = (last.stderr or "") + (last.stdout or "")
+        if attempt == retries or not _GH_TRANSIENT_RE.search(blob):
+            break
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
+    if last is not None and last.returncode != 0 and not quiet:
+        first = ((last.stderr or last.stdout or "").strip().splitlines() or [""])[0]
+        print(f">> WARN: gh {' '.join(args[:3])} failed (rc={last.returncode}): {first[:200]}",
+              file=sys.stderr)
+    return last
 
 # ---- contributor denylist (eval-gaming / sybil block) ----
 # .github/blocked-contributors.txt lists GitHub logins (one per line, # = comment). A PR is blocked
@@ -1019,23 +1063,29 @@ def post_needs_bench_comment(repo, num):
 def _owner_repo(repo):
     parts = repo.split("/"); return parts[0], parts[1]
 
+# These three go through gh() rather than a bare subprocess.run so they inherit its retry and its
+# failure warning. add_label in particular is load-bearing: the eval:* mirror it writes is what
+# SN74 scoring reads, so a dropped call costs a contributor credit silently (see gh()'s note on
+# PR #862). REST endpoints, not `gh pr edit` -- that CLI path goes through a GraphQL query which
+# now fails outright on this repo with "Projects (classic) is being deprecated ...
+# (repository.pullRequest.projectCards)", independently of any outage.
 def labels_on(repo, num):
     owner, r = _owner_repo(repo)
-    out = subprocess.run(["gh", "api", f"repos/{owner}/{r}/issues/{num}/labels",
-                          "--jq", "[.[].name]"], capture_output=True, text=True)
+    out = gh(["api", f"repos/{owner}/{r}/issues/{num}/labels", "--jq", "[.[].name]"])
     try: return set(json.loads(out.stdout))
     except Exception: return set()
 
 def add_label(repo, num, label):
     owner, r = _owner_repo(repo)
-    subprocess.run(["gh", "api", f"repos/{owner}/{r}/issues/{num}/labels",
-                    "--method", "POST", "-f", f"labels[]={label}"],
-                   capture_output=True, text=True)
+    return gh(["api", f"repos/{owner}/{r}/issues/{num}/labels",
+               "--method", "POST", "-f", f"labels[]={label}"])
 
 def remove_label(repo, num, label):
     owner, r = _owner_repo(repo)
-    subprocess.run(["gh", "api", f"repos/{owner}/{r}/issues/{num}/labels/{label}",
-                    "--method", "DELETE"], capture_output=True, text=True)
+    # quiet: removing a label that is not on the PR is a 404, and every caller here removes
+    # unconditionally rather than checking first, so warning on it would be pure noise.
+    return gh(["api", f"repos/{owner}/{r}/issues/{num}/labels/{label}", "--method", "DELETE"],
+              quiet=True)
 
 def apply_area_labels(repo, num, areas):
     want = {f"area:{a}" for a in areas}
