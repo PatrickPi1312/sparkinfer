@@ -1435,7 +1435,7 @@ __global__ void k_gdn_scan_commit_layers(
     const bf16* __restrict__ beta_base,
     const GdnCommitLayer* __restrict__ layers,
     float* __restrict__ live_base, size_t live_stride,
-    int n_tokens, int q_heads, int v_heads) {
+    int n_tokens, int q_heads, int v_heads, bool qh_block) {
     constexpr int NROW = HEAD_DIM / 32;
     const int li = blockIdx.z;
     const int vh = blockIdx.x;
@@ -1451,7 +1451,11 @@ __global__ void k_gdn_scan_commit_layers(
     const bf16* a = reinterpret_cast<const bf16*>(layers[li].a);
     float* live_state = live_base + live_stride * L;
 
-    const int qh = vh % q_heads;
+    // Must match df_gdn_scan_checkpoint_kernel's qh mapping exactly (batched_prefill.cu) -- this
+    // used to hardcode vh % q_heads unconditionally, silently using the wrong K/Q head for every
+    // qh_block=true model (Qwen3.8-27B) on every commit, corrupting the carried-forward GDN state
+    // one round at a time even though each round's own verify computation was itself correct.
+    const int qh = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
     const int q_dim = q_heads * HEAD_DIM;
     const int v_dim = v_heads * HEAD_DIM;
     const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
@@ -1506,14 +1510,14 @@ void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
                                    const void* beta_base, const GdnCommitLayer* layers,
                                    float* live_base, size_t live_layer_stride,
                                    int n_layers, int n_tokens, int q_heads, int v_heads,
-                                   int head_dim, cudaStream_t stream) {
+                                   int head_dim, bool qh_block, cudaStream_t stream) {
     if (n_tokens <= 0 || head_dim != 128 || n_layers <= 0) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS, n_layers);
     k_gdn_scan_commit_layers<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
         (const bf16*)k_base, k_layer_stride, (const bf16*)v_base, v_layer_stride,
         (const bf16*)alpha_base, ab_layer_stride, (const bf16*)beta_base, layers,
-        live_base, live_layer_stride, n_tokens, q_heads, v_heads);
+        live_base, live_layer_stride, n_tokens, q_heads, v_heads, qh_block);
 }
 
 namespace {

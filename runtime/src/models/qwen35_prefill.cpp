@@ -2189,6 +2189,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const int H = c.hidden, N = n, qdim = s.qdim, kvdim = s.kvdim;
     const int lqkv = s.linear_qkvdim, lvdim = s.linear_vdim, vh = c.linear_v_heads;
     const int ffn = c.moe_ffn, E = c.n_experts, topk = c.top_k;
+    // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): confirm the row<->position mapping
+    // before trusting any hidden-state diff. Real token ids only (warm_verify's capture_only
+    // pre-build pass uses all-zero placeholder ids, not real ones -- skip printing those).
+    if (getenv("SPARKINFER_DFLASH_VERIFY_DUMP_ROW") && token_ids[0] != 0) {
+        fprintf(stderr, "[dflash-verify-debug] start_pos=%d N=%d ids=[", start_pos, N);
+        for (int i = 0; i < N; i++) fprintf(stderr, "%d ", token_ids[i]);
+        fprintf(stderr, "]\n");
+    }
     cudaStream_t st = s.stream;
     static thread_local Arena verify_arena;
     verify_arena.rewind();
@@ -2196,6 +2204,56 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bf16* x = a.alloc<bf16>((size_t)N * H);
     bf16* xn = a.alloc<bf16>((size_t)N * H);
     bf16* h = a.alloc<bf16>((size_t)N * H);
+    // DEBUG ONLY (dspark_tau_check bisection, 2026-08-17): SPARKINFER_DFLASH_VERIFY_DUMP_ROW=<row>
+    // dumps that row's pre-attn-norm xn after EVERY layer, plus the post-final-norm xn, into
+    // [n_layers+1, H] bf16 written to SPARKINFER_DFLASH_VERIFY_DUMP_FILE (default
+    // /tmp/dflash_verify_xn_dump.bin) -- same format as qwen35.cpp's SPARKINFER_MG_DUMP_STEP, so
+    // the two can be diffed layer-by-layer to find where a verify row's hidden state first parts
+    // ways from AR's. SPARKINFER_DFLASH_VERIFY_DUMP_START_POS=<pos> (default: first call, any
+    // start_pos) selects WHICH verify round to dump -- rows are the DRAFT's own proposed tokens,
+    // not a 1:1 window onto the AR reference sequence, so "first call" only lines up with AR's
+    // first few outputs when every earlier row in that round was also a correct guess.
+    static int verify_dbg_row = -2;
+    if (verify_dbg_row < -1) {
+        const char* e = getenv("SPARKINFER_DFLASH_VERIFY_DUMP_ROW");
+        verify_dbg_row = e ? atoi(e) : -1;
+    }
+    static int verify_dbg_want_pos = -2;
+    if (verify_dbg_want_pos < -1) {
+        const char* e = getenv("SPARKINFER_DFLASH_VERIFY_DUMP_START_POS");
+        verify_dbg_want_pos = e ? atoi(e) : -1;
+    }
+    static int verify_dbg_call = 0;
+    static bf16* verify_dbg_buf = nullptr;
+    // Two separate gates, deliberately not one: whichever call happens to be first triggers this
+    // function's ONE graph recording (dflash_warm_verify's capture_only pre-build, typically at
+    // an earlier start_pos than the round actually wanted). A CUDA graph replay does NOT re-run
+    // this function's C++ -- it only relaunches whatever kernel nodes were captured during that
+    // first recording -- so gating the memcpy itself on start_pos meant it was never captured at
+    // all when the target round wasn't the recording one, and every "dump" after that silently
+    // read uninitialized verify_dbg_buf. Snapshot on every call (cheap, and bakes the node into
+    // the graph regardless of which call records it); gate only the FILE WRITE on start_pos, and
+    // since replay still feeds live data through the captured nodes, the buffer is guaranteed
+    // correct for the CURRENT call by the time verify sync/replay-sync completes.
+    const bool vdbg = (verify_dbg_row >= 0 && verify_dbg_row < N);
+    const bool vdbg_dump_now = (vdbg && verify_dbg_call == 0 &&
+                                (verify_dbg_want_pos < 0 || verify_dbg_want_pos == start_pos));
+    if (vdbg && !verify_dbg_buf)
+        pf_cu(cudaMalloc(&verify_dbg_buf, (size_t)(c.n_layers + 1) * H * sizeof(bf16)), "verify_dbg_buf alloc");
+    auto vdbg_snapshot = [&](const bf16* p, int layer) {
+        if (vdbg) pf_cu(cudaMemcpyAsync(verify_dbg_buf + (size_t)layer * H, p + (size_t)verify_dbg_row * H,
+                                        (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+                        "verify_dbg snapshot");
+    };
+    // DEBUG ONLY: 4-slot layer-0-only sub-stage buffer (ao/h/hn/routed) -- see the call sites.
+    static bf16* verify_dbg_buf2 = nullptr;
+    if (vdbg && !verify_dbg_buf2)
+        pf_cu(cudaMalloc(&verify_dbg_buf2, (size_t)5 * H * sizeof(bf16)), "verify_dbg_buf2 alloc");
+    auto vdbg_snapshot2 = [&](const bf16* p, int slot) {
+        if (vdbg) pf_cu(cudaMemcpyAsync(verify_dbg_buf2 + (size_t)slot * H, p + (size_t)verify_dbg_row * H,
+                                        (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+                        "verify_dbg2 snapshot");
+    };
     bf16* hn = a.alloc<bf16>((size_t)N * H);
     bf16* ao = a.alloc<bf16>((size_t)N * H);
     bf16* routed = a.alloc<bf16>((size_t)N * H);
@@ -2469,6 +2527,25 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         pf_cu(cudaGraphLaunch(verify_exec, st), "verify graph launch");
         pf_cu(cudaStreamSynchronize(st), "verify graph sync");
         std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
+        if (vdbg_dump_now) {
+            std::vector<bf16> host((size_t)(c.n_layers + 1) * H);
+            pf_cu(cudaMemcpy(host.data(), verify_dbg_buf, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
+                  "verify_dbg readback (replay)");
+            const char* path = getenv("SPARKINFER_DFLASH_VERIFY_DUMP_FILE");
+            FILE* f = fopen(path ? path : "/tmp/dflash_verify_xn_dump.bin", "wb");
+            if (f) { fwrite(host.data(), sizeof(bf16), host.size(), f); fclose(f); }
+            fprintf(stderr, "[dflash-verify-debug] dumped xn[layer,H=%d] for row=%d start_pos=%d, %d layers -> %s (replay path)\n",
+                    H, verify_dbg_row, start_pos, c.n_layers, path ? path : "/tmp/dflash_verify_xn_dump.bin");
+            std::vector<bf16> host2((size_t)5 * H);
+            pf_cu(cudaMemcpy(host2.data(), verify_dbg_buf2, host2.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
+                  "verify_dbg2 readback (replay)");
+            const char* path2 = getenv("SPARKINFER_DFLASH_VERIFY_DUMP_FILE2");
+            FILE* f2 = fopen(path2 ? path2 : "/tmp/dflash_verify_l0_substages.bin", "wb");
+            if (f2) { fwrite(host2.data(), sizeof(bf16), host2.size(), f2); fclose(f2); }
+            fprintf(stderr, "[dflash-verify-debug] dumped layer0 substages [ao,h,hn,routed,x] -> %s (replay path)\n",
+                    path2 ? path2 : "/tmp/dflash_verify_l0_substages.bin");
+            verify_dbg_call++;
+        }
         goto verify_forward_done;
     }
     recording = graph_warm || capture_only;
@@ -2505,6 +2582,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     kernels::launch_rmsnorm(x, s.w.layers[0].input_norm, xn, N, H, c.rms_eps, st);
     for (int L = 0; L < c.n_layers && supported; ++L) {
         vfail_L = L;
+        vdbg_snapshot(xn, L);
+        if (L == 0) vdbg_snapshot2(x, 4);   // raw pre-norm residual stream (h = x + ao)
         const Qwen35LayerWeights& w = s.w.layers[L];
         if (w.linear_attn) {
             bf16* rq = rec_qkv + (size_t)L * N * lqkv;
@@ -2609,8 +2688,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             supported = proj(att, w.wo, w.wo_type, ao, H, qdim);
         }
         if (!supported) break;
+        // DEBUG ONLY: layer-0-only sub-stage capture (ao = GDN/attn output pre-residual, h =
+        // post-residual, hn = pre-FFN norm) for the SAME row as verify_dbg_buf, into a second
+        // small buffer -- memcpy destination pointers survive graph replay even though scalar
+        // kernel args (a printf's tag/step) do not, which is why this uses vdbg_snapshot's
+        // approach and not a live stat-printer call here.
+        if (L == 0) vdbg_snapshot2(ao, 0);
         kernels::launch_add_rmsnorm2_q8_rows(x, ao, w.post_attn_norm, h, hn, q81,
                                              N, H, c.rms_eps, st);
+        // FIXED (2026-08-17): this used to snapshot h BEFORE this kernel wrote it -- h is an
+        // arena buffer reused every layer, so the earlier capture was reading whatever the
+        // PREVIOUS layer's residual left there, not this layer's real value. That stale read is
+        // what produced the ~456 magnitude "anomaly" that briefly looked like a kernel bug; an
+        // isolated repro of this exact kernel under compute-sanitizer (memcheck + racecheck, 0
+        // errors both) proved the kernel itself was never the problem.
+        if (L == 0) { vdbg_snapshot2(h, 1); vdbg_snapshot2(hn, 2); }
         q81_src = hn; q81_k = H;
 
         // Dense FFN: one expert, no router, no shared expert. Seed ids/weights with the same
@@ -2625,6 +2717,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
                                                expert_ids, expert_w, routed, moe_h, moe_out,
                                                N, topk, H, ffn, q81, st);
+            if (L == 0) vdbg_snapshot2(routed, 3);
             // Residual + next-layer norm, matching the MoE branch's tail.
             const void* nn = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
             kernels::launch_add_rmsnorm2_q8_rows(h, routed, nn, x, xn, q81,
@@ -2774,6 +2867,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         return -1;
     }
 
+    vdbg_snapshot(xn, c.n_layers);   // extra slot: post-final-norm xn, matching qwen35.cpp's convention
     quant_rows(xn, H);
     // Score logits from the SAME weight representation AR uses. AR decode runs the
     // native Q4_K head (qwen35.cpp: launch_mmvq_q4k_f32 on s.w.lm_head), whose Q4_K
@@ -2798,11 +2892,37 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_I8");
         return e && e[0] != '0';
     }();
-    head_ok = verify_head_i8_on && verify_head_i8
-        ? kernels::launch_gemv_i8_q81_multirow_f32(
-              q81, verify_head_i8, verify_head_scale, logits, c.vocab, H, N, st)
-        : kernels::launch_mmvq_rows_f32(
-              s.w.lm_head_type, q81, s.w.lm_head, logits, N, c.vocab, H, st);
+    if (verify_head_i8_on && verify_head_i8) {
+        head_ok = kernels::launch_gemv_i8_q81_multirow_f32(
+            q81, verify_head_i8, verify_head_scale, logits, c.vocab, H, N, st);
+    } else if (s.w.lm_head_type == 12) {
+        // AR decode drives the LM head with launch_mmvq_q4k_f32 at one row (qwen35.cpp:1888);
+        // this makes the verify call the identical kernel instead of launch_mmvq_rows_f32's
+        // batched Q4_K path, on the same "N one-row AR calls are bit-identical by construction"
+        // reasoning as the FP8/NVFP4 GDN projections above.
+        //
+        // NOTE (2026-08-17): this alone does NOT make dspark_tau_check report lossless=YES.
+        // si_mmvq_q4k_rows_exact_kernel's own per-row dot/reduction order claim held up under
+        // direct testing -- swapping every Q4_K GEMV in the model (not just this head) to the
+        // same per-row AR kernel, AND separately pinning SPARKINFER_NSPLITS=1 to remove
+        // flash-decode's split-K nondeterminism (see dspark_tau_check.cpp), left the FIRST
+        // divergence (position 3, verify=3065 vs AR=314, K=5120/Qwen3.8-27B) byte-for-byte
+        // unchanged across all three variants. That rules out Q4_K kernel choice and split-K
+        // order as the cause of THIS divergence -- something else (attention/GDN state handling
+        // most likely, see the #712 precedent noted at the flash_decode_split call below) is the
+        // real source. Kept anyway: it is still a strictly more defensible position than trusting
+        // an unverified "same order" claim, and costs nothing extra since N is small here.
+        const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
+        for (int r = 0; r < N; ++r) {
+            kernels::launch_mmvq_q4k_f32(
+                static_cast<const unsigned char*>(q81) + (size_t)r * q81_row_bytes,
+                s.w.lm_head, logits + (size_t)r * c.vocab, c.vocab, H, st);
+        }
+        head_ok = true;
+    } else {
+        head_ok = kernels::launch_mmvq_rows_f32(
+            s.w.lm_head_type, q81, s.w.lm_head, logits, N, c.vocab, H, st);
+    }
     if (!head_ok) {
         fprintf(stderr, "[dflash-verify] unsupported LM head type=%d H=%d\n", s.w.lm_head_type, H);
         abandon_capture();
@@ -2824,9 +2944,33 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     pf_cu(cudaStreamSynchronize(st), "verify sync");
     std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
     graph_warm = true;
+    if (vdbg_dump_now) {
+        std::vector<bf16> host((size_t)(c.n_layers + 1) * H);
+        pf_cu(cudaMemcpy(host.data(), verify_dbg_buf, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
+              "verify_dbg readback");
+        const char* path = getenv("SPARKINFER_DFLASH_VERIFY_DUMP_FILE");
+        FILE* f = fopen(path ? path : "/tmp/dflash_verify_xn_dump.bin", "wb");
+        if (f) { fwrite(host.data(), sizeof(bf16), host.size(), f); fclose(f); }
+        fprintf(stderr, "[dflash-verify-debug] dumped xn[layer,H=%d] for row=%d start_pos=%d, %d layers -> %s\n",
+                H, verify_dbg_row, start_pos, c.n_layers, path ? path : "/tmp/dflash_verify_xn_dump.bin");
+        std::vector<bf16> host2((size_t)5 * H);
+        pf_cu(cudaMemcpy(host2.data(), verify_dbg_buf2, host2.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
+              "verify_dbg2 readback");
+        const char* path2 = getenv("SPARKINFER_DFLASH_VERIFY_DUMP_FILE2");
+        FILE* f2 = fopen(path2 ? path2 : "/tmp/dflash_verify_l0_substages.bin", "wb");
+        if (f2) { fwrite(host2.data(), sizeof(bf16), host2.size(), f2); fclose(f2); }
+        fprintf(stderr, "[dflash-verify-debug] dumped layer0 substages [ao,h,hn,routed,x] -> %s\n",
+                path2 ? path2 : "/tmp/dflash_verify_l0_substages.bin");
+        verify_dbg_call++;
+    }
 verify_forward_done:
     int keep = 1;
     while (keep < N && token_ids[keep] == out_argmax[keep - 1]) ++keep;
+    if (getenv("SPARKINFER_DFLASH_VERIFY_DUMP_ROW")) {
+        fprintf(stderr, "[dflash-verify-debug] start_pos=%d N=%d keep=%d out_argmax=[", start_pos, N, keep);
+        for (int i = 0; i < N; i++) fprintf(stderr, "%d ", out_argmax[i]);
+        fprintf(stderr, "]\n");
+    }
     // Commit the accepted prefix into the live GDN state. This runs OUTSIDE the verify graph, on
     // the same stream, and the next step's draft does not start until it drains — so its launches
     // are on the critical path. One launch per GDN layer per commit meant 60 tiny serialized
@@ -2868,7 +3012,7 @@ verify_forward_done:
             rec_k, (size_t)N * s.linear_qdim, rec_v, (size_t)N * lvdim,
             rec_a, (size_t)N * vh, rec_b, d_gdn_w,
             s.lin_state, (size_t)vh * c.linear_head_dim * c.linear_head_dim,
-            n_gdn, keep, c.linear_q_heads, vh, c.linear_head_dim, st);
+            n_gdn, keep, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
     } else {
         for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
             bf16* rq = rec_qkv + (size_t)L * N * lqkv;

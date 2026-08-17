@@ -148,7 +148,11 @@ void launch_rms_heads_rope_normal(void* x, const void* w, int seq, int n_heads, 
 // two per-layer weight vectors are not strided and are passed as device pointers.
 //
 // The per-layer arithmetic and reduction order are unchanged, so each layer's committed state is
-// bit-identical to running the single-layer kernels one at a time.
+// bit-identical to running the single-layer kernels one at a time -- PROVIDED qh_block is threaded
+// through (fixed 2026-08-17, see launch_gdn_scan_commit_layers's own note below; this comment was
+// wrong from the day the optimization was written -- k_gdn_scan_commit_layers hardcoded the
+// vh % q_heads mapping and silently dropped the vh / (v_heads/q_heads) branch checkpoint kernels
+// use for qh_block models like Qwen3.8-27B).
 struct GdnCommitLayer { const void* dt; const void* a; int layer; };
 
 void launch_gdn_conv_commit_layers(const void* qkv_base, size_t qkv_layer_stride,
@@ -163,7 +167,7 @@ void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
                                    const void* beta_base, const GdnCommitLayer* layers,
                                    float* live_base, size_t live_layer_stride,
                                    int n_layers, int n_tokens, int q_heads, int v_heads,
-                                   int head_dim, cudaStream_t stream);
+                                   int head_dim, bool qh_block, cudaStream_t stream);
 
 // Copy nodes are barriers inside the verify graph. The batched verify records two kinds of
 // device-to-device copy per replay -- one 2-D copy per captured layer to stage the draft's target
