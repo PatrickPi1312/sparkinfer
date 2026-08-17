@@ -2359,6 +2359,19 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 kernels::launch_gemv_fp8(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
             return true;
         }
+        // SI_QTYPE_NVFP4: same story one checkpoint later. The ModelOpt export
+        // (gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090) quantizes ALL 400 Linears to NVFP4,
+        // including every GDN projection, where the compressed-tensors export used FP8. Without
+        // this branch that checkpoint declines the verify on layer 0 exactly as Qwen3.8 did
+        // before the FP8 branch above was added.
+        // Row loop for the same reason as FP8: AR decode drives launch_gemv_nvfp4 at one row, so
+        // N one-row calls are bit-identical to N AR steps, which is what keeps the speculative
+        // path lossless by construction rather than by measurement.
+        if (type == kernels::SI_QTYPE_NVFP4) {
+            for (int r = 0; r < N; ++r)
+                kernels::launch_gemv_nvfp4(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
+            return true;
+        }
         if (type != 8 && type != 12 && type != 14) {
             fprintf(stderr, "[dflash-verify] unsupported projection type=%d N=%d K=%d\n", type, no, k);
             return false;
@@ -2371,6 +2384,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     auto proj_on = [&](cudaStream_t ps, const bf16* in, const void* w, int type, bf16* out,
                        int no, int k) -> bool {
         if (type == 0) return kernels::launch_gemv_rows(in, w, out, N, no, k, ps);
+        // Native FP8/NVFP4 touch no shared q81 scratch, so unlike the mmvq path below they are
+        // safe on ANY stream and never need the fall-back to `st`.
+        if (type == kernels::SI_QTYPE_FP8 || type == kernels::SI_QTYPE_NVFP4) {
+            for (int r = 0; r < N; ++r) {
+                const bf16* xr = in + (size_t)r * k;
+                bf16* yr = out + (size_t)r * no;
+                if (type == kernels::SI_QTYPE_FP8) kernels::launch_gemv_fp8(xr, w, yr, no, k, ps);
+                else                               kernels::launch_gemv_nvfp4(xr, w, yr, no, k, ps);
+            }
+            return true;
+        }
         if (type != 8 && type != 12 && type != 14) return false;
         if (q81_src != in || q81_k != k) { quant_rows(in, k); ps = st; }
         return kernels::launch_mmvq_rows(type, q81, w, out, N, no, k, ps);
