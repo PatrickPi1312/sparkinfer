@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sparkinfer Qwen3.8-27B PR auto-evaluator.
+"""sparkinfer Qwen3.8-27B ModelOpt (NVFP4) PR auto-evaluator.
 
 Sibling of pr_museglimmer_bot.py / pr_dflash_bot.py, and the ONLY scored bot once Qwen3.8-27B
 becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
@@ -59,13 +59,13 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
 
 Applies `eval-qwen38:<TIER>` AND mirrors it to the generic `eval:<TIER>` label (SN74 scoring reads
 eval:* tiers). Auto-close on none/REJECT is live; auto-merge stays OFF unless
-SPARKINFER_QWEN38_AUTOMERGE=1 is explicitly set.
+SPARKINFER_MODELOPT_AUTOMERGE=1 is explicitly set.
 
-  python eval/pr_qwen38_bot.py --instance 46074104
-  python eval/pr_qwen38_bot.py --only-prs 636 --reeval
+  python eval/pr_modelopt_bot.py --instance 46074104
+  python eval/pr_modelopt_bot.py --only-prs 636 --reeval
 
 Never rents a GPU. Shares the pinned box with any other bot via flock in the cron wrapper
-(run_qwen38_cron.sh) — all bots MUST share /tmp/sparkinfer_bot.lock.
+(run_modelopt_cron.sh) — all bots MUST share /tmp/sparkinfer_bot.lock.
 """
 from __future__ import annotations
 
@@ -192,9 +192,13 @@ Q38_GUARD_MODEL_DIR = os.environ.get("Q38_GUARD_MODEL_DIR", "/root/workspace/mod
 Q38_GUARD_CTXS = [0, 4096, 16384]
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
-# shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
-# inert until a human deliberately flips it on. Single-line change to enable later.
-AUTO_MERGE = os.environ.get("SPARKINFER_QWEN38_AUTOMERGE") == "1"
+# shape) but OFF unless this exact env var is set.
+# Was reading SPARKINFER_QWEN38_AUTOMERGE until 2026-08-17 -- a leftover from this file being
+# forked from pr_qwen38_bot.py, whose rename to the ModelOpt-specific var missed this one
+# word-boundary. It "worked" only because .env.eval happened to set BOTH SPARKINFER_QWEN38_
+# AUTOMERGE and SPARKINFER_MODELOPT_AUTOMERGE=1, not because they were actually independent —
+# flipping one without the other would have silently done nothing. Reads its own var now.
+AUTO_MERGE = os.environ.get("SPARKINFER_MODELOPT_AUTOMERGE") == "1"
 AUTOMERGE_BLOCK = {
     "copycat", "copycat-warn", "flagged:gaming", "penalty", "needs-benchmark",
     MODELOPT_NEEDS_REBASE, arb.REEVALUATE_LABEL, arb.HOLD_LABEL, *arb.REGRESSION_LABELS,
@@ -1358,22 +1362,22 @@ def auto_merge_ok_qwen38(repo, num):
 def try_auto_merge_qwen38(repo, num):
     ok, reason = auto_merge_ok_qwen38(repo, num)
     if not ok:
-        print(f">> qwen38 auto-merge SKIP #{num}: {reason}")
+        print(f">> modelopt auto-merge SKIP #{num}: {reason}")
         return False
     r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash"])
     if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "1") == "1":
         err = ((r.stderr or "") + (r.stdout or "")).lower()
         if "not mergeable" in err or "branch policy" in err or "required" in err or "prohibited" in err:
-            print(">> qwen38 auto-merge: branch policy blocked — retrying with --admin")
+            print(">> modelopt auto-merge: branch policy blocked — retrying with --admin")
             r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash", "--admin"])
     if r.returncode == 0:
-        print(f">> QWEN38 AUTO-MERGED #{num} (qwen38-merge-first)")
+        print(f">> MODELOPT AUTO-MERGED #{num} (qwen38-merge-first)")
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
                 "<!-- sparkinfer-qwen38-automerge -->\n"
                 "Auto-merged as the round's `qwen38-merge-first` winner — verified same-box "
                 "128-token decode speedup over `main`, accuracy-gated vs llama.cpp."])
         return True
-    print(f">> qwen38 auto-merge BLOCKED #{num}: {(r.stderr or r.stdout or '')[:200]}")
+    print(f">> modelopt auto-merge BLOCKED #{num}: {(r.stderr or r.stdout or '')[:200]}")
     return False
 
 
@@ -1410,10 +1414,10 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
 
     scored.sort(key=lambda x: x[1], reverse=True)
     if not scored:
-        print(">> qwen38 round: no verified speedup PRs")
+        print(">> modelopt round: no verified speedup PRs")
         return
     winner = scored[0][0]
-    print(f">> qwen38 round: merge-first #{winner}; rebase {[n for n,_,_ in scored[1:]] or 'none'}")
+    print(f">> modelopt round: merge-first #{winner}; rebase {[n for n,_,_ in scored[1:]] or 'none'}")
     if dry_run:
         return
     arb.add_label(repo, winner, MODELOPT_MERGE_FIRST)
@@ -1480,17 +1484,17 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
             msg += f" + polaris {receipt.get('receipt_id', '?')[:16]}"
         commit = subprocess.run(["git", "-C", arb.LOG_DIR, "commit", "-q", "-m", msg], check=False)
         if commit.returncode != 0:
-            print(">> qwen38 eval-log upload skipped: nothing to commit")
+            print(">> modelopt eval-log upload skipped: nothing to commit")
             return None
         push = subprocess.run(["git", "-C", arb.LOG_DIR, "push", "-q"], check=False)
         if push.returncode != 0:
-            print(f">> qwen38 eval-log push failed (rc={push.returncode})")
+            print(f">> modelopt eval-log push failed (rc={push.returncode})")
             return None
         url = arb.LOG_PAGE + rid
-        print(f">> qwen38 eval log: {url}")
+        print(f">> modelopt eval log: {url}")
         return url
     except Exception as e:
-        print(f">> qwen38 eval-log upload failed: {e}")
+        print(f">> modelopt eval-log upload failed: {e}")
         return None
 
 
@@ -1594,7 +1598,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Qwen3.8-27B 128-decode PR eval bot")
+    ap = argparse.ArgumentParser(description="Qwen3.8-27B ModelOpt 128-decode PR eval bot")
     ap.add_argument("--instance", type=int, default=0)
     ap.add_argument("--repo", default="gittensor-ai-lab/sparkinfer")
     ap.add_argument("--dry-run", action="store_true")
@@ -1607,13 +1611,13 @@ def main():
 
     only = {int(x) for x in args.only_prs.split(",") if x.strip().isdigit()}
 
-    print(f">> qwen38 eval transport: "
+    print(f">> modelopt eval transport: "
           f"{'ssh' if ssh_box_enabled() else f'vast.ai (instance {arb.current_instance(args.instance) or args.instance})'}")
     print(f">> AUTOMERGE={int(AUTO_MERGE)}")
 
     if args.labels_only:
         reconcile_qwen38_merge_labels(args.repo, dry_run=args.dry_run)
-        print("done — qwen38 labels only (no GPU).")
+        print("done — modelopt labels only (no GPU).")
         return
 
     prs = json.loads(arb.gh([
@@ -1652,10 +1656,10 @@ def main():
         head = (pr.get("headRefOid") or "")[:40]
         short = head[:9]
         if not args.reeval and head and head in qwen38_evaluated_commits(args.repo, num):
-            print(f"PR #{num} @ {short}: already qwen38-evaluated — skip")
+            print(f"PR #{num} @ {short}: already modelopt-evaluated — skip")
             continue
         if arb.pr_merge_conflict(pr.get("mergeable")):
-            print(f"PR #{num}: merge conflict — qwen38-needs-rebase")
+            print(f"PR #{num}: merge conflict — modelopt-needs-rebase")
             if not args.dry_run:
                 arb.add_label(args.repo, num, MODELOPT_NEEDS_REBASE)
             continue
@@ -1663,7 +1667,7 @@ def main():
         if not only:
             status, why = arb.greenlight_status(args.repo, num, labs)
             if status != "ok":
-                print(f"PR #{num}: not greenlit ({why}) — skip qwen38 eval")
+                print(f"PR #{num}: not greenlit ({why}) — skip modelopt eval")
                 continue
             print(f"PR #{num}: greenlit ({why})")
         else:
@@ -1674,7 +1678,7 @@ def main():
 
     if not pending:
         reconcile_qwen38_merge_labels(args.repo, dry_run=args.dry_run)
-        print("done — no qwen38 PRs to evaluate.")
+        print("done — no modelopt PRs to evaluate.")
         return
 
     if args.dry_run:
@@ -1691,7 +1695,7 @@ def main():
     except Exception as e:
         print(f">> GPU unavailable: {e}")
         reconcile_qwen38_merge_labels(args.repo, dry_run=False)
-        print("done — qwen38 labels only (GPU down).")
+        print("done — modelopt labels only (GPU down).")
         return
 
     _ssh_user = ssh_box_user() if ssh_box_enabled() else "root"
@@ -1706,7 +1710,7 @@ def main():
         # pending PR for what is really one shared infra problem.
         print(f">> main baseline measurement failed: {main_result.get('reason')} — skipping round")
         reconcile_qwen38_merge_labels(args.repo, dry_run=False)
-        print("done — qwen38 round skipped (main baseline unusable).")
+        print("done — modelopt round skipped (main baseline unusable).")
         return
     # main has no top1/kl of its own: it IS the accuracy reference, and its score dump was just
     # written to SCORE_DUMP_MAIN for each PR in this round to diff against.
@@ -1723,7 +1727,7 @@ def main():
         apply_result(args.repo, num, head or short, res, title=title, dry_run=False)
 
     reconcile_qwen38_merge_labels(args.repo, dry_run=False)
-    print("done — qwen38 eval pass complete.")
+    print("done — modelopt eval pass complete.")
 
 
 if __name__ == "__main__":
