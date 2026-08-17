@@ -1590,7 +1590,19 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
     for lab in {l for l in arb.labels_on(repo, num) if l.startswith("eval:")}:
         arb.remove_label(repo, num, lab)
     arb.add_label(repo, num, f"eval:{label}")
-    arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+    # The verdict comment is the ONLY place a contributor sees why their PR was labelled and (for
+    # a non-speedup) closed, so a dropped post is worse than a dropped label. Post via the REST
+    # issues endpoint rather than `gh pr comment`: the latter resolves the PR through a GraphQL
+    # query that now fails outright on this repo with "Projects (classic) is being deprecated ...
+    # (repository.pullRequest.projectCards)", independent of any outage. Then CHECK it -- a
+    # silently-failed comment is what left PR #862 closed with a label and no result on
+    # 2026-08-17, while the round logged a clean pass.
+    c = arb.gh(["api", f"repos/{repo}/issues/{num}/comments",
+                "--method", "POST", "--field", f"body={body}"])
+    if c is None or c.returncode != 0:
+        print(f">> ERROR: PR #{num}: verdict comment FAILED to post — the PR now carries a label "
+              f"with no visible explanation. Verdict body follows so the round is not lost:\n"
+              f"{body[:900]}", file=sys.stderr)
     if res.get("ok"):
         upload_qwen38_eval_log(repo, num, title, commit, res)
     if res.get("ok") and res.get("delta_pct") is not None:
