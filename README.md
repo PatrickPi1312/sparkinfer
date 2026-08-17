@@ -106,11 +106,13 @@ Same weights the model was released with, re-quantized for the hardware it runs 
 and +28–222% prefill over the same engine reading a Q4_K_M GGUF**, and it erases the one dimension
 llama.cpp wins above — 6,546 pp at ctx=128 against 2,782.
 
-The upstream [unsloth NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) build (NVFP4 FFN +
-FP8 attention) is supported too and measures 84.9 / 83.2 / 80.6 tok/s decode and 5,031 / 9,548 /
-8,727 pp prefill at the same contexts. The eval scores PRs on our checkpoint and runs a *separate*
-no-regression guard on that one, so an optimisation cannot win on the scored build by pessimising
-the other.
+**Both NVFP4 builds are supported targets.** The upstream
+[unsloth NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) checkpoint (NVFP4 FFN + FP8
+attention) measures 84.9 / 83.2 / 80.6 tok/s decode and 5,031 / 9,548 / 8,727 pp prefill at the
+same contexts. The eval *scores* PRs on our checkpoint and runs a separate *no-regression guard*
+on that one — they share the loader, the batched prefill and every decode kernel, so scoring one
+while guarding the other is what stops an optimisation from winning on the scored build by
+pessimising the supported one.
 
 Read that last column for what it is. llama.cpp cannot load NVFP4 compressed-tensors at all, so
 `vs llama.cpp` there is **each engine on the format it actually runs** — our NVFP4 against
