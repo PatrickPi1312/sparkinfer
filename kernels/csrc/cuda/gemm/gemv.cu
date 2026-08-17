@@ -2538,14 +2538,21 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
     if (M < 1 || M > 8 || N < 1) return false;
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const auto* w = reinterpret_cast<const unsigned char*>(W);
-    if (qtype == 12 && (K == 2048 || K == 4096)) {
-        if (K == 2048) {
-            if (M <= 6) si_mmvq_q4k_rows_exact_kernel<float, 8, 6, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, y, M, N);
-            else        si_mmvq_q4k_rows_exact_kernel<float, 8, 8, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, y, M, N);
-        } else {
-            if (M <= 6) si_mmvq_q4k_rows_exact_kernel<float, 16, 6, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, y, M, N);
-            else        si_mmvq_q4k_rows_exact_kernel<float, 16, 8, SI_Q4K_OROWS><<<(N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS, 4 * 32, 0, stream>>>(q, w, y, M, N);
-        }
+    // Same instantiated-width limit as launch_mmvq_q4k_rows above, and the same consequence:
+    // this is the LM-head path, so K=5120 (Qwen3.8's hidden) refused here made the verify decline
+    // AFTER every layer had already succeeded -- "unsupported LM head type=12 H=5120".
+    if (qtype == 12 && (K == 2048 || K == 4096 || K == 5120 || K == 6144)) {
+        const int grid = (N + SI_Q4K_OROWS - 1) / SI_Q4K_OROWS;
+        #define SI_Q4K_ROWS_F32_DISPATCH(KB) \
+            do { \
+                if (M <= 6) si_mmvq_q4k_rows_exact_kernel<float, KB, 6, SI_Q4K_OROWS><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); \
+                else        si_mmvq_q4k_rows_exact_kernel<float, KB, 8, SI_Q4K_OROWS><<<grid, 4 * 32, 0, stream>>>(q, w, y, M, N); \
+            } while (0)
+        if      (K == 2048) SI_Q4K_ROWS_F32_DISPATCH(8);
+        else if (K == 4096) SI_Q4K_ROWS_F32_DISPATCH(16);
+        else if (K == 5120) SI_Q4K_ROWS_F32_DISPATCH(20);
+        else                SI_Q4K_ROWS_F32_DISPATCH(24);
+        #undef SI_Q4K_ROWS_F32_DISPATCH
         return true;
     }
     if (qtype == 14 && (K == 2048 || K == 4096)) {
