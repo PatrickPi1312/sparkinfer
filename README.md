@@ -78,14 +78,21 @@ marginally slower on this model, so llama.cpp's better configuration is the one 
 
 | context | SparkInfer | llama.cpp | Δ |
 |---:|---:|---:|---:|
-| 128 | **5,006** tok/s | 2,782 tok/s | **+79.9%** |
+| 128 | 2,033 tok/s | **2,782** tok/s | **−26.9%** |
+| 512 | **3,790** tok/s | 3,680 tok/s | **+3.0%** |
 | 4k | **7,548** tok/s | 3,670 tok/s | **+105.7%** |
 | 16k | **7,596** tok/s | 3,496 tok/s | **+117.2%** |
 
-Short-context prefill is the one dimension llama.cpp still wins, and it is listed here rather than
-omitted: at ctx=128 there is not enough work to fill the GPU with one batched GEMM pass, so the
-per-pass overhead sparkinfer pays to be fast at 4k/16k is not yet amortised. It is a live
-optimisation target, tracked by the same automated eval that gates every PR.
+Prefill crosses over at ~512 tokens: below it llama.cpp leads, above it sparkinfer pulls away to
+roughly 2× while llama.cpp stays flat near 3,700 pp. The short-prompt loss is published rather
+than omitted, and it has a cause — reading a Q4_K_M GGUF means dequantizing Q4_K into the GEMM
+operand on every pass, a fixed cost that 128 tokens cannot amortize but 4k easily does
+(2,033 → 3,114 → 3,790 → 6,325 → 7,349 → 7,515 pp across 128 → 4k). It is a live optimisation
+target, tracked by the same automated eval that gates every PR.
+
+Note this is the **GGUF** path, kept identical to llama.cpp's input on purpose. sparkinfer's own
+NVFP4 checkpoints do not pay that dequant and reach 5,031–6,546 pp at the same ctx=128 — see the
+two tables below, which is where a ~5,000 pp figure for this model comes from.
 
 ### Native NVFP4 — two supported checkpoints
 
@@ -97,15 +104,23 @@ checkpoints.
 — ours: uniform NVFP4 on every `Linear`, quantized in house with NVIDIA ModelOpt for the RTX 5090's
 FP4 tensor cores, and the checkpoint the automated eval scores every PR against:
 
-| context | decode | prefill | vs same-GGUF sparkinfer | vs llama.cpp |
-|---:|---:|---:|---:|---:|
-| 128 | **95.8** tok/s | **6,546** tok/s | +10.2% dec · +222% pp | +19.4% dec · **+135%** pp |
-| 4k | **93.7** tok/s | **10,021** tok/s | +10.0% dec · +32.8% pp | +21.7% dec · **+173%** pp |
-| 16k | **90.1** tok/s | **9,749** tok/s | +9.4% dec · +28.4% pp | +22.0% dec · **+179%** pp |
+<!-- BENCH:qwen38-modelopt:start -->
 
-Same weights the model was released with, re-quantized for the hardware it runs on: **+9–10% decode
-and +28–222% prefill over the same engine reading a Q4_K_M GGUF**, and it erases the one dimension
-llama.cpp wins above — 6,546 pp at ctx=128 against 2,782.
+| context | decode | prefill |
+|---:|---:|---:|
+| 128 | **95.8** tok/s | **6,546** tok/s |
+| 4k | **93.7** tok/s | **10,021** tok/s |
+| 16k | **90.1** tok/s | **9,749** tok/s |
+
+<sub>Auto-refreshed by the ModelOpt eval bot at `d8e1c74` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
+<!-- BENCH:qwen38-modelopt:end -->
+
+Same weights the model was released with, re-quantized for the hardware it runs on. Measured at
+`d8e1c74` that was **+9–10% decode and +28–222% prefill** over the same engine reading a Q4_K_M
+GGUF, and **+19–22% decode / +135–179% prefill** over llama.cpp on its GGUF — including the one
+dimension llama.cpp wins above, 6,546 pp at ctx=128 against 2,782. Those comparisons are a
+snapshot: only the table above self-updates, because a round measures this checkpoint and nothing
+else.
 
 **[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)** — upstream: NVFP4
 FFN + FP8 attention/GDN projections, equally supported, and measured on the same box at the same
@@ -116,6 +131,9 @@ commit:
 | 128 | 84.9 tok/s | 5,031 tok/s |
 | 4k | 83.2 tok/s | 9,548 tok/s |
 | 16k | 80.6 tok/s | 8,727 tok/s |
+
+<sub>Measured at `d8e1c74`. Not auto-refreshed — a round scores the ModelOpt checkpoint and only
+guards this one, so these move when someone re-measures, not on every merge.</sub>
 
 Both load through the same `load_compressed_tensors` path and share the batched prefill and every
 decode kernel — the mixed-precision build is simply a different quantization of the same weights,
