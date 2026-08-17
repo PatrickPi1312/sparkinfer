@@ -61,6 +61,35 @@ int main(int argc, char** argv) {
     //     atomic accumulation. 5/5 lossless=YES on both the 32- and 40-token repros after both
     //     pins landed (was still nondeterministic with only the first).
     setenv("SPARKINFER_PREFILL_SKINNY_SPLITK", "0", 0);
+    // Fourth pin, same family, but for VRAM rather than determinism (2026-08-17): the checkpoint's
+    // native NVFP4 FFN tensors are kept resident ON TOP OF the Q4_K copies decode always uses,
+    // purely to speed up batched prefill (qwen35.cpp's own load-time comment: ~9.6 GB extra,
+    // pushing this model to ~29.7 GB on a 32.6 GB card). This tool never measures prefill
+    // throughput -- it measures tau/lossless -- so that second residency buys nothing here and
+    // was what left too little headroom for the draft + dflash workspace to fit, producing an
+    // unchecked-cudaMalloc-driven illegal-memory-access cascade instead of a clean OOM message.
+    setenv("SPARKINFER_QWEN38_PREFILL_NVFP4", "0", 0);
+    // Fifth pin (2026-08-17): dflash_generate() prompt-prefills through its OWN token-by-token
+    // loop (qwen35.cpp's dflash_generate, the `for (int i = 0; i < n; i++) forward_token(...)`
+    // block), never through ingest_prompt_range's batched path -- while this file's AR reference
+    // used generate(), whose prefill defaults to batched. Those two prefill implementations are
+    // NOT guaranteed bit-identical (see bench/scripts/prefill_parity_check.py's own tolerant 0.75
+    // bar, which exists because they aren't); the gap is normally a few ULPs, invisible at the
+    // prefill boundary, but with the target's own decode carrying GDN recurrent state forward, a
+    // few-ULP difference at position 0 compounds every subsequent step until it flips an argmax.
+    // Traced via a fresh per-layer xn diff (AR vs DFlash, both dumped with SPARKINFER_MG_DUMP_STEP)
+    // at the exact round where a 64-token generation on a 12-token prompt first diverges: L0 exact
+    // (embedding correct), L1 already off by up to 0.0078 in ~22% of elements -- a real but tiny
+    // divergence growing round over round until argmax finally flips around step 31. Confirmed as
+    // the sole cause: forcing AR's own prefill to token-loop too (this pin) reproduces
+    // lossless=YES 64/64 across repeats; every other candidate (deferred target/draft overlap,
+    // the draft's own forward pass, the compact-verify warm-up graph capture, the +block_size KV
+    // budget padding) was independently ruled out first and left the divergence unchanged. This is
+    // a test-harness fairness fix, not a claim that batched prefill is wrong -- dflash_generate's
+    // own prefill was simply never upgraded to the batched path, so comparing against a
+    // batched-prefilled AR reference was comparing two different starting states, not verifying
+    // DFlash's speculative logic.
+    setenv("SPARKINFER_PREFILL_BATCHED", "0", 0);
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) { printf("[SKIP] no GPU\n"); return 0; }
 
@@ -93,20 +122,33 @@ int main(int argc, char** argv) {
     mc.ffn_dim = cfg.moe_ffn; mc.num_layers = cfg.n_layers;
     auto engine = sparkinfer::moe::MoEEngine::create(mc);
 
+    auto memck = [](const char* label) {
+        if (!getenv("SPARKINFER_DSPARK_MEMCK")) return;
+        size_t f = 0, t = 0;
+        cudaMemGetInfo(&f, &t);
+        fprintf(stderr, "[memck] %-24s free=%.3fGB total=%.3fGB used=%.3fGB\n",
+                label, f / 1e9, t / 1e9, (t - f) / 1e9);
+    };
+
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
+    memck("after KV alloc");
     printf("loading target (%s) ...\n", qwen_checkpoint_kind_label(kind));
     if (!qwen_checkpoint_load(model, tpath, kind)) { printf("[FAIL] target load\n"); return 1; }
+    memck("after target load");
 
     sparkinfer::DFlashDraftConfig dcfg;
     sparkinfer::DFlashDraftModel draft(dcfg);
     if (!draft.load(dpath)) { printf("[FAIL] draft load\n"); return 1; }
+    memck("after draft load");
     const sparkinfer::DFlashDraftConfig& dc = draft.config();
 
     // The draft has no embed_tokens / lm_head of its own -- it borrows the target's, which is what
     // makes its proposals directly comparable to what the target would produce.
     draft.set_shared_weights(model.embed_weights(), model.lm_head_weights(),
                              model.lm_head_quant_type(), cfg.vocab, cfg.hidden);
+    memck("after set_shared_weights");
     draft.ensure_quant();
+    memck("after ensure_quant");
 
     // Capture layers come from the CHECKPOINT, not from this runtime's Qwen3.6 default: DSpark
     // projects [4,16,28,40,52] and its fc is sized n_cap*hidden accordingly.
@@ -116,6 +158,7 @@ int main(int argc, char** argv) {
     // not from the draft's block_size -- so sizing this buffer from block_size is sizing it from
     // the wrong quantity entirely, and it can be overrun.
     model.set_dflash_capture(true, dc.target_layer_ids);
+    memck("after set_dflash_capture");
     printf("draft: layers=%d B=%d n_cap=%zu  target: layers=%d dense_ffn=%d experts=%d\n",
            dc.n_layers, dc.block_size, dc.target_layer_ids.size(),
            cfg.n_layers, (int)cfg.dense_ffn, cfg.n_experts);

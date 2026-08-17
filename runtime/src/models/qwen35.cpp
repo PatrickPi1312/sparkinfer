@@ -765,6 +765,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph);
         s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
     }
+    // The check above only forces recapture of the PLAIN decode graph. DFlash's own forward_token
+    // calls (AR+capture isolation, and the token-loop verify) route through dflash_cap=true, which
+    // replays s.cu_dflash_exec instead -- an early return further below that skips all the
+    // debug/dump code entirely once that graph is warm, so SPARKINFER_MG_DUMP_STEP silently only
+    // ever captured the plain-AR-reference call otherwise (found 2026-08-17 bisecting a dspark
+    // divergence that turned out to be unrelated -- kept because the gap was real).
+    if (mgd && s.dflash_graph_ready) {
+        cudaGraphExecDestroy(s.cu_dflash_exec); cudaGraphDestroy(s.cu_dflash_graph);
+        s.cu_dflash_exec = nullptr; s.cu_dflash_graph = nullptr; s.dflash_graph_ready = false;
+    }
     auto dbg_bf16 = [&](const void* p, int n, int tag, int layer) {
         if (mgd) kernels::launch_mg_debug_bf16(p, n, tag, layer, position, st);
     };
@@ -1977,10 +1987,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         cu(cudaMemcpy(host.data(), s.dbg_xn_dump, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
            "dbg_xn_dump readback");
         const char* path = getenv("SPARKINFER_MG_DUMP_FILE");
-        FILE* f = fopen(path ? path : "/tmp/mg_xn_dump.bin", "wb");
+        // This fires on EVERY call at this position, not just the first, so a process that calls
+        // forward_token(_, dump_step, true) more than once (AR ref, then AR+capture isolation, then
+        // DFlash's own token loop) used to silently overwrite the same file. Suffix with a call
+        // counter so each occurrence survives.
+        static int mgdump_call = 0;
+        std::string path_s = std::string(path ? path : "/tmp/mg_xn_dump.bin") + "." + std::to_string(mgdump_call++);
+        FILE* f = fopen(path_s.c_str(), "wb");
         if (f) { fwrite(host.data(), sizeof(bf16), host.size(), f); fclose(f); }
         fprintf(stderr, "[mg-debug] dumped xn[layer,H=%d] for step=%d, %d layers -> %s\n",
-                H, position, c.n_layers, path ? path : "/tmp/mg_xn_dump.bin");
+                H, position, c.n_layers, path_s.c_str());
     }
     return *s.h_out_id;
 }
