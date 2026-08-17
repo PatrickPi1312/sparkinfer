@@ -2401,6 +2401,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (!a.ok) { fprintf(stderr, "[dflash-verify] block-table scratch allocation failed\n"); return -1; }
     bool supported = true;
     bool recording = false;
+    // Abandon an in-progress capture so the stream is usable again. EVERY early return between
+    // "verify graph begin" and "verify graph end" must call this first: cudaStreamEndCapture is
+    // the only way to leave cudaStreamCaptureStatusActive, so a bare return strands the stream in
+    // capturing state permanently and every later CUDA call on it fails -- including the caller's
+    // token-loop fallback, which is why a merely-unsupported shape presented as model corruption.
+    // Declared HERE, above `goto verify_forward_done`'s target scope: a goto may not jump over a
+    // variable initialization, and defining it later broke the build outright.
+    // The partial graph is destroyed, never instantiated -- recorded mid-layer, not replayable.
+    auto abandon_capture = [&]() {
+        if (!recording) return;
+        cudaGraph_t partial = nullptr;
+        if (cudaStreamEndCapture(st, &partial) == cudaSuccess && partial) cudaGraphDestroy(partial);
+        else cudaGetLastError();
+        recording = false;
+    };
     bool head_ok = false;
     if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
         graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
@@ -2694,7 +2709,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         q81_src = xn; q81_k = H;
         capture(L);
     }
-    if (!supported) return -1;
+    if (!supported) {
+        // Reached when a layer's projection type is one proj() cannot drive (anything but
+        // 0/8/12/14 -- notably SI_QTYPE_FP8 108 and SI_QTYPE_NVFP4 109, i.e. EVERY GDN layer of a
+        // compressed-tensors Qwen3.8 checkpoint). Falling back to the token loop is correct; doing
+        // so with the capture still open is what turned a missing optimisation into garbage output.
+        abandon_capture();
+        return -1;
+    }
 
     quant_rows(xn, H);
     // Score logits from the SAME weight representation AR uses. AR decode runs the
@@ -2727,6 +2749,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
               s.w.lm_head_type, q81, s.w.lm_head, logits, N, c.vocab, H, st);
     if (!head_ok) {
         fprintf(stderr, "[dflash-verify] unsupported LM head type=%d H=%d\n", s.w.lm_head_type, H);
+        abandon_capture();
         return -1;
     }
     kernels::launch_argmax(logits, out_ids, N, c.vocab, st);
