@@ -183,5 +183,16 @@ void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int d
 
 void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream);
 
+// DSpark's Markov head: a low-rank learned bigram bias, added in place to one row of draft
+// logits. bias[v] = sum_r(w1[prev_token][r] * w2[v][r]) -- w1 is a [verifier_vocab, rank]
+// embedding table (indexed by the token id immediately preceding the position being predicted),
+// w2 is a [draft_vocab, rank] projection back to vocab space. prev_token is read from DEVICE
+// memory (not passed by value) so a chain of calls on the same stream can each depend on the
+// previous call's own argmax result without a host round-trip in between -- required because the
+// bias for block position k conditions on position k's own token, which for k>0 is only known
+// once position k-1's (already Markov-corrected) argmax has been computed.
+void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,
+                            float* logits, int vocab, int rank, cudaStream_t stream);
+
 } // namespace dflash_kernels
 } // namespace sparkinfer

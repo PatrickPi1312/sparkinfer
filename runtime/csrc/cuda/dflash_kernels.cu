@@ -1537,6 +1537,25 @@ __global__ void k_broadcast_rows_i32(const int* __restrict__ src, int* __restric
     if (i >= n * rows) return;
     dst[i] = src[i % n];
 }
+
+// bias[v] = sum_r(w1[prev_token][r] * w2[v][r]), added in place to logits[v]. rank is small
+// (256 for the checkpoints this has been measured against) so the whole latent vector for this
+// call's prev_token fits comfortably in shared memory and is reused by every thread in the block.
+__global__ void k_markov_bias_add(const bf16* __restrict__ w1, const bf16* __restrict__ w2,
+                                  const int* __restrict__ prev_token, float* __restrict__ logits,
+                                  int vocab, int rank) {
+    extern __shared__ float latent[];
+    const int tok = *prev_token;
+    const bf16* w1_row = w1 + (size_t)tok * rank;
+    for (int r = threadIdx.x; r < rank; r += blockDim.x) latent[r] = b2f(w1_row[r]);
+    __syncthreads();
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= vocab) return;
+    const bf16* w2_row = w2 + (size_t)v * rank;
+    float acc = 0.f;
+    for (int r = 0; r < rank; r++) acc += latent[r] * b2f(w2_row[r]);
+    logits[v] += acc;
+}
 } // namespace
 
 void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int dst_row_stride,
@@ -1553,6 +1572,15 @@ void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaSt
     if (total <= 0) return;
     const int threads = 256;
     k_broadcast_rows_i32<<<(total + threads - 1) / threads, threads, 0, stream>>>(src, dst, n, rows);
+}
+
+void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,
+                            float* logits, int vocab, int rank, cudaStream_t stream) {
+    if (vocab <= 0 || rank <= 0) return;
+    const int threads = 256;
+    const int blocks = (vocab + threads - 1) / threads;
+    k_markov_bias_add<<<blocks, threads, rank * sizeof(float), stream>>>(
+        (const bf16*)w1, (const bf16*)w2, prev_token, logits, vocab, rank);
 }
 
 } // namespace dflash_kernels

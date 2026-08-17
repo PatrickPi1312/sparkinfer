@@ -317,6 +317,15 @@ struct DFlashDraftModel::Impl {
     unsigned char* lm_head_i4 = nullptr;
     float* lm_head_i4_scale = nullptr;
 
+    // DSpark's Markov head (optional -- absent for plain DFlash drafts, e.g. Qwen3.6-35B-A3B's).
+    // markov_w1 [vocab, markov_rank]: embedding table indexed by the previous token id.
+    // markov_w2 [vocab, markov_rank]: projection back to vocab space, added to the base logits.
+    // Shared vocab with the target (this draft has no embed_tokens of its own either), so no
+    // verifier/draft vocab remapping is needed.
+    bf16* markov_w1 = nullptr;
+    bf16* markov_w2 = nullptr;
+    int markov_rank = 0;
+
     // Scratch
     cudaStream_t stream{};
     bf16 *noise = nullptr;          // [B, H]
@@ -581,6 +590,10 @@ bool DFlashDraftModel::load(const std::string& dir) {
         }
         return &it->second;
     };
+    auto optional = [&](const std::string& name) -> TensorView* {
+        auto it = st.tensors.find(name);
+        return it == st.tensors.end() ? nullptr : &it->second;
+    };
 
     const int H = s.cfg.hidden;
     const int I = s.cfg.intermediate;
@@ -645,10 +658,28 @@ bool DFlashDraftModel::load(const std::string& dir) {
         }
     }
 
+    // DSpark's Markov head: trained weights sitting in the checkpoint but unused by plain DFlash
+    // drafting. Both tensors must be present and agree on rank, or the head is silently skipped
+    // (a malformed pair is worth surfacing, but a genuinely draft-without-Markov checkpoint --
+    // Qwen3.6-35B-A3B's, for one -- is the normal case and should load exactly as before).
+    auto* mw1 = optional("markov_head.markov_w1.weight");
+    auto* mw2 = optional("markov_head.markov_w2.weight");
+    if (mw1 && mw2 && mw1->shape.size() == 2 && mw2->shape.size() == 2 &&
+        mw1->shape[1] == mw2->shape[1] && mw1->shape[1] > 0) {
+        s.markov_w1 = s.upload(*mw1);
+        s.markov_w2 = s.upload(*mw2);
+        s.markov_rank = (int)mw1->shape[1];
+    } else if (mw1 || mw2) {
+        fprintf(stderr, "[dflash] markov_head tensors present but malformed "
+                        "(w1=%zux%zu w2=%zux%zu) -- skipping\n",
+                mw1 ? (size_t)mw1->shape[0] : 0, mw1 ? (size_t)mw1->shape[1] : 0,
+                mw2 ? (size_t)mw2->shape[0] : 0, mw2 ? (size_t)mw2->shape[1] : 0);
+    }
+
     // Scratch + KV cache (shared with load_gguf(), see Impl::alloc_scratch).
     s.alloc_scratch();
-    fprintf(stderr, "[dflash] loaded draft: layers=%d H=%d B=%d n_cap=%d mask=%d\n",
-            s.cfg.n_layers, H, B, n_cap, s.cfg.mask_token_id);
+    fprintf(stderr, "[dflash] loaded draft: layers=%d H=%d B=%d n_cap=%d mask=%d markov_rank=%d\n",
+            s.cfg.n_layers, H, B, n_cap, s.cfg.mask_token_id, s.markov_rank);
     return true;
 }
 
@@ -1141,9 +1172,29 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         }
     }
     }
-    kernels::launch_argmax(s.logits + (head_done ? V : 0),
-                           s.d_out + (head_done ? 1 : 0),
-                           head_done ? kProposalDepth : B, V, st);
+    // DSpark's Markov head: position r's logit bias conditions on the token AT position r itself
+    // (the anchor for r==0, its own -- just-chosen -- prediction for r>0), predicting position
+    // r+1. That token is only known once position r-1's own Markov-corrected argmax has run, so
+    // rows 1..kProposalDepth chain sequentially instead of the single batched argmax below --
+    // each launch reads its "previous token" from device memory (s.d_ids[0], the real anchor, for
+    // r==1; this same loop's own s.d_out[r-1] for r>1), so the chain needs no host round-trip
+    // until the final readback already below. Row 0 itself is never consumed by the caller (its
+    // prediction for position start+1 is redundant with the target's own verify-row-0 call, which
+    // is strictly more reliable than any draft guess), so it only needs a plain argmax in the
+    // !head_done path, where the batched LM-head GEMV computed it too and left it unscored.
+    if (s.markov_w1 && s.markov_w2) {
+        if (!head_done) kernels::launch_argmax(s.logits, s.d_out, 1, V, st);
+        for (int r = 1; r <= kProposalDepth; r++) {
+            const int* prev = (r == 1) ? s.d_ids : (s.d_out + (r - 1));
+            dflash_kernels::launch_markov_bias_add(s.markov_w1, s.markov_w2, prev,
+                                                   s.logits + (size_t)r * V, V, s.markov_rank, st);
+            kernels::launch_argmax(s.logits + (size_t)r * V, s.d_out + r, 1, V, st);
+        }
+    } else {
+        kernels::launch_argmax(s.logits + (head_done ? V : 0),
+                               s.d_out + (head_done ? 1 : 0),
+                               head_done ? kProposalDepth : B, V, st);
+    }
     cu(cudaMemcpyAsync(s.h_out, s.d_out,
                        (head_done ? kProposalDepth + 1 : B) * sizeof(int),
                        cudaMemcpyDeviceToHost, st), "argmax");
