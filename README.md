@@ -17,7 +17,7 @@ SparkInfer focuses on the models driving the future of AI — not thousands of l
 | Model | Role |
 |---|---|
 | [**Qwen3.6-35B-A3B**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | Primary SOTA — hybrid Gated-DeltaNet + full-attention MoE |
-| [**Qwen3.8-27B**](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090) | Dense hybrid Gated-DeltaNet — **our own NVFP4 Blackwell quantization**, current eval scope |
+| [**Qwen3.8-27B**](https://huggingface.co/Qwen/Qwen3.8-27B) | Dense hybrid Gated-DeltaNet · current eval scope — native NVFP4 from **[our RTX 5090 build](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)** or [unsloth](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4), both supported |
 | [**SparkDistill**](https://github.com/gittensor-model-hub/SparkDistill/) | Fable 5 / OpenAI 5.6-level CoT *(coming soon)* |
 | [**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) | Open MoE frontier *(next)* |
 
@@ -87,13 +87,15 @@ omitted: at ctx=128 there is not enough work to fill the GPU with one batched GE
 per-pass overhead sparkinfer pays to be fast at 4k/16k is not yet amortised. It is a live
 optimisation target, tracked by the same automated eval that gates every PR.
 
-### Native NVFP4 — [our own Blackwell checkpoint](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)
+### Native NVFP4 — two supported checkpoints
 
 The GGUF numbers above exist to make the engine comparison fair. They are **not** how sparkinfer
-runs this model. We quantize Qwen3.8-27B ourselves —
-[**gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090**](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090),
-uniform NVFP4 on every `Linear`, built with NVIDIA ModelOpt and tuned for the RTX 5090's FP4 tensor
-cores — and that is the checkpoint the automated eval scores every PR against:
+runs this model: it reads Qwen3.8-27B's NVFP4 weights directly, from **either** of two supported
+checkpoints.
+
+**[gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)**
+— ours: uniform NVFP4 on every `Linear`, quantized in house with NVIDIA ModelOpt for the RTX 5090's
+FP4 tensor cores, and the checkpoint the automated eval scores every PR against:
 
 | context | decode | prefill | vs same-GGUF sparkinfer | vs llama.cpp |
 |---:|---:|---:|---:|---:|
@@ -105,13 +107,21 @@ Same weights the model was released with, re-quantized for the hardware it runs 
 and +28–222% prefill over the same engine reading a Q4_K_M GGUF**, and it erases the one dimension
 llama.cpp wins above — 6,546 pp at ctx=128 against 2,782.
 
-**Both NVFP4 builds are supported targets.** The upstream
-[unsloth NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) checkpoint (NVFP4 FFN + FP8
-attention) measures 84.9 / 83.2 / 80.6 tok/s decode and 5,031 / 9,548 / 8,727 pp prefill at the
-same contexts. The eval *scores* PRs on our checkpoint and runs a separate *no-regression guard*
-on that one — they share the loader, the batched prefill and every decode kernel, so scoring one
-while guarding the other is what stops an optimisation from winning on the scored build by
-pessimising the supported one.
+**[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)** — upstream: NVFP4
+FFN + FP8 attention/GDN projections, equally supported, and measured on the same box at the same
+commit:
+
+| context | decode | prefill |
+|---:|---:|---:|
+| 128 | 84.9 tok/s | 5,031 tok/s |
+| 4k | 83.2 tok/s | 9,548 tok/s |
+| 16k | 80.6 tok/s | 8,727 tok/s |
+
+Both load through the same `load_compressed_tensors` path and share the batched prefill and every
+decode kernel — the mixed-precision build is simply a different quantization of the same weights,
+so it lands a little slower on this hardware. The eval *scores* PRs on our build and runs a
+separate *no-regression guard* on the upstream one, which is what stops an optimisation from
+winning on the scored checkpoint by pessimising the other.
 
 Read that last column for what it is. llama.cpp cannot load NVFP4 compressed-tensors at all, so
 `vs llama.cpp` there is **each engine on the format it actually runs** — our NVFP4 against
