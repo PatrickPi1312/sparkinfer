@@ -17,6 +17,7 @@ SparkInfer focuses on the models driving the future of AI — not thousands of l
 | Model | Role |
 |---|---|
 | [**Qwen3.6-35B-A3B**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | Primary SOTA — hybrid Gated-DeltaNet + full-attention MoE |
+| [**Qwen3.8-27B**](https://huggingface.co/Qwen/Qwen3.8-27B) | Dense hybrid Gated-DeltaNet — native NVFP4/FP8, current eval scope |
 | [**Qwythos 9B**](https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF) | Mythos-level reasoning · long-context guard |
 | [**SparkDistill**](https://github.com/gittensor-model-hub/SparkDistill/) | Fable 5 / OpenAI 5.6-level CoT *(coming soon)* |
 | [**MiniMax M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) | Open MoE frontier *(next)* |
@@ -59,6 +60,51 @@ Quality parity vs llama.cpp: top-1 **0.953** · KL **0.031** · IFEval **83%** �
 Full competitor matrix (vLLM, SGLang, TensorRT-LLM) and quality tables:
 [`bench/competitors/latest-results.md`](bench/competitors/latest-results.md) ·
 [`bench/quality/README.md`](bench/quality/README.md).
+
+## Benchmark · Qwen3.8-27B
+
+RTX 5090 · **same `Q4_K_M` GGUF** ([unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)) · greedy bs=1 · 5 reps ·
+sparkinfer `d8e1c74` vs `llama.cpp d8df12e` (`-ngl 99`; `-fa 1` was measured too and came out
+marginally slower on this model, so llama.cpp's better configuration is the one reported).
+
+### Decode
+
+| context | SparkInfer | llama.cpp | Δ |
+|---:|---:|---:|---:|
+| 128 | **86.9** tok/s | 80.2 tok/s | **+8.4%** |
+| 4k | **85.2** tok/s | 77.0 tok/s | **+10.6%** |
+| 16k | **82.3** tok/s | 73.9 tok/s | **+11.5%** |
+
+### Prefill
+
+| context | SparkInfer | llama.cpp | Δ |
+|---:|---:|---:|---:|
+| 128 | 2,033 tok/s | **2,782** tok/s | **−26.9%** |
+| 4k | **7,548** tok/s | 3,670 tok/s | **+105.7%** |
+| 16k | **7,596** tok/s | 3,496 tok/s | **+117.2%** |
+
+Short-context prefill is the one dimension llama.cpp still wins, and it is listed here rather than
+omitted: at ctx=128 there is not enough work to fill the GPU with one batched GEMM pass, so the
+per-pass overhead sparkinfer pays to be fast at 4k/16k is not yet amortised. It is a live
+optimisation target, tracked by the same automated eval that gates every PR.
+
+**What actually ships is faster than either column above.** sparkinfer serves Qwen3.8-27B from a
+native [NVFP4 checkpoint](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090)
+(uniform NVFP4 on every `Linear`), not from a GGUF — same box, same commit:
+
+| context | decode | vs GGUF path | prefill | vs GGUF path |
+|---:|---:|---:|---:|---:|
+| 128 | **95.8** tok/s | +10.2% | **6,546** tok/s | +222.0% |
+| 4k | **93.7** tok/s | +10.0% | **10,021** tok/s | +32.8% |
+| 16k | **90.1** tok/s | +9.4% | **9,749** tok/s | +28.4% |
+
+This is the path the automated eval scores every PR against, and it wins on *both* axes — including
+the short-context prefill the GGUF path loses: 6,546 pp at ctx=128 against llama.cpp's 2,782.
+
+That table carries **no llama.cpp column on purpose**: llama.cpp cannot read NVFP4
+compressed-tensors, so putting it beside a Q4_K_M GGUF would be a quantization comparison wearing
+an engine comparison's clothes. The head-to-head above deliberately runs sparkinfer on the *same
+file* as llama.cpp so the only variable is the runtime.
 
 Runtime footprint (excluding model weights):
 
