@@ -92,9 +92,19 @@ if(BUILD_EXAMPLES)
     target_include_directories(qwen3_gguf_score PRIVATE include)
     target_link_libraries(qwen3_gguf_score PRIVATE sparkinfer_runtime CUDA::cudart
                           nlohmann_json::nlohmann_json)   # same reason as qwen3_gguf_bench above
+    # Model-free NVFP4 GEMM correctness check: isolates the kernel from the loader, the KV cache
+    # and 64 layers of accumulation, so a shape-dependent defect shows up on its own.
+    add_executable(nvfp4_gemm_check examples/nvfp4_gemm_check.cpp)
+    target_include_directories(nvfp4_gemm_check PRIVATE include)
+    target_link_libraries(nvfp4_gemm_check PRIVATE sparkinfer_runtime CUDA::cudart)
+
     add_executable(qwen3_gguf_prefill_check examples/qwen3_gguf_prefill_check.cpp)
     target_include_directories(qwen3_gguf_prefill_check PRIVATE include)
-    target_link_libraries(qwen3_gguf_prefill_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    # nlohmann_json: same reason as qwen3_gguf_bench above -- this tool now routes through
+    # qwen_checkpoint.h so it can A/B batched prefill on a compressed-tensors checkpoint, which is
+    # the only place the FP4 FFN prefill arm is reachable.
+    target_link_libraries(qwen3_gguf_prefill_check PRIVATE sparkinfer_runtime CUDA::cudart
+                          nlohmann_json::nlohmann_json)
     add_executable(qwen3_gguf_dflash_check examples/qwen3_gguf_dflash_check.cpp)
     target_include_directories(qwen3_gguf_dflash_check PRIVATE include)
     target_link_libraries(qwen3_gguf_dflash_check PRIVATE sparkinfer_runtime CUDA::cudart)

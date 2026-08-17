@@ -28,4 +28,26 @@ void launch_ct_dequant_nvfp4(const void* packed_u8, const void* group_scale_ue4m
                              float global_scale, void* out_bf16, int rows, int cols,
                              cudaStream_t stream = nullptr);
 
+// Same dequant, but the global scale is read from device memory. For callers holding an
+// SI_QTYPE_NVFP4 payload (whose 256 B header stores the scale on the device) inside batched
+// prefill: fetching it host-side would need a D2H copy, which under the CUDA graph capture that
+// prefill runs in is illegal, not merely slow.
+void launch_ct_dequant_nvfp4_dev(const void* packed_u8, const void* group_scale_ue4m3,
+                                 const float* global_scale_dev, void* out_bf16, int rows, int cols,
+                                 cudaStream_t stream = nullptr);
+
+// Fused NVFP4 -> per-row int8 (q[rows,cols] + scale[rows]) for the int8 projection path, which
+// otherwise dequantizes to a bf16 scratch and row-quantizes out of it -- a full bf16 write and
+// re-read of the weight that nothing else ever looks at.
+//
+// Bit-identical to launch_ct_dequant_nvfp4_dev followed by launch_prefill_quantize_rows_i8: the
+// same eight columns per thread, the same bf16 rounding, the same amax over that value set (a max,
+// so associative and exact), the same d = amax/127.0f and roundf, the same amax==0 -> 0 rule.
+//
+// Returns false for shapes it does not handle (cols % 16, or a K needing more than four register
+// slots) so the caller keeps the two-kernel path. SPARKINFER_CT_NVFP4_ROWS_I8=0 disables.
+bool launch_ct_dequant_nvfp4_rows_i8(const void* packed_u8, const void* group_scale_ue4m3,
+                                     const float* global_scale_dev, signed char* q, float* scale,
+                                     int rows, int cols, cudaStream_t stream = nullptr);
+
 }} // namespace sparkinfer::kernels

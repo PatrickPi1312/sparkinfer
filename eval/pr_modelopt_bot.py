@@ -98,10 +98,17 @@ SIG = 0.02
 REGRESS_TOL = 0.98
 BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 
-# The ONE dimension that can earn a tier. decode@128 and prefill@128 are still measured and still
-# act as no-regression floors (see evaluate_pr), but a PR that only improves them now scores
-# "none": long-context prefill is the sole optimisation target for this model.
-SCORING_DIM = "prefill@16k"
+# The dimensions that can earn a tier. Both 128-context optimisations count for the ModelOpt
+# checkpoint (decision 2026-08-16, prefill@128 added alongside decode@128); prefill@16k is still
+# measured and still acts as a no-regression floor, but a PR that only improves it scores "none".
+#
+# A PR is tiered on its BEST scoring dimension, not on a sum or an average: the two are largely
+# independent optimisations (decode is weight-bandwidth bound at m=1, prefill@128 is a
+# tensor-core GEMM at m=128), so a real win in one is a real win, and averaging would let a
+# strong result be diluted by an untouched dimension. SCORING_DIM stays defined as the primary
+# for the places that report a single name.
+SCORING_DIMS = ["decode@128", "prefill@128"]
+SCORING_DIM = SCORING_DIMS[0]
 
 # Accuracy gate bars. This gate is DIFFERENTIAL (PR vs origin/main on the same token stream, see
 # the module docstring pt. 2), not absolute-vs-llama.cpp, so the bars are much tighter than the
@@ -109,47 +116,58 @@ SCORING_DIM = "prefill@16k"
 # should agree essentially exactly. Anything less means the PR changed the model's numerics.
 # Not 1.0/0.0 — a PR may legitimately reassociate float ops (fusing a kernel, changing a
 # reduction order), which perturbs the last bits without being a correctness bug.
-ACC_TOP1_BAR = float(os.environ.get("QWEN38_ACC_TOP1_BAR", "0.99"))
-ACC_KL_BAR = float(os.environ.get("QWEN38_ACC_KL_BAR", "0.01"))
+# top1 0.90 and KL 0.1, both loosened by explicit decision 2026-08-16 from the Qwen3.8 bot's
+# 0.99 / 0.01. The gate stays differential (PR vs main on the same token stream), so it still
+# catches a PR that CHANGES this model's output distribution -- it now tolerates ten times the KL
+# drift and lets one token in ten flip its argmax before calling that a failure.
+#
+# Worth knowing what that admits, since these are the numbers this codebase measured by hand
+# during Qwen3.8 bring-up: a second quantization of the GDN projections scored top1 0.96 / KL
+# 0.035 and was rejected as too lossy to ship; a Q8_0 fit scored 1.00 / 0.015. Both pass here.
+# So this bar no longer distinguishes "same model, faster" from "slightly different, faster" --
+# it is a guard against gross corruption, not against quality drift. The batched-prefill parity
+# gate and the Qwen3.8 no-regression guard are what carry correctness now.
+ACC_TOP1_BAR = float(os.environ.get("MODELOPT_ACC_TOP1_BAR", "0.9"))
+ACC_KL_BAR = float(os.environ.get("MODELOPT_ACC_KL_BAR", "0.1"))
 
-EVAL_PREFIX = "eval-qwen38:"
-QWEN38_MERGE_FIRST = "qwen38-merge-first"
-QWEN38_NEEDS_REBASE = "qwen38-needs-rebase"
+EVAL_PREFIX = "eval-modelopt:"
+MODELOPT_MERGE_FIRST = "modelopt-merge-first"
+MODELOPT_NEEDS_REBASE = "modelopt-needs-rebase"
 # First schema for this bot. Same reasoning as the sibling bots' own bumps: a PR evaluated before
 # a scoring change existed must not keep a stale-scored label/score forever.
-EVAL_SCHEMA_VERSION = "v1-nvfp4-decode128"
+EVAL_SCHEMA_VERSION = "v1-modelopt-decode128"
 MARKER_RE = re.compile(
-    r"<!-- sparkinfer-qwen38-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
+    r"<!-- sparkinfer-modelopt-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
 )
 
-# --- box paths (see .env.eval's QWEN38_* block) ---
+# --- box paths (see .env.eval's MODELOPT_* block) ---
 # Separate clone from pr_eval_bot's /root/sparkinfer, which carries unrelated uncommitted work.
-REMOTE_REPO = os.environ.get("QWEN38_REMOTE_REPO", "/root/sparkinfer_qwen38")
+REMOTE_REPO = os.environ.get("MODELOPT_REMOTE_REPO", "/root/sparkinfer_modelopt")
 # The scored checkpoint is a HuggingFace compressed-tensors DIRECTORY (mixed NVFP4 FFN + FP8
 # attention/GDN projections, unsloth/Qwen3.8-27B-NVFP4) -- NOT a GGUF. That is what the server
 # actually serves, so it is what gets benchmarked; qwen3_gguf_bench/qwen3_gguf_score grew
 # directory support for exactly this (runtime/examples/qwen_checkpoint.h).
-MODEL_DIR = os.environ.get("QWEN38_MODEL_DIR", "/root/workspace/models_qwen38")
+MODEL_DIR = os.environ.get("MODELOPT_MODEL_DIR", "/root/workspace/models_q38_modelopt")
 # The single weight blob inside MODEL_DIR, for the Polaris attestation ONLY. The sibling bots pass
 # their .gguf here; the analogue for a compressed-tensors checkout is the safetensors file, not the
 # directory -- receipt.model_sha256() returns "" for anything that is not a regular file, so
 # passing MODEL_DIR would mint a receipt whose model_sha256 pins nothing while still looking valid.
 # If a future checkpoint is sharded (model-00001-of-0000N.safetensors) this path stops existing and
-# the sha degrades to "" rather than crashing; override QWEN38_MODEL_WEIGHT_FILE if that happens.
-MODEL_WEIGHT_FILE = os.environ.get("QWEN38_MODEL_WEIGHT_FILE",
-                                   os.path.join(MODEL_DIR, "model.safetensors"))
-BENCH_TOKENS = int(os.environ.get("QWEN38_BENCH_TOKENS", "128"))
-ACC_TOPK = int(os.environ.get("QWEN38_ACC_TOPK", "128"))
+# the sha degrades to "" rather than crashing; override MODELOPT_MODEL_WEIGHT_FILE if that happens.
+MODEL_WEIGHT_FILE = os.environ.get("MODELOPT_MODEL_WEIGHT_FILE",
+                                   os.path.join(MODEL_DIR, "model-00001-of-00003.safetensors"))
+BENCH_TOKENS = int(os.environ.get("MODELOPT_BENCH_TOKENS", "128"))
+ACC_TOPK = int(os.environ.get("MODELOPT_ACC_TOPK", "128"))
 # Batched-prefill parity floor: the fraction of the continuation that batched prefill must still
 # generate identically to the token loop. Absolute, not PR-vs-main -- see the PREFILL_PARITY block
 # in the remote script for why a differential gate cannot catch this class of bug.
-PARITY_BAR = float(os.environ.get("QWEN38_PARITY_BAR", "0.75"))
+PARITY_BAR = float(os.environ.get("MODELOPT_PARITY_BAR", "0.75"))
 # Score dumps for the differential accuracy gate. main's is written once per round by
 # measure_main_baseline(); each PR compares its own dump against it. Kept on the box (not shipped
 # back over ssh) because a 128-deep top-k dump over the whole corpus is megabytes.
-SCORE_DUMP_MAIN = "/tmp/q38_score_main.txt"
-SCORE_DUMP_PR = "/tmp/q38_score_pr.txt"
+SCORE_DUMP_MAIN = "/tmp/mopt_score_main.txt"
+SCORE_DUMP_PR = "/tmp/mopt_score_pr.txt"
 EVAL_TEXT = "bench/scripts/eval_text.txt"  # same corpus the sibling bots score
 
 # Qwen3.6 no-regression guard (module docstring, pt. 3) — same env var names as pr_dflash_bot.py's
@@ -162,17 +180,28 @@ Q36_GUARD_MODEL_REPO = os.environ.get("PRIMARY36_MODEL_REPO", "unsloth/Qwen3.6-3
 Q36_GUARD_TOK_REPO = os.environ.get("PRIMARY36_TOK_REPO", "Qwen/Qwen3.6-35B-A3B")
 GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
 
+# Qwen3.8 no-regression guard. The ModelOpt checkpoint and the shipping unsloth Qwen3.8 checkpoint
+# share load_compressed_tensors, the batched prefill and every decode kernel, so a ModelOpt
+# optimisation that speeds up its own checkpoint by pessimising the shared path is a regression --
+# and this bot's own numbers cannot see it, because it only ever benches models_q38_modelopt.
+# Same shape as the inherited Qwen3.6 guard below, except the subject is a compressed-tensors
+# DIRECTORY rather than a GGUF, so there is no ensure_model/ensure_tokenizer download step.
+Q38_GUARD_MODEL_DIR = os.environ.get("Q38_GUARD_MODEL_DIR", "/root/workspace/models_qwen38")
+# decode@128 is this bot's scoring dimension, so ctx 0 carries the most weight; 4k/16k are included
+# because that is where the shared prefill and KV paths cost the most.
+Q38_GUARD_CTXS = [0, 4096, 16384]
+
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
 # shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
 # inert until a human deliberately flips it on. Single-line change to enable later.
 AUTO_MERGE = os.environ.get("SPARKINFER_QWEN38_AUTOMERGE") == "1"
 AUTOMERGE_BLOCK = {
     "copycat", "copycat-warn", "flagged:gaming", "penalty", "needs-benchmark",
-    QWEN38_NEEDS_REBASE, arb.REEVALUATE_LABEL, arb.HOLD_LABEL, *arb.REGRESSION_LABELS,
+    MODELOPT_NEEDS_REBASE, arb.REEVALUATE_LABEL, arb.HOLD_LABEL, *arb.REGRESSION_LABELS,
 }
 
 SCORES_FILE = os.path.expanduser(
-    os.environ.get("QWEN38_SCORES_FILE", "~/.sparkinfer_qwen38_scores.json")
+    os.environ.get("MODELOPT_SCORES_FILE", "~/.sparkinfer_modelopt_scores.json")
 )
 
 # Polaris verifiable-compute receipts — same policy/keys as the AR and DFlash bots (on by
@@ -210,7 +239,7 @@ def _save_scores(data):
         with open(SCORES_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        print(f">> qwen38 scores save skipped: {e}")
+        print(f">> modelopt scores save skipped: {e}")
 
 
 def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
@@ -237,6 +266,49 @@ def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
 
 
 _TIER_RANK = {"REJECT": -1, "none": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "XL": 5}
+
+
+def check_q38_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Did this ModelOpt PR regress the SHIPPING Qwen3.8 checkpoint?
+
+    Differential, PR vs freshly-measured main on the same box and contexts -- the same discipline
+    and the same comparison convention as check_q36_guard below (tol is a RATIO FLOOR: cur must
+    stay >= main * 0.98, it is NOT a fractional delta).
+
+    It exists because this bot's scoring numbers come only from models_q38_modelopt, so a change
+    that wins on the ModelOpt checkpoint by pessimising the shared compressed-tensors path
+    (load_compressed_tensors, prefill_batched_run, the decode GEMVs) would score as an improvement
+    while making the model actually in production slower.
+
+    Iterates MAIN's contexts as the reference set and fails closed on a missing/zero PR
+    measurement, for the same reason check_q36_guard does: a PR build that crashes partway through
+    its own sweep must not make that context silently uncheckable."""
+    problems = []
+    if (pr.get("guard38_failed") or main.get("guard38_failed")
+            or not pr.get("guard38") or not main.get("guard38")):
+        problems.append("qwen3.8 guard measurement unavailable")
+    pr_ctxs, main_ctxs = pr.get("guard38") or {}, main.get("guard38") or {}
+    for ctx, main_vals in main_ctxs.items():
+        label = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        pr_vals = pr_ctxs.get(ctx) or {}
+        for metric in ("decode", "prefill"):
+            base = main_vals.get(metric, 0)
+            if base <= 0:
+                continue
+            cur = pr_vals.get(metric, 0)
+            if cur <= 0:
+                problems.append(
+                    f"qwen3.8 {metric}@{label}: PR measurement missing/zero "
+                    f"(main {base:.1f}) — treated as regression"
+                )
+                continue
+            if cur < base * tol:
+                pct = 100.0 * (cur - base) / base
+                problems.append(
+                    f"qwen3.8 {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
+                    f"{base:.1f} ({pct:+.1f}%)"
+                )
+    return (len(problems) == 0, problems)
 
 
 def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
@@ -282,7 +354,7 @@ def qwen38_evaluated_commits(repo, num):
     for c in json.loads(r.stdout or "{}").get("comments", []):
         body = c.get("body") or ""
         m = MARKER_RE.search(body)
-        if not m or "sparkinfer qwen38 auto-eval" not in body:
+        if not m or "sparkinfer modelopt auto-eval" not in body:
             continue
         meta_raw = m.group(2)
         try:
@@ -301,7 +373,7 @@ def strip_qwen38_eval_labels(repo, num):
             arb.remove_label(repo, num, lab)
 
 
-STALE_DAYS = float(os.environ.get("QWEN38_STALE_DAYS", "1"))
+STALE_DAYS = float(os.environ.get("MODELOPT_STALE_DAYS", "1"))
 
 
 def _pr_last_activity_ts(repo, num):
@@ -332,7 +404,7 @@ def close_stale_qwen38_prs(repo, prs, dry_run=False):
         if pr.get("isDraft"):
             continue
         labs = {l["name"] for l in pr.get("labels", [])}
-        if arb.HOLD_LABEL in labs or QWEN38_MERGE_FIRST in labs:
+        if arb.HOLD_LABEL in labs or MODELOPT_MERGE_FIRST in labs:
             continue
         ts = _pr_last_activity_ts(repo, num)
         if ts is None:
@@ -485,6 +557,7 @@ def _remote_script(ref: str, role: str = "pr") -> str:
     dump_self = shlex.quote(SCORE_DUMP_MAIN if role == "main" else SCORE_DUMP_PR)
     dump_main = shlex.quote(SCORE_DUMP_MAIN)
     is_pr = "1" if role == "pr" else "0"
+    q38_guard_dir = shlex.quote(Q38_GUARD_MODEL_DIR)
     q36_dir = shlex.quote(Q36_GUARD_MODELS_DIR)
     q36_file = shlex.quote(Q36_GUARD_MODEL_FILE)
     q36_repo = shlex.quote(Q36_GUARD_MODEL_REPO)
@@ -530,6 +603,7 @@ EVAL_TEXT={eval_text}
 DUMP_SELF={dump_self}
 DUMP_MAIN={dump_main}
 IS_PR={is_pr}
+Q38_GUARD_MODEL_DIR={q38_guard_dir}
 Q36_GUARD_MODELS_DIR={q36_dir}
 Q36_GUARD_MODEL_FILE={q36_file}
 Q36_GUARD_MODEL_REPO={q36_repo}
@@ -551,10 +625,10 @@ test -f "$MODEL_DIR/config.json" || {{ echo "FAIL $MODEL_DIR has no config.json"
 # generated Makefiles pointing at a DIFFERENT PR branch's files once the checkout switched
 # underneath it (the sibling bots hit exactly this, #693/#694).
 mkdir -p build
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/q38_cmake.log 2>&1
-cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_generate -j"$(nproc)" >/tmp/q38_build.log 2>&1 || {{
-  echo "BUILD_FAILED -- tail of /tmp/q38_build.log:" >&2
-  tail -80 /tmp/q38_build.log >&2
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/mopt_cmake.log 2>&1
+cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_generate -j"$(nproc)" >/tmp/mopt_build.log 2>&1 || {{
+  echo "BUILD_FAILED -- tail of /tmp/mopt_build.log:" >&2
+  tail -80 /tmp/mopt_build.log >&2
   exit 1
 }}
 test -x build/runtime/qwen3_gguf_bench
@@ -584,7 +658,7 @@ SI_BIN="$PWD/build/runtime"; SI_LD=""
 # PR-vs-main comparison stays apples-to-apples either way.
 # If the file is missing or too short, bench_decode logs and falls back to the ramp rather than
 # padding -- a partly-synthetic prompt would be worse than an honestly synthetic one.
-BENCH_PROMPT_IDS=/tmp/q38_bench_prompt_ids.txt
+BENCH_PROMPT_IDS=/tmp/mopt_bench_prompt_ids.txt
 if python3 - "$MODEL_DIR/tokenizer.json" bench/scripts/bench_prompt.txt > "$BENCH_PROMPT_IDS" 2>/dev/null <<'PYBP'
 import sys
 from tokenizers import Tokenizer
@@ -637,9 +711,9 @@ TOKEN_COUNT=$(printf '%s' "$IDS" | wc -w)
 echo "RESULT_TOKEN_COUNT $TOKEN_COUNT"
 
 wait_gpu_clear
-build/runtime/qwen3_gguf_score "$MODEL_DIR" "$TOPK" $IDS > "$DUMP_SELF" 2>/tmp/q38_score.err || {{
-  echo "SCORE_FAILED -- tail of /tmp/q38_score.err:" >&2
-  tail -40 /tmp/q38_score.err >&2
+build/runtime/qwen3_gguf_score "$MODEL_DIR" "$TOPK" $IDS > "$DUMP_SELF" 2>/tmp/mopt_score.err || {{
+  echo "SCORE_FAILED -- tail of /tmp/mopt_score.err:" >&2
+  tail -40 /tmp/mopt_score.err >&2
   exit 1
 }}
 echo "ACCURACY_STAGE_DONE"
@@ -657,12 +731,12 @@ echo "ACCURACY_STAGE_DONE"
 # newly introduced divergence. A run where main is equally broken must still fail.
 wait_gpu_clear
 if PARITY_BAR="$PARITY_BAR" python3 bench/scripts/prefill_parity_check.py \
-     "$MODEL_DIR" "$MODEL_DIR/tokenizer.json" 32,128 > /tmp/q38_parity.txt 2>&1; then
+     "$MODEL_DIR" "$MODEL_DIR/tokenizer.json" 32,128 > /tmp/mopt_parity.txt 2>&1; then
   echo "PREFILL_PARITY_OK"
 else
   echo "PREFILL_PARITY_FAILED" >&2
 fi
-grep -E "^PARITY|^n=" /tmp/q38_parity.txt || tail -20 /tmp/q38_parity.txt
+grep -E "^PARITY|^n=" /tmp/mopt_parity.txt || tail -20 /tmp/mopt_parity.txt
 
 if [ "$IS_PR" = "1" ]; then
   if [ -s "$DUMP_MAIN" ]; then
@@ -684,6 +758,24 @@ fi
 # anyway. Unset so the guard is unambiguously synthetic on both refs -- which is all it needs,
 # since it is a PR-vs-main comparison, not an absolute number.
 unset SPARKINFER_BENCH_PROMPT_FILE
+
+# --- Qwen3.8 no-regression guard (shared compressed-tensors loader / prefill / decode) ---
+echo "GUARD38_START"
+wait_gpu_clear
+if [ -d "$Q38_GUARD_MODEL_DIR" ] && [ -f "$Q38_GUARD_MODEL_DIR/config.json" ]; then
+  if bench_sweep_run "$Q38_GUARD_MODEL_DIR" 128 0 5 4096 5 16384 5; then
+    for ctx in 0 4096 16384; do
+      echo "GUARD38 $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+    done
+  else
+    echo "GUARD38_FAILED"
+  fi
+else
+  echo "GUARD38_FAILED"
+  echo "WARN: qwen3.8 guard checkpoint missing at $Q38_GUARD_MODEL_DIR" >&2
+fi
+echo "GUARD38_END"
+
 export MODELS_DIR="$Q36_GUARD_MODELS_DIR" MODEL_REPO="$Q36_GUARD_MODEL_REPO" \\
        MODEL_FILE="$Q36_GUARD_MODEL_FILE" TOK_REPO="$Q36_GUARD_TOK_REPO"
 export MODEL_SHA256="${{QWEN36_MODEL_SHA256:-}}"
@@ -711,6 +803,7 @@ def _parse_remote(stdout: str) -> dict:
     fewer place for the two to disagree about what was measured."""
     out = {}
     guard36 = {}
+    guard38 = {}
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
@@ -753,6 +846,16 @@ def _parse_remote(stdout: str) -> dict:
                         out[k] = float(v)
                     except ValueError:
                         pass
+        elif line.startswith("GUARD38 "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guard38[int(parts[1])] = {"decode": float(parts[2]),
+                                              "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.startswith("GUARD38_FAILED"):
+            out["guard38_failed"] = True
         elif line.startswith("GUARD36 "):
             parts = line.split()
             if len(parts) >= 4:
@@ -763,6 +866,7 @@ def _parse_remote(stdout: str) -> dict:
         elif line.strip() == "GUARD36_FAILED":
             out["guard36_failed"] = True
     out["guard36"] = guard36
+    out["guard38"] = guard38
     return out
 
 
@@ -991,10 +1095,10 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
     by_dim = {s["dim"]: s for s in scored}
 
-    # ANY dimension regressing is still a hard REJECT. decode@128 and prefill@128 are NOT scoring
-    # dimensions any more -- they cannot earn a tier -- but they remain no-regression FLOORS,
-    # because without them a PR could trade decode throughput away to buy long-context prefill and
-    # still auto-merge at XL. They cost nothing to keep: all three come from the one sweep.
+    # ANY dimension regressing is still a hard REJECT. prefill@16k is NOT a scoring dimension --
+    # it cannot earn a tier -- but it remains a no-regression FLOOR, because without it a PR could
+    # trade long-context prefill away to buy 128-context throughput and still auto-merge at XL.
+    # It costs nothing to keep: all three come from the one sweep.
     regressed = [s for s in scored if s["label"] == "REJECT"]
     if regressed:
         worst = min(regressed, key=lambda s: s["delta"])
@@ -1004,7 +1108,11 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     else:
         # The tier comes from prefill@16k ALONE. A decode-only or prefill@128-only improvement now
         # scores "none" by design -- long-context prefill is the only optimisation target.
-        best = by_dim[SCORING_DIM]
+        # Best of the scoring dimensions, by measured delta. max() over deltas rather than over
+        # tier letters: two dimensions can share a bucket while one is clearly the larger win, and
+        # the delta is what the tier was derived from anyway.
+        best = max((by_dim[d] for d in SCORING_DIMS if d in by_dim),
+                   key=lambda s: s["delta"], default=by_dim[SCORING_DIM])
         label, delta_pct, passed, speed_reason = best["label"], best["delta"], best["passed"], best["reason"]
     decode_label,  decode_delta_pct  = by_dim["decode@128"]["label"],  by_dim["decode@128"]["delta"]
     prefill_label, prefill_delta_pct = by_dim["prefill@128"]["label"], by_dim["prefill@128"]["delta"]
@@ -1049,6 +1157,16 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         label = "REJECT"
         passed = False
 
+    q38_ok, q38_problems = check_q38_guard(pr, main)
+    if not q38_ok:
+        # Same hard-REJECT discipline as the Qwen3.6 guard below: a ModelOpt PR that wins on its
+        # own checkpoint while regressing the shipping Qwen3.8 one via shared code is unmergeable
+        # regardless of its own score.
+        q38_reason = "qwen3.8 no-regression guard failed: " + "; ".join(q38_problems[:6])
+        reason = f"{q38_reason} | {reason}"
+        label = "REJECT"
+        passed = False
+
     q36_ok, q36_problems = check_q36_guard(pr, main)
     if not q36_ok:
         # Same hard-REJECT discipline as the accuracy gate: a Qwen3.8-27B PR that silently
@@ -1088,6 +1206,8 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "token_count": pr.get("token_count"),
         "accuracy_ok": accuracy_ok,
         "q36_guard_ok": q36_ok,
+        "q38_guard_ok": q38_ok,
+        "parity_ok": parity_ok is True,
         "q36_guard_problems": q36_problems,
         "q36_guard": pr.get("guard36"),
         "q36_guard_main": main.get("guard36"),
@@ -1129,12 +1249,12 @@ def format_comment(commit: str, res: dict) -> str:
         "q36_guard_ok": res.get("q36_guard_ok"),
     }
     marker = (
-        f"<!-- sparkinfer-qwen38-eval:{EVAL_SCHEMA_VERSION}:{commit} "
+        f"<!-- sparkinfer-modelopt-eval:{EVAL_SCHEMA_VERSION}:{commit} "
         f"{json.dumps(meta, separators=(',', ':'))} -->"
     )
     if not res.get("ok"):
         return (
-            f"{marker}\n## sparkinfer qwen38 auto-eval — error\n\n"
+            f"{marker}\n## sparkinfer modelopt auto-eval — error\n\n"
             f"**reason:** `{res.get('reason')}`\n\n"
             f"<details><summary>log tail</summary>\n\n```\n{(res.get('log') or '')[:1800]}\n```\n</details>\n"
         )
@@ -1166,10 +1286,10 @@ def format_comment(commit: str, res: dict) -> str:
     else:
         polaris_row = ""
     return (
-        f"{marker}\n## sparkinfer qwen38 auto-eval — `eval-qwen38:{lab}`\n\n"
+        f"{marker}\n## sparkinfer modelopt auto-eval — `eval-modelopt:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
-        f"| **label** | `eval-qwen38:{lab}` |\n"
-        f"| scored at | prefill@16k (the only scoring dimension); decode@128 + prefill@128 are no-regression floors |\n"
+        f"| **label** | `eval-modelopt:{lab}` |\n"
+        f"| scored at | decode@128 + prefill@128 (best of the two earns the tier); prefill@16k is a no-regression floor |\n"
         f"| tier came from | `{res.get('scored_dimension', '?')}` |\n"
         f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
         f"| main decode tok/s | {res['main_decode_tps']:.2f} |\n"
@@ -1214,7 +1334,7 @@ def auto_merge_ok_qwen38(repo, num):
     tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
     if not (tiers & SPEEDUP_LABELS):
         return False, "no verified eval-qwen38:speedup label"
-    if QWEN38_MERGE_FIRST not in labs:
+    if MODELOPT_MERGE_FIRST not in labs:
         return False, "not qwen38-merge-first"
     blocked = labs & AUTOMERGE_BLOCK
     if blocked:
@@ -1266,16 +1386,16 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
     open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
 
     merged = json.loads(arb.gh([
-        "pr", "list", "-R", repo, "--state", "merged", "--label", QWEN38_MERGE_FIRST,
+        "pr", "list", "-R", repo, "--state", "merged", "--label", MODELOPT_MERGE_FIRST,
         "--json", "number", "--limit", "10",
     ]).stdout or "[]")
     for m in merged:
         if not dry_run:
-            arb.remove_label(repo, m["number"], QWEN38_MERGE_FIRST)
+            arb.remove_label(repo, m["number"], MODELOPT_MERGE_FIRST)
 
     scored = []
     for num, labs in open_labels.items():
-        if QWEN38_NEEDS_REBASE in labs:
+        if MODELOPT_NEEDS_REBASE in labs:
             continue
         tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
         tier = next((t for t in tiers if t in SPEEDUP_LABELS), None)
@@ -1296,11 +1416,11 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
     print(f">> qwen38 round: merge-first #{winner}; rebase {[n for n,_,_ in scored[1:]] or 'none'}")
     if dry_run:
         return
-    arb.add_label(repo, winner, QWEN38_MERGE_FIRST)
-    arb.remove_label(repo, winner, QWEN38_NEEDS_REBASE)
+    arb.add_label(repo, winner, MODELOPT_MERGE_FIRST)
+    arb.remove_label(repo, winner, MODELOPT_NEEDS_REBASE)
     for num, _, _ in scored[1:]:
-        arb.add_label(repo, num, QWEN38_NEEDS_REBASE)
-        arb.remove_label(repo, num, QWEN38_MERGE_FIRST)
+        arb.add_label(repo, num, MODELOPT_NEEDS_REBASE)
+        arb.remove_label(repo, num, MODELOPT_MERGE_FIRST)
     if AUTO_MERGE:
         try_auto_merge_qwen38(repo, winner)
 
@@ -1379,13 +1499,15 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
     label = res.get("label") if res.get("ok") else "REJECT"
     if not res.get("ok"):
         label = "REJECT"
-    print(f"PR #{num}: eval-qwen38:{label}  "
+    print(f"PR #{num}: eval-modelopt:{label}  "
           f"decode PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')}  "
           f"prefill PR={res.get('pr_prefill_pp')} main={res.get('main_prefill_pp')}  "
           f"from={res.get('scored_dimension')}  "
           f"top1={res.get('pr_top1')} kl={res.get('pr_kl')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
-          f"q36_guard_ok={res.get('q36_guard_ok')}")
+          f"q36_guard_ok={res.get('q36_guard_ok')} "
+          f"q38_guard_ok={res.get('q38_guard_ok')} "
+          f"parity_ok={res.get('parity_ok')}")
     if dry_run:
         print(body[:500])
         return
@@ -1395,13 +1517,13 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         # with main and deserves a fair shot at winning the next merge-first reconciliation --
         # clear any stale needs-rebase from a round it lost (or an old conflict that's since been
         # resolved). Found 2026-08-13: reconcile_qwen38_merge_labels() filters candidates on
-        # `QWEN38_NEEDS_REBASE not in labs` (this bot's own "who's eligible to win" gate) but
+        # `MODELOPT_NEEDS_REBASE not in labs` (this bot's own "who's eligible to win" gate) but
         # the ONLY place that ever removed the label was the winner-selection branch itself --
         # a PR that lost one round, or ever hit a transient merge conflict, could never be
         # reconsidered again even after a completely clean re-evaluation confirmed its score,
         # since it was filtered out of candidacy before scoring was ever compared. Hit #790 and
         # #791 both losing merge-first to a strictly worse score for exactly this reason.
-        arb.remove_label(repo, num, QWEN38_NEEDS_REBASE)
+        arb.remove_label(repo, num, MODELOPT_NEEDS_REBASE)
     arb.add_label(repo, num, f"{EVAL_PREFIX}{label}")
     # Mirrored to the generic `eval:*` label, same as pr_dflash_bot.py -- SN74 scoring reads
     # eval:* tiers, so this makes Qwen3.8-27B submissions count toward that live incentive
@@ -1457,7 +1579,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "(regression)"
             close_body = (
                 "<!-- sparkinfer-qwen38-auto-close -->\n"
-                f"## Closed: sparkinfer qwen38 auto-eval — `eval-qwen38:{label}`\n\n"
+                f"## Closed: sparkinfer modelopt auto-eval — `eval-modelopt:{label}`\n\n"
                 f"This PR's Qwen3.8-27B prefill@16k speed measured **{res.get('delta_pct')}%** "
                 f"vs main, {fail_clause} "
                 "— closing automatically. This bot evaluates every eligible PR in the repo "
@@ -1468,7 +1590,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             )
             arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
             arb.gh(["pr", "close", str(num), "-R", repo])
-            print(f">> auto-closed PR #{num} (eval-qwen38:{label})")
+            print(f">> auto-closed PR #{num} (eval-modelopt:{label})")
 
 
 def main():
@@ -1535,7 +1657,7 @@ def main():
         if arb.pr_merge_conflict(pr.get("mergeable")):
             print(f"PR #{num}: merge conflict — qwen38-needs-rebase")
             if not args.dry_run:
-                arb.add_label(args.repo, num, QWEN38_NEEDS_REBASE)
+                arb.add_label(args.repo, num, MODELOPT_NEEDS_REBASE)
             continue
 
         if not only:

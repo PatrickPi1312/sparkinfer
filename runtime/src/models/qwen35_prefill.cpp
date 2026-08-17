@@ -484,7 +484,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // Muse keeps N==128 (its scored shape). Qwen3.8 now runs batched prefill at the
     // scored ctx=128 too (bf16 KV + NeoX rope, see the !kv8 arm below) as well as
     // ctx>=4096 (int8 KV). CUTLASS accepts any m%8==0, n/k%128==0.
-    // SPARKINFER_Q38_NVFP4=0 restores the int8/bf16 FFN.
+    // DEFAULT OFF since 2026-08-16: this leg leaves the prefilled state WRONG, and does so on
+    // every Qwen3.8 compressed-tensors checkpoint at every context length. Measured with
+    // qwen3_gguf_prefill_check on real token ids (KV int8 off, 16 teacher-forced continuation
+    // positions), unsloth/Qwen3.8-27B-NVFP4, comparing batched prefill against the token loop:
+    //
+    //     prompt   this leg ON            this leg OFF
+    //       32     top1 12/16  KL 0.990   top1 16/16  KL 0.0024
+    //      128     top1  8/16  KL 2.321   top1 16/16  KL 0.0007
+    //      512     top1  6/16  KL 3.491   top1 16/16  KL 0.0026
+    //
+    // Off, batched prefill is exact at every length; on, the state is badly wrong and gets worse
+    // with context. Turning ONLY this off also restores the ModelOpt checkpoint (KL 1.073 ->
+    // 0.009), and the same model loaded from GGUF was always exact (KL 0.011) because load_gguf
+    // never builds the *_fp4 operands -- which is precisely why this hid for so long.
+    //
+    // Nothing tested it: the PR accuracy gate runs qwen3_gguf_score.cpp, which teacher-forces
+    // through forward_token() and never enters prefill_batched_run(), while the bench beside it
+    // reports prefill throughput measured on exactly this path. Every prefill@128 / prefill@16k
+    // number from #837 onward was measured against a wrong state.
+    //
+    // The defect is inside the NVFP4 GEMM sequence itself (activation quant -> gate/up GEMM ->
+    // swiglu -> down GEMM), not in the weights: the same packed bytes dequantize correctly for
+    // decode, and this branch is bypassed, not changed, by turning the flag off. Re-enabling it
+    // needs the kernel fixed and prefill_check green at 32/128/512 -- do not flip this default
+    // back on a throughput result alone, because throughput is what selected for the bug.
+    // SPARKINFER_Q38_NVFP4=1 re-enables it for that debugging.
     const bool q38_nvfp4 = [&] {
         if (!c.dense_ffn || c.muse_glimmer || s.w.layers.empty() || !s.w.layers[0].gate_fp4)
             return false;
@@ -550,6 +575,62 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(fp4_rows, ffn)) : nullptr;
     unsigned char* fp4_down_as = nvfp4_down
         ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(fp4_rows, ffn)) : nullptr;
+
+    // ---- GDN projections straight off the checkpoint's NVFP4 bytes ----
+    // On the ModelOpt checkpoint in_proj_qkv / in_proj_z / out_proj are NVFP4 and proj() has no
+    // native-NVFP4 arm, so each one expands the weight NVFP4 -> bf16 (dq) -> int8
+    // (quantize_rows_i8) -> int8 GEMM on EVERY prefill pass. That is 6.5625 bytes of traffic per
+    // stored weight against the 0.5625 the payload actually occupies, over 48 GDN layers x
+    // (10240 + 6144 + 6144) x 5120 weights = 5.54 G weights, i.e. ~36 GB moved per pass to read a
+    // 3.1 GB operand. Feeding the packed nibbles to the same SM120 block-scaled GEMM the FFN
+    // already uses deletes the expansion instead of making it faster.
+    //
+    // Confined to short prompts (SPARKINFER_Q38_GDN_NVFP4_MAXN, default 2048). Two reasons, and
+    // neither is the benchmark: the saving is a per-layer FIXED cost, so it is worth the most per
+    // token exactly where N is small; and the GDN recurrence amplifies activation-quant error with
+    // sequence length -- this file already drops GDN off int8 past bf16_minctx for that reason,
+    // and FP4 activations are coarser than int8. A fixed bound also keeps the scored shape off the
+    // cudaMemGetInfo-derived FC, so which arm runs at ctx=128 does not depend on free VRAM.
+    // SPARKINFER_Q38_GDN_NVFP4_PREFILL=0 restores the dequant-to-int8 path (A/B in ONE binary);
+    // bit 0 is the in-projections (qkv + z, which share one A quantize) and bit 1 is out_proj, so
+    // 1/2 price them separately -- they sit on opposite sides of the GDN recurrence and do not
+    // carry the same activation-quant risk.
+    static const int gdn_fp4_mask = [] {
+        const char* e = getenv("SPARKINFER_Q38_GDN_NVFP4_PREFILL");
+        return e ? atoi(e) : 3;
+    }();
+    const bool gdn_fp4_env = gdn_fp4_mask != 0;
+    // Layer 0 is not necessarily a GDN layer (full_attention_interval), so probe for the first one.
+    const Qwen35LayerWeights* gdn_probe = nullptr;
+    for (const auto& lw : s.w.layers)
+        if (lw.linear_attn) { gdn_probe = &lw; break; }
+    static const int gdn_fp4_maxn = [] {
+        const char* e = getenv("SPARKINFER_Q38_GDN_NVFP4_MAXN");
+        return e ? atoi(e) : 2048;
+    }();
+    const bool gdn_nvfp4 = gdn_fp4_env && !moe && gdn_probe && gdn_probe->gdn_qkv_fp4 &&
+        N <= gdn_fp4_maxn &&
+        kernels::prefill_nvfp4_supported(N, lqkv, H) &&
+        kernels::prefill_nvfp4_supported(N, lvdim, H) &&
+        kernels::prefill_nvfp4_supported(N, H, lvdim);
+    // out_proj's A operand is `lnrm` at k = lvdim, which is WIDER than the FFN's k = H on this
+    // model (6144 vs 5120), so fp4_a/fp4_as cannot be reused -- they would be overrun by a quarter
+    // of a row. One staging pair sized for the widest GDN k covers all three projections.
+    const int gdn_k = (lvdim > H) ? lvdim : H;
+    unsigned char* fp4_gdn_a = gdn_nvfp4
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, gdn_k)) : nullptr;
+    unsigned char* fp4_gdn_as = gdn_nvfp4
+        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, gdn_k)) : nullptr;
+    // The three GDN shapes can each want more workspace than the FFN's, and fp4_ws is shared.
+    unsigned char* fp4_gdn_ws = nullptr;
+    if (gdn_nvfp4) {
+        size_t wb = kernels::prefill_nvfp4_workspace_bytes(N, lqkv, H);
+        const size_t wz = kernels::prefill_nvfp4_workspace_bytes(N, lvdim, H);
+        const size_t wo = kernels::prefill_nvfp4_workspace_bytes(N, H, lvdim);
+        if (wz > wb) wb = wz;
+        if (wo > wb) wb = wo;
+        fp4_gdn_ws = (wb <= fp4_ws_bytes && fp4_ws) ? fp4_ws : a8.alloc<unsigned char>(wb);
+    }
 
     // Long-ctx FFN int8: keep gate/up/down int8 weights (+scales) across token chunks so each
     // layer dequants once instead of once per chunk. ~150 MB vs ~300 MB for a bf16 cache.
@@ -759,6 +840,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             kernels::launch_ct_dequant_fp8_packed(W, wbuf, n_out, K, st);
             return wbuf;
         }
+        if (wtype == kernels::SI_QTYPE_NVFP4) {
+            // Payload is [256 B header with the f32 global scale | ue4m3 group scales | packed
+            // nibbles]; the global scale lives on the device, so read it through the kernel's own
+            // pointer rather than copying it back to the host inside a prefill step.
+            const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
+            const size_t scale_bytes = (size_t)n_out * K / 16;
+            kernels::launch_ct_dequant_nvfp4_dev(
+                static_cast<const char*>(W) + hdr + scale_bytes,
+                static_cast<const char*>(W) + hdr,
+                static_cast<const float*>(W), wbuf, n_out, K, st);
+            return wbuf;
+        }
         kernels::launch_gguf_dequant(wtype, W, wbuf, (long)n_out * K, st);
         return wbuf;
     };
@@ -818,7 +911,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         if (use_i8 && n_out >= 128) {
             quant_a_i8(A, R, K);
             // fused Q4_K/Q6_K -> int8 rows skips the dequant-to-bf16 scratch round trip
-            if (!kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st)) {
+            bool w_i8_ready = kernels::launch_gguf_dequant_rows_i8(wtype, W, W_i8, sw, n_out, K, st);
+            // Same for a checkpoint NVFP4 weight, which otherwise has no fused arm at all: dq()
+            // writes the whole [n_out,K] as bf16 and the row-quantizer reads it straight back.
+            // Bit-identical to that pair -- see launch_ct_dequant_nvfp4_rows_i8.
+            if (!w_i8_ready && wtype == kernels::SI_QTYPE_NVFP4) {
+                const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
+                const size_t scale_bytes = (size_t)n_out * K / 16;
+                w_i8_ready = kernels::launch_ct_dequant_nvfp4_rows_i8(
+                    static_cast<const char*>(W) + hdr + scale_bytes,
+                    static_cast<const char*>(W) + hdr,
+                    static_cast<const float*>(W), W_i8, sw, n_out, K, st);
+            }
+            if (!w_i8_ready) {
                 const void* wb = dq(W, wtype, n_out, K);
                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
             }
@@ -918,6 +1023,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const char* _pshareq = getenv("SPARKINFER_PREFILL_FP8_GDN_SHAREQ");
     const bool fp8_shareq = (use_fp8_gdn || moe_fp8) && (!_pshareq || _pshareq[0] != '0');
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w) {
+        // Checkpoint-native NVFP4: quantize xn to FP4 ONCE (both projections read it) and run two
+        // block-scaled GEMMs straight off the packed nibbles. A_i8/sx are not touched, so the int8
+        // activation memo stays valid for whatever runs next in the layer.
+        if (gdn_nvfp4 && (gdn_fp4_mask & 1) &&
+            w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf && w.gdn_z_fp4 && w.gdn_z_fp4_sf &&
+            fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
+            kernels::launch_prefill_nvfp4_quant_a(A, fp4_gdn_a, fp4_gdn_as, N, H, st) &&
+            kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                               w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
+                                               b8, N, lqkv, H, fp4_gdn_ws, st,
+                                               w.gdn_qkv_fp4_alpha) &&
+            kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                               w.gdn_z_fp4, w.gdn_z_fp4_sf,
+                                               lz, N, lvdim, H, fp4_gdn_ws, st,
+                                               w.gdn_z_fp4_alpha))
+            return;
         if (q38_fp8_prefill && w.wqkv_type == kernels::SI_QTYPE_FP8 &&
             w.wqkv_gate_type == kernels::SI_QTYPE_FP8 && A_i8 && sx && sw) {
             a_q = nullptr; a_pk = false;
@@ -1000,8 +1121,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
                 c.gdn_qh_block, st);
             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
-            attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
-            if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            // out_proj off the same NVFP4 bytes. The block-scaled GEMM cannot accumulate the
+            // residual, so this writes the RAW projection to `ao` and leaves attn_fused false --
+            // the `if (!attn_fused) launch_prefill_add(x, ao, x, ...)` below is what applies it,
+            // exactly as the Muse wo_fp4 arm does for the o projection.
+            const bool out_fp4 = gdn_nvfp4 && (gdn_fp4_mask & 2) &&
+                w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
+                fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws &&
+                kernels::launch_prefill_nvfp4_quant_a(lnrm, fp4_gdn_a, fp4_gdn_as, N, lvdim, st) &&
+                kernels::launch_prefill_nvfp4_gemm(fp4_gdn_a, fp4_gdn_as,
+                                                   w.gdn_out_fp4, w.gdn_out_fp4_sf,
+                                                   ao, N, H, lvdim, fp4_gdn_ws, st,
+                                                   w.gdn_out_fp4_alpha);
+            if (!out_fp4) {
+                attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
+                if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+            }
             use_i8 = restore_i8_gdn;
         } else {
             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----
@@ -1257,7 +1392,28 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             // so the FFN residual can ride the residual-fused GEMM straight into x per chunk.
             // Muse Glimmer must NOT residual-fuse: the post-FFN sandwich (norm_then_add below) needs
             // the RAW FFN output in `ao`, and the residual it adds onto is `h` (not x).
-            const bool ffn_fused = !c.muse_glimmer && resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
+            // The FP4 arm below writes the RAW FFN output to `ao` and never folds the residual --
+            // it ends in `continue`, skipping every fused-residual path in this loop. So the fused
+            // decision has to account for it, or the post-loop
+            //     } else if (!ffn_fused) { x += ao; }
+            // is skipped on the belief the down GEMM already accumulated into x, and the whole FFN
+            // contribution is dropped from the residual stream, on every one of 64 layers, for
+            // every token of every prefill. Fluent output, wrong content, worse with context.
+            //
+            // Muse Glimmer shares the same FP4 arm and was never affected: c.muse_glimmer already
+            // forces ffn_fused false, and its sandwich norm consumes `ao` explicitly, so its FP4
+            // output was always read back. That asymmetry is why this looked like a Qwen3.8 kernel
+            // bug -- the NVFP4 GEMM is exact to ~0.14 rel err at both models' shapes
+            // (runtime/examples/nvfp4_gemm_check.cpp); the residual bookkeeping around it was not.
+            //
+            // Keyed on whether the arm CAN run, not on whether a given chunk took it: chunks would
+            // otherwise mix fused and unfused within one layer and a single post-loop add could not
+            // be right for both. With this false the non-FP4 chunks write `ao` too, so one add at
+            // the end covers every chunk.
+            const bool ffn_fp4_possible = gu_nvfp4 && w.gate_fp4 && w.gate_fp4_sf &&
+                                          w.up_fp4 && w.up_fp4_sf && fp4_a && fp4_as;
+            const bool ffn_fused = !c.muse_glimmer && !ffn_fp4_possible &&
+                                   resid_fuse && (ffn_i8 || use_i8) && !ffn_qi8;
             for (int fo = 0; fo < N; fo += FC) {
                 const int fn = (N - fo < FC) ? (N - fo) : FC;
                 const bf16* hn_c = hn + (size_t)fo * H;
