@@ -1398,9 +1398,9 @@ def format_comment(commit: str, res: dict) -> str:
         "throughput at ctx=128 on the ModelOpt NVFP4 checkpoint, with the AR reference measured in "
         "the same process and the same model load. Both a regression in AR decode and any "
         "divergence from the AR token sequence are hard REJECTs — a speculative decoder that is "
-        "fast because it skips verification is not faster, it is wrong. τ is the lever: at τ≈1.4 "
-        "against a block_size of 7, DSpark is still slower than plain AR decode, so there is real "
-        "headroom here. This is informational, not a judgment on your PR: a `none` label just "
+        "fast because it skips verification is not faster, it is wrong. τ is the lever, and the "
+        "row above reports it against a block_size of 7. This is informational, not a judgment on "
+        "your PR: a `none` label just "
         "means no measurable DSpark decode@128 speedup was verified, which is expected and fine if "
         "that isn't what your change is about. "
         "Automated — merge behaviour depends on SPARKINFER_DSPARK_AUTOMERGE.</sub>\n"
@@ -1587,7 +1587,7 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
             print(f">> modelopt eval-log push failed (rc={push.returncode})")
             return None
         url = arb.LOG_PAGE + rid
-        print(f">> modelopt eval log: {url}")
+        print(f">> dspark eval log: {url}")
         return url
     except Exception as e:
         print(f">> modelopt eval-log upload failed: {e}")
@@ -1845,7 +1845,7 @@ def main():
         apply_result(args.repo, num, head or short, res, title=title, dry_run=False)
 
     reconcile_qwen38_merge_labels(args.repo, dry_run=False)
-    print("done — modelopt eval pass complete.")
+    print("done — dspark eval pass complete.")
 
 
 if __name__ == "__main__":
