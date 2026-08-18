@@ -1,0 +1,1654 @@
+#!/usr/bin/env python3
+"""sparkinfer DSpark speculative-decode PR auto-evaluator (Qwen3.8-27B, ctx=128).
+
+Adapted from pr_modelopt_bot.py — same transport, same tier buckets, same GitHub plumbing — and
+narrowed to one question: how fast is DSpark speculative decode at ctx=128, and is it still exact?
+
+  0. SCOPE (2026-08-18) — DSpark decode @ ctx=128 is the ONLY scored dimension.
+              The target is the ModelOpt NVFP4 checkpoint (MODEL_DIR); the draft is the released
+              DSpark checkpoint (DRAFT_DIR). Both legs — the AR reference and the speculative run —
+              are measured in ONE process by runtime/examples/dspark_tau_check.cpp, so they share a
+              model load, a GPU state and an env, and the PR-vs-main delta is apples-to-apples.
+
+              Where this starts from, measured 2026-08-18 on the pinned RTX 5090 at main b59f6d5:
+              DSpark 50.50 tok/s against AR's 88.37 — 0.571x, i.e. speculative decode is currently
+              a NET LOSS at this context, at tau 1.422 against a block_size of 7. That is the point
+              of scoring it: there is ~1.75x of headroom just to reach break-even with AR, and the
+              lever is tau. A PR that raises tau, or that cuts the per-step draft/verify cost, is
+              what this bot is built to find and reward.
+
+  1. LOSSLESSNESS IS A GATE, NOT A SCORE. dspark_tau_check regenerates the same prompt with the
+              draft disabled and requires the two token sequences to be IDENTICAL. A speculative
+              decoder that is fast because it emits unverified tokens is not fast, it is wrong, so
+              a run with LOSSLESS=0 is REJECTed no matter what it measured. Fail-closed: a missing
+              or unparseable LOSSLESS reads as 0, never as a pass.
+
+              This is a stronger accuracy statement than the top1/KL bar the sibling bots use — it
+              is exact token equality, not distributional agreement — but it is RELATIVE to the AR
+              path in the same build. It cannot see a PR that breaks AR itself, because DSpark
+              would then faithfully reproduce the broken AR. Hence gate 2.
+
+  2. Accuracy gate — DIFFERENTIAL, inherited from pr_modelopt_bot.py unchanged: score the same
+              token stream on the PR build and on origin/main and require the two distributions to
+              agree (bench/scripts/accuracy_compare_pair.py). This is what catches a PR that
+              changes what the TARGET produces, which losslessness alone cannot.
+
+              Limitation, stated plainly: a differential gate cannot catch a bug already present on
+              main. It catches newly introduced divergence only.
+
+  3. AR no-regression floor — the AR leg of the same run, REGRESS_TOL=0.98. Without it a PR could
+              post a DSpark "speedup" purely by making the AR baseline slower (they share every
+              target forward), or by slowing ordinary serving decode to help the speculative path.
+              A regression here is a hard REJECT regardless of the DSpark number.
+
+Deliberately NOT run, and why — each of these costs real GPU time per round and none of them can
+move the scored dimension: the Qwen3.6/Qwen3.8 sweep guards (this bot never touches the prefill or
+long-context paths they cover) and the batched-prefill parity check (DSpark prefills through the
+token loop, see dspark_tau_check.cpp's SPARKINFER_PREFILL_BATCHED pin). If DSpark work starts
+touching shared prefill code, put them back.
+
+Applies `eval-dspark:<TIER>` AND mirrors it to the generic `eval:<TIER>` label (SN74 scoring reads
+eval:* tiers). Auto-close on none/REJECT is live; auto-merge stays OFF unless
+SPARKINFER_DSPARK_AUTOMERGE=1 is explicitly set.
+
+  python eval/pr_dspark_bot.py
+  python eval/pr_dspark_bot.py --only-prs 870 --reeval
+
+Never rents a GPU. Shares the pinned box with any other bot via flock in the cron wrapper
+(run_dspark_cron.sh) — all bots MUST share /tmp/sparkinfer_bot.lock.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from ssh_box import ssh_box_enabled, ssh_box_endpoint, ssh_box_user  # noqa: E402
+
+# Reuse shared helpers from the AR bot (labels, greenlight, denylist, gh() wrapper, Polaris
+# signing, stale-close primitives, …) — same import pattern as pr_dflash_bot.py.
+import pr_eval_bot as arb  # noqa: E402
+
+SPEEDUP_LABELS = {"XL", "L", "M", "S", "XS"}
+# Same tier-bucketing constants as pr_dflash_bot.py / pr_eval_bot.py — copied verbatim, not
+# reinvented, per explicit instruction.
+SIG = 0.02
+REGRESS_TOL = 0.98
+BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
+
+# The dimensions that can earn a tier: LONG CONTEXT, both axes (decision 2026-08-17). decode@16k
+# and prefill@16k are the optimisation target, so those two are what auto-merges.
+#
+# A PR is tiered on whichever of the two it moved MORE, not on a sum or an average -- they are
+# largely independent (decode at 16k is KV-read bound at m=1, prefill at 16k is a tensor-core GEMM
+# over the whole prompt), so a real win in one is a real win, and averaging would let an untouched
+# dimension dilute it.
+#
+# decode@128 and prefill@128 stay MEASURED as no-regression FLOORS, as do these two: a PR that
+# buys long-context throughput by trading away short-context is still a hard REJECT. Floor and
+# scoring are separate lists precisely so the target can move without weakening the guard -- a PR
+# The one scored dimension: DSpark speculative decode throughput at ctx=128, as measured by
+# runtime/examples/dspark_tau_check.cpp's METRIC DSPARK_TPS.
+#
+# Single-dimension on purpose. The multi-dimension machinery below (best-tier-wins across a list,
+# every dimension also a floor) is kept intact so adding e.g. "dspark-decode@4k" later is a
+# one-line change, but with one entry the combination rule degenerates to "score it, and reject if
+# it regresses" -- which is what a focused optimisation target wants.
+SCORING_DIMS = ["dspark-decode@128"]
+SCORING_DIM = SCORING_DIMS[0]
+
+# Accuracy gate bars. This gate is DIFFERENTIAL (PR vs origin/main on the same token stream, see
+# the module docstring pt. 2), not absolute-vs-llama.cpp, so the bars are much tighter than the
+# 0.90/0.10 an across-engine comparison needs: two builds of the same model on the same box
+# should agree essentially exactly. Anything less means the PR changed the model's numerics.
+# Not 1.0/0.0 — a PR may legitimately reassociate float ops (fusing a kernel, changing a
+# reduction order), which perturbs the last bits without being a correctness bug.
+# top1 0.90 and KL 0.1, both loosened by explicit decision 2026-08-16 from the Qwen3.8 bot's
+# 0.99 / 0.01. The gate stays differential (PR vs main on the same token stream), so it still
+# catches a PR that CHANGES this model's output distribution -- it now tolerates ten times the KL
+# drift and lets one token in ten flip its argmax before calling that a failure.
+#
+# Worth knowing what that admits, since these are the numbers this codebase measured by hand
+# during Qwen3.8 bring-up: a second quantization of the GDN projections scored top1 0.96 / KL
+# 0.035 and was rejected as too lossy to ship; a Q8_0 fit scored 1.00 / 0.015. Both pass here.
+# So this bar no longer distinguishes "same model, faster" from "slightly different, faster" --
+# it is a guard against gross corruption, not against quality drift. The batched-prefill parity
+# gate and the Qwen3.8 no-regression guard are what carry correctness now.
+ACC_TOP1_BAR = float(os.environ.get("MODELOPT_ACC_TOP1_BAR", "0.9"))
+ACC_KL_BAR = float(os.environ.get("MODELOPT_ACC_KL_BAR", "0.1"))
+
+EVAL_PREFIX = "eval-dspark:"
+MODELOPT_MERGE_FIRST = "dspark-merge-first"
+MODELOPT_NEEDS_REBASE = "dspark-needs-rebase"
+# First schema for this bot. Same reasoning as the sibling bots' own bumps: a PR evaluated before
+# a scoring change existed must not keep a stale-scored label/score forever.
+EVAL_SCHEMA_VERSION = "v1-dspark-decode128"
+MARKER_RE = re.compile(
+    r"<!-- sparkinfer-dspark-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
+    re.DOTALL,
+)
+
+# --- box paths (see .env.eval's MODELOPT_* block) ---
+# Separate clone from pr_eval_bot's /root/sparkinfer, which carries unrelated uncommitted work.
+REMOTE_REPO = os.environ.get("MODELOPT_REMOTE_REPO", "/root/sparkinfer_modelopt")
+# The SCORED checkpoint: gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 -- our own uniform-NVFP4
+# ModelOpt quantization, a compressed-tensors DIRECTORY, NOT a GGUF. qwen3_gguf_bench /
+# qwen3_gguf_score grew directory support for exactly this (runtime/examples/qwen_checkpoint.h).
+#
+# NOT the same checkpoint as Q38_GUARD_MODEL_DIR below (upstream unsloth, NVFP4 FFN + FP8
+# attention). Both are supported; this one is scored and that one is guarded. They differ by
+# ~13% decode and ~30% prefill, so mixing them up silently changes every number this bot prints
+# -- which is exactly what happened while writing the Qwen3.8 README section on 2026-08-17.
+MODEL_DIR = os.environ.get("MODELOPT_MODEL_DIR", "/root/workspace/models_q38_modelopt")
+# The single weight blob inside MODEL_DIR, for the Polaris attestation ONLY. The sibling bots pass
+# their .gguf here; the analogue for a compressed-tensors checkout is the safetensors file, not the
+# directory -- receipt.model_sha256() returns "" for anything that is not a regular file, so
+# passing MODEL_DIR would mint a receipt whose model_sha256 pins nothing while still looking valid.
+# If a future checkpoint is sharded (model-00001-of-0000N.safetensors) this path stops existing and
+# the sha degrades to "" rather than crashing; override MODELOPT_MODEL_WEIGHT_FILE if that happens.
+MODEL_WEIGHT_FILE = os.environ.get("MODELOPT_MODEL_WEIGHT_FILE",
+                                   os.path.join(MODEL_DIR, "model-00001-of-00003.safetensors"))
+# The DSpark draft checkpoint (block_size=7, 5 layers, hidden 5120). It has no embed_tokens or
+# lm_head of its own -- it borrows the target's, which is what makes its proposals directly
+# comparable to what the target would produce, and what makes the losslessness check meaningful.
+DRAFT_DIR = os.environ.get("DSPARK_DRAFT_DIR", "/root/workspace/dspark")
+# Prompt length for the scored context. dspark_tau_check takes explicit token ids, so this is the
+# real ctx: the bot tokenizes bench/scripts/bench_prompt.txt and truncates to this many ids.
+DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "128"))
+BENCH_TOKENS = int(os.environ.get("MODELOPT_BENCH_TOKENS", "128"))
+ACC_TOPK = int(os.environ.get("MODELOPT_ACC_TOPK", "128"))
+# Batched-prefill parity floor: the fraction of the continuation that batched prefill must still
+# generate identically to the token loop. Absolute, not PR-vs-main -- see the PREFILL_PARITY block
+# in the remote script for why a differential gate cannot catch this class of bug.
+PARITY_BAR = float(os.environ.get("MODELOPT_PARITY_BAR", "0.75"))
+# Score dumps for the differential accuracy gate. main's is written once per round by
+# measure_main_baseline(); each PR compares its own dump against it. Kept on the box (not shipped
+# back over ssh) because a 128-deep top-k dump over the whole corpus is megabytes.
+SCORE_DUMP_MAIN = "/tmp/mopt_score_main.txt"
+SCORE_DUMP_PR = "/tmp/mopt_score_pr.txt"
+EVAL_TEXT = "bench/scripts/eval_text.txt"  # same corpus the sibling bots score
+
+# Qwen3.6 no-regression guard (module docstring, pt. 3) — same env var names as pr_dflash_bot.py's
+# Q36_GUARD_* (PRIMARY36_MODEL_REPO/PRIMARY36_TOK_REPO) so one .env.eval entry covers both bots.
+# Defaults point at this box's actual layout (confirmed 2026-08-12: /root/workspace/models36),
+# distinct from the DFlash bot's vast.ai-box convention (/workspace/models36).
+Q36_GUARD_MODELS_DIR = os.environ.get("Q36_GUARD_MODELS_DIR", "/root/workspace/models36")
+Q36_GUARD_MODEL_FILE = os.environ.get("Q36_GUARD_MODEL_FILE", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+Q36_GUARD_MODEL_REPO = os.environ.get("PRIMARY36_MODEL_REPO", "unsloth/Qwen3.6-35B-A3B-GGUF")
+Q36_GUARD_TOK_REPO = os.environ.get("PRIMARY36_TOK_REPO", "Qwen/Qwen3.6-35B-A3B")
+GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
+
+# Qwen3.8 no-regression guard, over the OTHER supported NVFP4 build (upstream unsloth, NVFP4 FFN +
+# FP8 attention). Both builds are supported targets; this one is not scored, so without a guard
+# nothing would notice it getting slower. They share load_compressed_tensors, the batched prefill
+# and every decode kernel, so a ModelOpt optimisation that speeds up the scored checkpoint by
+# pessimising the shared path is a regression -- and this bot's own numbers cannot see it, because
+# it only ever benches models_q38_modelopt.
+# Same shape as the inherited Qwen3.6 guard below, except the subject is a compressed-tensors
+# DIRECTORY rather than a GGUF, so there is no ensure_model/ensure_tokenizer download step.
+Q38_GUARD_MODEL_DIR = os.environ.get("Q38_GUARD_MODEL_DIR", "/root/workspace/models_qwen38")
+# decode@128 is this bot's scoring dimension, so ctx 0 carries the most weight; 4k/16k are included
+# because that is where the shared prefill and KV paths cost the most.
+Q38_GUARD_CTXS = [0, 4096, 16384]
+
+# Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
+# shape) but OFF unless this exact env var is set.
+# Was reading SPARKINFER_QWEN38_AUTOMERGE until 2026-08-17 -- a leftover from this file being
+# forked from pr_qwen38_bot.py, whose rename to the ModelOpt-specific var missed this one
+# word-boundary. It "worked" only because .env.eval happened to set BOTH SPARKINFER_QWEN38_
+# AUTOMERGE and SPARKINFER_MODELOPT_AUTOMERGE=1, not because they were actually independent —
+# flipping one without the other would have silently done nothing. Reads its own var now.
+AUTO_MERGE = os.environ.get("SPARKINFER_DSPARK_AUTOMERGE") == "1"
+AUTOMERGE_BLOCK = {
+    "copycat", "copycat-warn", "flagged:gaming", "penalty", "needs-benchmark",
+    MODELOPT_NEEDS_REBASE, arb.REEVALUATE_LABEL, arb.HOLD_LABEL, *arb.REGRESSION_LABELS,
+}
+
+SCORES_FILE = os.path.expanduser(
+    os.environ.get("DSPARK_SCORES_FILE", "~/.sparkinfer_dspark_scores.json")
+)
+
+# Polaris verifiable-compute receipts — same policy/keys as the AR and DFlash bots (on by
+# default; TDX via POLARIS_API_KEY when configured, else Ed25519 fallback). Wired through
+# judge.py's --from-stdin generic RESULT_JSON path (NOT --dflash, which hardcodes a
+# DFlash-shaped measurement block and eval_mode="dflash" — reusing it here would produce a
+# mislabeled, semantically wrong attestation). SPARKINFER_EVAL_MODE is set explicitly below so
+# the attestation correctly records "qwen38-128", not the AR bot's "longctx" default.
+POLARIS_ENABLED = os.environ.get("POLARIS", "1") != "0"
+POLARIS_API_KEY = os.environ.get("POLARIS_API_KEY", "")
+_POLARIS_PUBKEY_FILE = os.path.join(HERE, "polaris", "sparkinfer_eval.pub")
+
+
+def _load_polaris_pubkey():
+    try:
+        with open(_POLARIS_PUBKEY_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+    except Exception:
+        pass
+    return ""
+
+
+def _load_scores():
+    try:
+        return json.load(open(SCORES_FILE))
+    except Exception:
+        return {}
+
+
+def _save_scores(data):
+    try:
+        with open(SCORES_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f">> modelopt scores save skipped: {e}")
+
+
+def _report_pct(pct: float, reject: bool = False) -> float:
+    """Round a delta so the number shown can never contradict the label it produced.
+
+    round() breaks that: PR #863 gained 9.9996% on decode@16k, which is BELOW the 10% L threshold
+    and correctly scored M -- but round(9.9996, 1) prints "10.0%", so the comment read
+    "delta=10.0%  eval-modelopt:M" and looked like an off-by-one in the buckets. (It missed L by
+    0.0004 points: it needed 90.17404 tok/s and measured 90.1737.) More decimals do not help --
+    that value reads as 10.0 / 10.00 / 10.000 and only separates at the fourth.
+
+    Which way to break the tie depends on which side the result landed, and getting only one side
+    right just moves the confusion:
+
+      PASSING (none/XS/S/M/L/XL) -> truncate TOWARD zero. A gain then never displays into a bucket
+      it did not earn (9.9996 -> 9.9), and a small negative that still cleared the -2% floor never
+      displays AT the floor (-1.96 -> -1.9) and so never reads as a REJECT it isn't.
+
+      REJECT -> truncate AWAY from zero (-2.04 -> -2.1), so the regression that triggered it never
+      displays milder than the threshold it broke.
+    """
+    scaled = pct * 10.0
+    return (math.floor(scaled) if reject else math.trunc(scaled)) / 10.0
+
+
+def tier_from_gain(pr_tps: float, main_tps: float, metric: str = "decode"):
+    """Return (label, delta_pct, pass_ok, reason). Identical logic to pr_dflash_bot.py's
+    tier_from_gain — same bucket thresholds, same no-regression floor. `metric` only affects the
+    reason text — lets prefill@128 scoring reuse this verbatim instead of duplicating it (this
+    codebase's "copied, not reinvented" convention) while still reporting which dimension a
+    regression/improvement actually came from."""
+    if main_tps <= 0:
+        return "REJECT", 0.0, False, f"main {metric} baseline is 0"
+    if pr_tps < REGRESS_TOL * main_tps:
+        pct = 100.0 * (pr_tps - main_tps) / main_tps
+        return "REJECT", _report_pct(pct, reject=True), False, (
+            f"{metric} regression: {pr_tps:.2f} < {100 * REGRESS_TOL:.0f}% of main {main_tps:.2f}"
+        )
+    g = (pr_tps - main_tps) / main_tps
+    pct = _report_pct(100.0 * g)
+    if g < SIG:
+        return "none", pct, True, f"within significance gate — not a verified {metric} improvement"
+    for thr, name in BUCKETS:
+        if g >= thr:
+            return name, pct, True, "ok"
+    return "none", pct, True, "ok"
+
+
+_TIER_RANK = {"REJECT": -1, "none": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "XL": 5}
+
+
+def check_q38_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Did this ModelOpt PR regress the SHIPPING Qwen3.8 checkpoint?
+
+    Differential, PR vs freshly-measured main on the same box and contexts -- the same discipline
+    and the same comparison convention as check_q36_guard below (tol is a RATIO FLOOR: cur must
+    stay >= main * 0.98, it is NOT a fractional delta).
+
+    It exists because this bot's scoring numbers come only from models_q38_modelopt, so a change
+    that wins on the ModelOpt checkpoint by pessimising the shared compressed-tensors path
+    (load_compressed_tensors, prefill_batched_run, the decode GEMVs) would score as an improvement
+    while making the OTHER supported NVFP4 build -- upstream unsloth, which nothing else here
+    measures -- slower.
+
+    Iterates MAIN's contexts as the reference set and fails closed on a missing/zero PR
+    measurement, for the same reason check_q36_guard does: a PR build that crashes partway through
+    its own sweep must not make that context silently uncheckable."""
+    problems = []
+    if (pr.get("guard38_failed") or main.get("guard38_failed")
+            or not pr.get("guard38") or not main.get("guard38")):
+        problems.append("qwen3.8 guard measurement unavailable")
+    pr_ctxs, main_ctxs = pr.get("guard38") or {}, main.get("guard38") or {}
+    for ctx, main_vals in main_ctxs.items():
+        label = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        pr_vals = pr_ctxs.get(ctx) or {}
+        for metric in ("decode", "prefill"):
+            base = main_vals.get(metric, 0)
+            if base <= 0:
+                continue
+            cur = pr_vals.get(metric, 0)
+            if cur <= 0:
+                problems.append(
+                    f"qwen3.8 {metric}@{label}: PR measurement missing/zero "
+                    f"(main {base:.1f}) — treated as regression"
+                )
+                continue
+            if cur < base * tol:
+                pct = 100.0 * (cur - base) / base
+                problems.append(
+                    f"qwen3.8 {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
+                    f"{base:.1f} ({pct:+.1f}%)"
+                )
+    return (len(problems) == 0, problems)
+
+
+def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """No-regression check: PR vs same-box main, Qwen3.6 only, decode + prefill, every measured
+    context. Adapted from pr_dflash_bot.py's check_qwen_guard (its qwen3.5/Qwythos half dropped —
+    scoped to qwen3.6 only per explicit instruction, module docstring pt. 3). Returns
+    (ok, [human-readable regression/failure strings])."""
+    problems = []
+    if pr.get("guard36_failed") or main.get("guard36_failed") or not pr.get("guard36") or not main.get("guard36"):
+        problems.append("qwen3.6 guard measurement unavailable")
+    pr_ctxs, main_ctxs = pr.get("guard36") or {}, main.get("guard36") or {}
+    # Iterate over MAIN's contexts (the reference set) — a PR build that crashes partway through
+    # its own sweep must not make that context silently uncheckable. Fail closed: a real main
+    # baseline (base > 0) with a missing/zero PR measurement (cur <= 0) is a regression, not a skip.
+    for ctx, main_vals in main_ctxs.items():
+        label = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        pr_vals = pr_ctxs.get(ctx) or {}
+        for metric in ("decode", "prefill"):
+            base = main_vals.get(metric, 0)
+            if base <= 0:
+                continue  # main itself has no baseline for this metric/ctx — not comparable
+            cur = pr_vals.get(metric, 0)
+            if cur <= 0:
+                problems.append(
+                    f"qwen3.6 {metric}@{label}: PR measurement missing/zero "
+                    f"(main {base:.1f}) — treated as regression"
+                )
+                continue
+            if cur < base * tol:
+                pct = 100.0 * (cur - base) / base
+                problems.append(
+                    f"qwen3.6 {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
+                    f"{base:.1f} ({pct:+.1f}%)"
+                )
+    return (len(problems) == 0, problems)
+
+
+def qwen38_evaluated_commits(repo, num):
+    """Head commits that already have a REAL scoring verdict posted — mirrors
+    dflash_evaluated_commits: infra/transport failures (label:null in the marker) don't count."""
+    r = arb.gh(["pr", "view", str(num), "-R", repo, "--json", "comments"])
+    done = set()
+    for c in json.loads(r.stdout or "{}").get("comments", []):
+        body = c.get("body") or ""
+        m = MARKER_RE.search(body)
+        if not m or "sparkinfer modelopt auto-eval" not in body:
+            continue
+        meta_raw = m.group(2)
+        try:
+            meta = json.loads(meta_raw) if meta_raw else {}
+        except json.JSONDecodeError:
+            meta = {}
+        if meta.get("label") is None:
+            continue
+        done.add(m.group(1))
+    return done
+
+
+def strip_qwen38_eval_labels(repo, num):
+    for lab in list(arb.labels_on(repo, num)):
+        if lab.startswith(EVAL_PREFIX):
+            arb.remove_label(repo, num, lab)
+
+
+STALE_DAYS = float(os.environ.get("MODELOPT_STALE_DAYS", "1"))
+
+
+def _pr_last_activity_ts(repo, num):
+    """Last real author activity (most recent commit's committedDate), not PR updatedAt — same
+    rationale as pr_dflash_bot.py's copy of this helper (bot comments/labels bump updatedAt)."""
+    r = arb.gh(["pr", "view", str(num), "-R", repo, "--json", "commits,createdAt"])
+    try:
+        info = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    dates = [c.get("committedDate") for c in (info.get("commits") or []) if c.get("committedDate")]
+    ts_str = max(dates) if dates else info.get("createdAt")
+    if not ts_str:
+        return None
+    try:
+        return time.mktime(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def close_stale_qwen38_prs(repo, prs, dry_run=False):
+    """Close open PRs with no author commit activity in STALE_DAYS+ days. HOLD_LABEL and the
+    current qwen38-merge-first winner are exempt."""
+    closed = set()
+    now = time.time()
+    for pr in prs:
+        num = pr["number"]
+        if pr.get("isDraft"):
+            continue
+        labs = {l["name"] for l in pr.get("labels", [])}
+        if arb.HOLD_LABEL in labs or MODELOPT_MERGE_FIRST in labs:
+            continue
+        ts = _pr_last_activity_ts(repo, num)
+        if ts is None:
+            continue
+        age_days = (now - ts) / 86400
+        if age_days < STALE_DAYS:
+            continue
+        print(f"PR #{num}: stale ({age_days:.1f}d since last commit, threshold {STALE_DAYS}d) — closing")
+        closed.add(num)
+        if dry_run:
+            continue
+        body = (
+            "<!-- sparkinfer-qwen38-auto-close-stale -->\n"
+            f"## Closed: stale — no commits in {age_days:.1f} days\n\n"
+            f"This PR has had no new commits in over {STALE_DAYS:g} days — closing automatically "
+            "to keep the Qwen3.8-27B eval queue clean. Reopen (or push a new commit / open a "
+            "fresh PR) whenever you're ready to continue; it'll be picked back up on the next "
+            "eval cycle."
+        )
+        arb.gh(["pr", "comment", str(num), "-R", repo, "--body", body])
+        arb.gh(["pr", "close", str(num), "-R", repo])
+    return closed
+
+
+def resolve_ssh(instance_id: int):
+    """Return (host, port) for the pinned box. Same logic as pr_dflash_bot.py's resolve_ssh."""
+    if ssh_box_enabled():
+        ep = ssh_box_endpoint()
+        if not ep:
+            raise RuntimeError("EVAL_TRANSPORT=ssh but EVAL_SSH_HOST unset")
+        return ep
+    key = os.environ.get("SSH_KEY", os.path.expanduser("~/.ssh/speedy"))
+    os.environ.setdefault("SSH_KEY", key)
+    iid = arb.current_instance(instance_id) or instance_id
+    raw = subprocess.run(
+        ["vastai", "show", "instance", str(iid), "--raw"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if raw.returncode != 0 or not (raw.stdout or "").strip():
+        raise RuntimeError(f"vastai show instance {iid} failed: {(raw.stderr or '')[:200]}")
+    info = json.loads(raw.stdout)
+    ip = (info.get("public_ipaddr") or "").strip()
+    ports = info.get("ports") or {}
+    m = ports.get("22/tcp") or [{}]
+    port = int((m[0] or {}).get("HostPort") or 0)
+    if info.get("actual_status") != "running" or not ip or not port:
+        raise RuntimeError(
+            f"pinned instance {iid} not SSH-ready (status={info.get('actual_status')})"
+        )
+    return ip, port
+
+
+def ssh_run(host, port, cmd, timeout=7200, stdin_data=None, via_stdin=False):
+    """Same shape as pr_dflash_bot.py's ssh_run — via_stdin=True avoids MAX_ARG_STRLEN limits
+    for the (much smaller here, but still nontrivial) remote script text."""
+    key = os.environ.get("SSH_KEY", os.path.expanduser("~/.ssh/speedy"))
+    user = ssh_box_user() if ssh_box_enabled() else "root"
+    remote = ["bash", "-s"] if via_stdin else [cmd]
+    return subprocess.run(
+        [
+            "ssh", "-i", key,
+            "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "BatchMode=yes",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=40",
+            "-p", str(port), f"{user}@{host}", *remote,
+        ],
+        capture_output=True, text=True, timeout=timeout,
+        input=cmd if via_stdin else stdin_data,
+    )
+
+
+_EXPLICIT_FAIL_MARKERS = ("BUILD_FAILED", "LLAMACPP_CONFIGURE_FAILED", "LLAMACPP_BUILD_FAILED")
+
+
+def _crash_reason(*outputs: str) -> str | None:
+    """Same ERR-trap diagnostic extraction as pr_dflash_bot.py, PLUS the remote script's own
+    explicit *_FAILED markers (BUILD_FAILED, LLAMACPP_CONFIGURE_FAILED, LLAMACPP_BUILD_FAILED).
+    Those markers are `exit 1` inside an `|| { ...; exit 1; }` handler, not a bare failing
+    command under `set -e` -- bash's ERR trap does NOT fire for an explicit `exit`, so a
+    perfectly-diagnosed compile error (e.g. #777's `launch_muse_sandwich_tail_q8` undefined)
+    was falling through to `_looks_like_hard_kill`'s "no diagnostic captured" bucket, getting
+    misreported as an ambiguous hard kill AND triggering a pointless retry of a build that will
+    deterministically fail again. Found by hand-running _remote_script directly against #777
+    after the bot mislabeled it twice."""
+    combined = "\n".join(o or "" for o in outputs)
+    lines = combined.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("REMOTE_SCRIPT_FAILED "):
+            extra = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            return line.strip() + (f" | gpu: {extra}" if extra else "")
+    for i, line in enumerate(lines):
+        marker = next((m for m in _EXPLICIT_FAIL_MARKERS if line.startswith(m)), None)
+        if not marker:
+            continue
+        # The single most actionable line is usually the compiler/linker's own "error:" —
+        # prefer that over the marker's generic "tail of build.log:" header.
+        for follow in lines[i + 1:i + 60]:
+            if "error:" in follow or "Error " in follow:
+                return f"{marker}: {follow.strip()}"
+        tail = " | ".join(l.strip() for l in lines[i + 1:i + 3] if l.strip())
+        return marker + (f": {tail}" if tail else "")
+    return None
+
+
+def _looks_like_hard_kill(stdout: str, stderr: str) -> bool:
+    """No ERR-trap diagnostic captured AND the run did not reach its final checkpoint.
+
+    The sibling bots key this off ACCURACY_STAGE_DONE because accuracy is their LAST stage. Here
+    it is not: the Qwen3.6 guard runs after it, so ACCURACY_STAGE_DONE would mark a run "far
+    enough along" while the entire guard was still missing. Observed for real 2026-08-15 --
+    a main run reached ACCURACY_STAGE_DONE and GUARD_START, then died at exit 6 during the guard
+    sweep with no ERR-trap output at all; re-running the identical script succeeded, so it was
+    transient. Under the old heuristic that run would NOT have been retried, check_q36_guard would
+    have seen an empty guard36 dict, called the measurement unavailable, and hard-REJECTed --
+    auto-closing a PR for a flake. GUARD_END is the real end-of-run marker, so use that."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    if _crash_reason(stdout, stderr):
+        return False
+    return "GUARD_END" not in combined
+
+
+def _ssh_run_resilient(host, port, script: str, label: str):
+    """One automatic retry on an apparent hard kill — same insurance pr_dflash_bot.py added
+    after #684/#690 (heavy model-reload boundaries silently killing the whole remote shell)."""
+    r = ssh_run(host, port, script, via_stdin=True)
+    if r.returncode != 0 and _looks_like_hard_kill(r.stdout, r.stderr):
+        print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, no accuracy-stage "
+              f"checkpoint reached) — retrying once")
+        r = ssh_run(host, port, script, via_stdin=True)
+    return r
+
+
+def _remote_script(ref: str, role: str = "pr") -> str:
+    """Bash run on the eval box: checkout ref, build, DSpark speculative decode @ctx=128 against
+    the NVFP4 target, and the teacher-forced score dump.
+
+    Run once per ref -- identical script both times so the two measurements are directly
+    comparable. `role` only decides which score dump path is written and whether the
+    differential accuracy compare runs (main has nothing to compare against yet; the PR run
+    compares itself against main's dump from earlier in the same round)."""
+    repo = shlex.quote(REMOTE_REPO)
+    model_dir = shlex.quote(MODEL_DIR)
+    ref_q = shlex.quote(ref)
+    ntok = BENCH_TOKENS
+    topk = ACC_TOPK
+    parity_bar = PARITY_BAR
+    draft_dir = shlex.quote(DRAFT_DIR)
+    ctx = DSPARK_CTX
+    eval_text = shlex.quote(EVAL_TEXT)
+    dump_self = shlex.quote(SCORE_DUMP_MAIN if role == "main" else SCORE_DUMP_PR)
+    dump_main = shlex.quote(SCORE_DUMP_MAIN)
+    is_pr = "1" if role == "pr" else "0"
+    q38_guard_dir = shlex.quote(Q38_GUARD_MODEL_DIR)
+    q36_dir = shlex.quote(Q36_GUARD_MODELS_DIR)
+    q36_file = shlex.quote(Q36_GUARD_MODEL_FILE)
+    q36_repo = shlex.quote(Q36_GUARD_MODEL_REPO)
+    q36_tok = shlex.quote(Q36_GUARD_TOK_REPO)
+    return f"""
+set -euo pipefail
+# Surface *why* a crash happened instead of dying silently -- same diagnostic trap as the sibling
+# bots' _remote_script (a REJECT from an infra crash should carry a real cause).
+trap 'rc=$?; ln=$LINENO; reason=""; \\
+  case $rc in \\
+    137) reason="likely OOM-killed (SIGKILL)" ;; \\
+    139) reason="likely segfault (SIGSEGV)" ;; \\
+    134) reason="likely abort (SIGABRT)" ;; \\
+    124) reason="likely timeout" ;; \\
+  esac; \\
+  echo "REMOTE_SCRIPT_FAILED line=$ln exit=$rc reason=$reason" >&2; \\
+  nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader >&2 2>/dev/null || true' ERR
+
+# One run does several back-to-back multi-GB model load/unload cycles -- poll GPU memory down to
+# near-empty before each heavy load instead of assuming the previous process's exit already freed
+# it. This matters more here than for the sibling bots: the NVFP4 checkpoint's resident footprint
+# is ~32GB of a 32GB card (dequant -> Q4_K decode copies plus the NVFP4 prefill copies), so even a
+# few hundred MB of not-yet-reclaimed memory is the difference between loading and OOM.
+wait_gpu_clear() {{
+  local tries=0 used
+  while [ "$tries" -lt 30 ]; do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    [ -n "$used" ] && [ "$used" -lt 1024 ] 2>/dev/null && return 0
+    sleep 1
+    tries=$((tries + 1))
+  done
+  echo "WARN: GPU memory still ${{used:-unknown}} MiB after ${{tries}}s wait -- proceeding anyway" >&2
+}}
+
+export PATH=/usr/local/cuda-13.0/bin:/usr/local/cuda/bin:/usr/local/bin:$PATH
+export CUDA_HOME=${{CUDA_HOME:-/usr/local/cuda-13.0}}
+REPO={repo}
+MODEL_DIR={model_dir}
+DRAFT_DIR={draft_dir}
+CTX={ctx}
+NTOK={ntok}
+TOPK={topk}
+PARITY_BAR={parity_bar}
+EVAL_TEXT={eval_text}
+DUMP_SELF={dump_self}
+DUMP_MAIN={dump_main}
+IS_PR={is_pr}
+Q38_GUARD_MODEL_DIR={q38_guard_dir}
+Q36_GUARD_MODELS_DIR={q36_dir}
+Q36_GUARD_MODEL_FILE={q36_file}
+Q36_GUARD_MODEL_REPO={q36_repo}
+Q36_GUARD_TOK_REPO={q36_tok}
+
+cd "$REPO"
+git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
+git fetch -q origin {ref_q}
+git reset -q --hard
+git clean -qfd
+git checkout -qf FETCH_HEAD
+HEAD=$(git rev-parse --short HEAD)
+echo "REMOTE_HEAD $HEAD"
+
+test -d "$MODEL_DIR" || {{ echo "FAIL missing NVFP4 checkpoint dir $MODEL_DIR"; exit 1; }}
+test -f "$MODEL_DIR/config.json" || {{ echo "FAIL $MODEL_DIR has no config.json"; exit 1; }}
+
+# Always reconfigure (cheap, idempotent) -- skipping it on an existing CMakeCache left stale
+# generated Makefiles pointing at a DIFFERENT PR branch's files once the checkout switched
+# underneath it (the sibling bots hit exactly this, #693/#694).
+mkdir -p build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/mopt_cmake.log 2>&1
+cmake --build build --target dspark_tau_check qwen3_gguf_score -j"$(nproc)" >/tmp/mopt_build.log 2>&1 || {{
+  echo "BUILD_FAILED -- tail of /tmp/mopt_build.log:" >&2
+  tail -80 /tmp/mopt_build.log >&2
+  exit 1
+}}
+test -x build/runtime/dspark_tau_check
+test -x build/runtime/qwen3_gguf_score
+
+# --- DSpark speculative decode @ ctx=CTX ---
+# ONE process runs both legs against one loaded model: the AR reference first (on clean state --
+# dflash_generate opens its own session, so taking the reference afterwards returns empty), then
+# the speculative run, then an exact token-equality check between them. That shared load is the
+# whole point: AR_TPS and DSPARK_TPS come off the same weights, the same GPU state and the same
+# env, so their ratio means something and the PR-vs-main delta is not measuring load variance.
+#
+# The env pins inside dspark_tau_check.cpp are deliberately NOT production defaults (they force
+# AR's prefill onto the token loop so both legs start from the same state, and pin split-K
+# determinism). Both refs in a round run the identical binary under identical pins and the scored
+# metric is relative, so the offset cancels. Do not read AR_TPS here as the serving decode rate.
+test -d "$DRAFT_DIR" || {{ echo "FAIL missing DSpark draft dir $DRAFT_DIR"; exit 1; }}
+test -f "$DRAFT_DIR/config.json" || {{ echo "FAIL $DRAFT_DIR has no config.json"; exit 1; }}
+
+# Real prompt, not a synthetic ramp -- same reasoning as the sibling bots: a synthetic token stream
+# is a gaming surface, and that matters when the bot can auto-merge without a human reading the
+# diff. Truncated to CTX ids so "ctx=128" means 128 real tokens.
+DSPARK_IDS=/tmp/dspark_prompt_ids.txt
+python3 - "$MODEL_DIR/tokenizer.json" bench/scripts/bench_prompt.txt "$CTX" > "$DSPARK_IDS" <<'PYDS'
+import sys
+from tokenizers import Tokenizer
+ids = Tokenizer.from_file(sys.argv[1]).encode(open(sys.argv[2]).read()).ids[:int(sys.argv[3])]
+print(" ".join(str(i) for i in ids))
+PYDS
+echo "DSPARK_PROMPT_IDS $(wc -w < "$DSPARK_IDS")"
+
+wait_gpu_clear
+DS_OUT=/tmp/dspark_run.txt
+timeout 2400 build/runtime/dspark_tau_check "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" $(cat "$DSPARK_IDS") \
+  > "$DS_OUT" 2>&1 || {{ echo "DSPARK_RUN_FAILED -- tail of $DS_OUT:" >&2; tail -40 "$DS_OUT" >&2; }}
+grep -E '^(DSPARK|AR|draft:) ' "$DS_OUT" || true
+
+# Default 0 on a missing metric, so a crashed or truncated run reads as "no speedup, not lossless"
+# rather than inheriting whatever the caller had. The scorer treats dspark_tps==0 and lossless==0
+# as hard failures, which makes this fail-closed end to end.
+_ds_metric() {{
+  local v
+  v=$(sed -n "s/^METRIC $1 //p" "$DS_OUT" | tail -1)
+  echo "${{v:-0}}"
+}}
+echo "RESULT_DSPARK_TPS $(_ds_metric DSPARK_TPS)"
+echo "RESULT_AR_TPS $(_ds_metric AR_TPS)"
+echo "RESULT_MEAN_ACCEPT $(_ds_metric MEAN_ACCEPT)"
+echo "RESULT_LOSSLESS $(_ds_metric LOSSLESS)"
+
+# --- teacher-forced score dump (differential accuracy gate, module docstring pt. 2) ---
+# llama.cpp cannot read a compressed-tensors directory, so there is no same-weights external
+# reference available for this checkpoint. Instead score the SAME token stream on this build and
+# diff it against origin/main's dump -- see bench/scripts/accuracy_compare_pair.py.
+#
+# Tokenized with the checkpoint's OWN tokenizer.json rather than llama-tokenize: no GGUF of this
+# model is involved anywhere in this bot, and the HF tokenizer is what the server uses.
+IDS=$(python3 - "$MODEL_DIR/tokenizer.json" "$EVAL_TEXT" <<'PYTOK'
+import sys
+from tokenizers import Tokenizer
+tok = Tokenizer.from_file(sys.argv[1])
+print(" ".join(str(i) for i in tok.encode(open(sys.argv[2]).read()).ids))
+PYTOK
+) || {{ echo "TOKENIZE_FAILED" >&2; exit 1; }}
+TOKEN_COUNT=$(printf '%s' "$IDS" | wc -w)
+echo "RESULT_TOKEN_COUNT $TOKEN_COUNT"
+
+wait_gpu_clear
+build/runtime/qwen3_gguf_score "$MODEL_DIR" "$TOPK" $IDS > "$DUMP_SELF" 2>/tmp/mopt_score.err || {{
+  echo "SCORE_FAILED -- tail of /tmp/mopt_score.err:" >&2
+  tail -40 /tmp/mopt_score.err >&2
+  exit 1
+}}
+echo "ACCURACY_STAGE_DONE"
+
+if [ "$IS_PR" = "1" ]; then
+  if [ -s "$DUMP_MAIN" ]; then
+    python3 bench/scripts/accuracy_compare_pair.py "$DUMP_SELF" "$DUMP_MAIN" || true
+  else
+    echo "ACCURACY_NO_BASELINE" >&2
+  fi
+fi
+
+# Deliberately NOT run here: the batched-prefill parity check and the Qwen3.6/Qwen3.8 sweep
+# guards that pr_modelopt_bot.py runs. DSpark prefills through its own token loop (see the
+# SPARKINFER_PREFILL_BATCHED pin in dspark_tau_check.cpp) and this bot never scores prefill or
+# long context, so those three cost real GPU time per round and cannot move the scored dimension.
+# Put them back if DSpark work starts touching shared prefill code.
+"""
+
+
+def _parse_remote(stdout: str) -> dict:
+    """Markers emitted by _remote_script + the METRIC line accuracy_compare_pair.py prints.
+
+    Unlike the sibling bots, the accuracy numbers are NOT re-echoed as RESULT_* by the remote
+    bash -- the comparator's own machine-readable METRIC line is parsed directly, so there is one
+    fewer place for the two to disagree about what was measured."""
+    out = {}
+    guard36 = {}
+    guard38 = {}
+    for line in (stdout or "").splitlines():
+        if line.startswith("REMOTE_HEAD "):
+            out["head"] = line.split()[1]
+        elif line.startswith("PREFILL_PARITY_OK"):
+            out["parity_ok"] = True
+        elif line.startswith("PREFILL_PARITY_FAILED"):
+            out["parity_ok"] = False
+        elif line.startswith("PARITY worst="):
+            try:
+                out["parity_worst"] = float(line.split("worst=")[1].split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("RESULT_DSPARK_TPS "):
+            try:
+                out["dspark_tps"] = float(line.split()[1])
+            except ValueError:
+                pass
+        elif line.startswith("RESULT_AR_TPS "):
+            try:
+                out["ar_tps"] = float(line.split()[1])
+            except ValueError:
+                pass
+        elif line.startswith("RESULT_MEAN_ACCEPT "):
+            try:
+                out["mean_accept"] = float(line.split()[1])
+            except ValueError:
+                pass
+        elif line.startswith("RESULT_LOSSLESS "):
+            # Fail-closed: anything that is not exactly 1 -- including a value the harness never
+            # printed, which the remote _ds_metric defaults to 0 -- means "not proven lossless".
+            try:
+                out["lossless"] = int(float(line.split()[1])) == 1
+            except ValueError:
+                out["lossless"] = False
+        elif line.startswith("DSPARK_RUN_FAILED"):
+            out["dspark_run_failed"] = True
+        elif line.startswith("RESULT_TOKEN_COUNT "):
+            try:
+                out["token_count"] = int(line.split()[1])
+            except ValueError:
+                pass
+        elif line.startswith("METRIC "):
+            for tok in line.split()[1:]:
+                if "=" not in tok:
+                    continue
+                k, _, v = tok.partition("=")
+                if k in ("top1", "kl", "ppl_pr", "ppl_main"):
+                    try:
+                        out[k] = float(v)
+                    except ValueError:
+                        pass
+        elif line.startswith("GUARD38 "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guard38[int(parts[1])] = {"decode": float(parts[2]),
+                                              "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.startswith("GUARD38_FAILED"):
+            out["guard38_failed"] = True
+        elif line.startswith("GUARD36 "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guard36[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.strip() == "GUARD36_FAILED":
+            out["guard36_failed"] = True
+    out["guard36"] = guard36
+    out["guard38"] = guard38
+    return out
+
+
+def push_eval_polaris(host, port):
+    """Sync eval/polaris/ (judge.py + receipt.py) from a TRUSTED source (origin/main) before
+    running attestation — same protection as pr_dflash_bot.py's push_eval_polaris (a PR's own
+    checkout must never supply the code that produces its own attestation)."""
+    use_local = os.environ.get("SPARKINFER_USE_LOCAL_POLARIS", "").strip().lower() in ("1", "true", "yes")
+    tar_data = None
+    source = "local checkout"
+    extract_root = os.path.join(REMOTE_REPO, "eval")
+    if not use_local:
+        subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=ROOT, capture_output=True, timeout=120)
+        arch = subprocess.run(
+            ["git", "archive", "--format=tar.gz", "origin/main", "eval/polaris"],
+            cwd=ROOT, capture_output=True, timeout=120,
+        )
+        if arch.returncode == 0 and arch.stdout:
+            tar_data = arch.stdout
+            source = "origin/main"
+            extract_root = REMOTE_REPO
+        else:
+            print(">> WARN: origin/main eval/polaris fetch failed — refusing to fall back to the "
+                  "local working tree for a real run — attestation unavailable this run")
+            return False
+    else:
+        polaris_dir = os.path.join(HERE, "polaris")
+        if os.path.isdir(polaris_dir):
+            tar = subprocess.run(["tar", "-C", HERE, "-czf", "-", "polaris"],
+                                  capture_output=True, timeout=120)
+            if tar.returncode == 0 and tar.stdout:
+                tar_data = tar.stdout
+                source = "local checkout"
+                extract_root = os.path.join(REMOTE_REPO, "eval")
+    if tar_data is None:
+        print(">> WARN: no eval/polaris archive — attestation unavailable this run")
+        return False
+    key = os.environ.get("SSH_KEY", os.path.expanduser("~/.ssh/speedy"))
+    user = ssh_box_user() if ssh_box_enabled() else "root"
+    import tempfile
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
+            tmp.write(tar_data)
+            tmp_path = tmp.name
+        scp = subprocess.run(
+            ["scp", "-P", str(port), "-i", key, "-o", "IdentitiesOnly=yes",
+             "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "BatchMode=yes", tmp_path, f"{user}@{host}:/tmp/si_polaris_mg.tgz"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if scp.returncode != 0:
+            print(f">> WARN: eval/polaris scp failed (rc={scp.returncode}): {scp.stderr[-500:]}")
+            return False
+        extract = (
+            f"mkdir -p {shlex.quote(extract_root)} && "
+            f"tar -xzf /tmp/si_polaris_mg.tgz -C {shlex.quote(extract_root)} && "
+            "rm -f /tmp/si_polaris_mg.tgz"
+        )
+        r = ssh_run(host, port, extract, timeout=60)
+        if r.returncode != 0:
+            print(f">> WARN: eval/polaris extract failed (rc={r.returncode}): {(r.stdout + r.stderr)[-500:]}")
+            return False
+        print(f">> eval/polaris synced from {source} (trusted attestation code)")
+        return True
+    except subprocess.TimeoutExpired:
+        print(">> WARN: eval/polaris sync timed out — attestation unavailable this run")
+        return False
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
+    """Run judge.py --from-stdin (a RESULT_JSON-prefixed line, the AR bot's own generic single-
+    model shape) to assemble+sign an attestation. NOT --dflash — that mode hardcodes a
+    DFlash-shaped measurement block and eval_mode="dflash", which would be a factually wrong
+    label for a plain-AR Qwen3.8-27B eval. Never raises — a Polaris failure must not block the
+    verdict itself, only omit its receipt."""
+    if not POLARIS_ENABLED:
+        return None
+    checkout_cmd = (
+        f"cd {shlex.quote(REMOTE_REPO)} && "
+        f"git fetch -q origin {shlex.quote(pr_ref)} && git checkout -qf FETCH_HEAD"
+    )
+    r0 = ssh_run(host, port, checkout_cmd, timeout=60)
+    if r0.returncode != 0:
+        print(f">> Polaris: could not checkout {pr_ref} for attestation (rc={r0.returncode}): "
+              f"{(r0.stderr or '')[-300:]}")
+        return None
+    if not push_eval_polaris(host, port):
+        return None
+    result_json = {
+        "model": "qwen38-128",
+        "label": res.get("label"),
+        "pass": res.get("pass"),
+        "tps": res.get("pr_decode_tps"),
+        "delta_tps": (res.get("pr_decode_tps") or 0) - (res.get("main_decode_tps") or 0),
+        "pct_over_frontier": res.get("delta_pct"),
+        "score_context": 128,
+        "best_context_label": "128",
+        "ctx_128_tps": res.get("pr_decode_tps"),
+        "top1": res.get("pr_top1"),
+        "kl": res.get("pr_kl"),
+    }
+    eval_seed = f"qwen38-{int(time.time() * 1000)}"  # unique nonce per attestation
+    stdin_payload = "RESULT_JSON " + json.dumps(result_json)
+    cmd = (
+        f"cd {shlex.quote(REMOTE_REPO)} && "
+        f"SPARKINFER_EVAL_MODE=qwen38-128 SPARKINFER_DECODE_TOKENS={BENCH_TOKENS} "
+        f"SPARKINFER_EVAL_SEED={shlex.quote(eval_seed)} python3 eval/polaris/judge.py --from-stdin "
+        f"--model-file {shlex.quote(MODEL_WEIGHT_FILE)} "
+        f"--build-dir {shlex.quote(REMOTE_REPO)}/build/runtime "
+        f"--sparkinfer-root {shlex.quote(REMOTE_REPO)}"
+    )
+    try:
+        # 180s, not the siblings' 60s: judge.py sha256s --model-file, and this checkpoint's weight
+        # blob is 21 GiB -- measured 32.7s on the pinned box with a warm cache, before judge.py
+        # signs the receipt and calls the Polaris API. 60s left almost no margin for a cold read.
+        r = ssh_run(host, port, cmd, timeout=180, stdin_data=stdin_payload)
+    except Exception as e:
+        print(f">> Polaris judge SSH failed: {e}")
+        return None
+    if r.returncode != 0:
+        print(f">> Polaris judge failed (rc={r.returncode}): {(r.stderr or '')[-500:]}")
+        return None
+    polaris_line = next((l for l in (r.stdout or "").splitlines()
+                         if l.startswith("POLARIS_ATTESTATION ")), None)
+    if not polaris_line:
+        print(">> Polaris judge produced no attestation")
+        return None
+    try:
+        attestation = json.loads(polaris_line[len("POLARIS_ATTESTATION "):])
+    except json.JSONDecodeError as e:
+        print(f">> Polaris attestation JSON parse failed: {e}")
+        return None
+    privkey = arb._load_polaris_privkey()
+    if not POLARIS_API_KEY and not privkey:
+        print(">> Polaris: attestation collected but NOT signed (no key configured)")
+        return {"attestation": attestation}
+    try:
+        receipt = arb.build_polaris_receipt_from_attestation(
+            attestation, api_key=POLARIS_API_KEY, privkey=privkey, pubkey=_load_polaris_pubkey(),
+        )
+        return {"attestation": attestation, "receipt": receipt}
+    except Exception as e:
+        print(f">> Polaris signing failed: {e}")
+        return {"attestation": attestation}
+
+
+def measure_main_baseline(host, port):
+    """Measure main's decode+accuracy+Qwen3.6-guard baseline ONCE per round, not once per PR —
+    main's code can't change mid-round (the only merge in this bot's own flow is
+    try_auto_merge_qwen38, called from reconcile_qwen38_merge_labels AFTER every
+    pending PR has already been individually evaluated in main()'s loop, see call ordering
+    there), so every PR in the round comparing against a freshly-remeasured main was pure
+    redundant GPU/build time. Returns {"ok": True, **parsed} or {"ok": False, "reason", "log"}."""
+    r = _ssh_run_resilient(host, port, _remote_script("main", role="main"), "main run")
+    if r.returncode != 0:
+        tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
+        crash = _crash_reason(r.stdout, r.stderr)
+        reason = "main run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
+        return {"ok": False, "reason": reason, "log": tail}
+    main = _parse_remote(r.stdout or "")
+    # Fail closed on missing OR zero. A crashed/truncated harness run leaves _ds_metric's 0
+    # default, and a zero baseline would make tier_from_gain treat every PR as an infinite speedup
+    # on the dimension that earns a tier -- i.e. auto-merge on a broken measurement.
+    if not main.get("dspark_tps"):
+        return {"ok": False, "reason": "main run missing/zero DSpark decode@128 tok/s",
+                "log": (r.stdout or "")[-1500:]}
+    if not main.get("ar_tps"):
+        return {"ok": False, "reason": "main run missing/zero AR decode@128 tok/s",
+                "log": (r.stdout or "")[-1500:]}
+    # If MAIN is not lossless the whole round is meaningless: every PR would be compared against a
+    # baseline that is already emitting unverified tokens, and "faster than a broken reference" is
+    # not a result. Stop the round rather than scoring against it.
+    if not main.get("lossless"):
+        return {"ok": False, "reason": "main run is NOT lossless — DSpark diverged from AR on main, "
+                                       "so there is no valid baseline to score against",
+                "log": (r.stdout or "")[-1500:]}
+    main["ok"] = True
+    return main
+
+
+def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
+    """Run the PR ref's speed+accuracy script on the same box and compare against `main`, an
+    already-measured baseline shared across every PR in the round (see measure_main_baseline)."""
+    print(f">> Qwen3.8-27B eval on box: PR ref={pr_ref}")
+    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr"), "PR run")
+    if r.returncode != 0:
+        tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
+        crash = _crash_reason(r.stdout, r.stderr)
+        reason = "PR speed/accuracy run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
+        return {"ok": False, "reason": reason, "log": tail}
+    pr = _parse_remote(r.stdout or "")
+    if not pr.get("dspark_tps"):
+        return {"ok": False, "reason": "PR run missing/zero DSpark decode@128 tok/s",
+                "log": (r.stdout or "")[-1500:]}
+    if not pr.get("ar_tps"):
+        return {"ok": False, "reason": "PR run missing/zero AR decode@128 tok/s",
+                "log": (r.stdout or "")[-1500:]}
+    if "top1" not in pr or "kl" not in pr:
+        # Either the score dump failed, or main's dump was missing so the comparator never ran
+        # (ACCURACY_NO_BASELINE). Both are infra faults, but they must NOT pass as "accurate" --
+        # a gate that cannot measure fails closed, same as check_q36_guard's unavailability path.
+        return {"ok": False, "reason": "PR run missing accuracy METRIC line (score dump failed, "
+                                       "or no main baseline dump to diff against)",
+                "log": (r.stdout or "")[-1500:]}
+    print(f">> PR dspark@128={pr['dspark_tps']:.2f} (scored) "
+          f"ar@128={pr['ar_tps']:.2f} "
+          f"ratio={pr['dspark_tps'] / pr['ar_tps']:.3f}x "
+          f"tau={pr.get('mean_accept', 0):.3f} lossless={pr.get('lossless')} "
+          f"top1={pr.get('top1', 0):.4f} kl={pr.get('kl', 99):.5f}")
+
+    # One scored dimension, one floor.
+    #   * dspark-decode@128 is what earns a tier.
+    #   * ar-decode@128 is a FLOOR only (it is not in SCORING_DIMS, so it can never earn a tier).
+    #     Without it a PR could post a DSpark "speedup" by making the AR baseline slower -- they
+    #     share every target forward, so that is a one-line change away -- or could buy speculative
+    #     throughput by pessimising the ordinary serving path. Either regressing is a hard REJECT.
+    dims = [
+        ("dspark-decode@128", pr["dspark_tps"], main["dspark_tps"]),
+        ("ar-decode@128",     pr["ar_tps"],     main["ar_tps"]),
+    ]
+    scored = []
+    for name, pr_v, main_v in dims:
+        lab, dlt, ok, why = tier_from_gain(pr_v, main_v, metric=name)
+        scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
+    by_dim = {s["dim"]: s for s in scored}
+
+    # ANY dimension regressing is still a hard REJECT. prefill@16k is NOT a scoring dimension --
+    # it cannot earn a tier -- but it remains a no-regression FLOOR, because without it a PR could
+    # trade long-context prefill away to buy 128-context throughput and still auto-merge at XL.
+    # It costs nothing to keep: all three come from the one sweep.
+    regressed = [s for s in scored if s["label"] == "REJECT"]
+    if regressed:
+        worst = min(regressed, key=lambda s: s["delta"])
+        label, delta_pct, passed = "REJECT", worst["delta"], False
+        speed_reason = " | ".join(s["reason"] for s in regressed)
+        best = worst
+    else:
+        # The tier comes from the LONG-CONTEXT pair, decode@16k and prefill@16k (2026-08-17), on
+        # the ModelOpt checkpoint this bot scores. A 128-context-only improvement scores "none" by
+        # design. Written against SCORING_DIMS rather than restating its contents, because an
+        # earlier version of this comment named a different dimension than the list actually held
+        # and nobody noticed until the two were compared by hand.
+        # Best of the scoring dimensions, by measured delta. max() over deltas rather than over
+        # tier letters: two dimensions can share a bucket while one is clearly the larger win, and
+        # the delta is what the tier was derived from anyway.
+        best = max((by_dim[d] for d in SCORING_DIMS if d in by_dim),
+                   key=lambda s: s["delta"], default=by_dim[SCORING_DIM])
+        label, delta_pct, passed, speed_reason = best["label"], best["delta"], best["passed"], best["reason"]
+    dspark_label, dspark_delta_pct = by_dim["dspark-decode@128"]["label"], by_dim["dspark-decode@128"]["delta"]
+    ar_label,     ar_delta_pct     = by_dim["ar-decode@128"]["label"],     by_dim["ar-decode@128"]["delta"]
+    # Keep the speed-only verdict: `label` below can be forced to REJECT by the accuracy gate or
+    # the Qwen3.6 guard, and the comment/dashboard still need to say whether speed itself moved.
+    speed_label = label
+
+    pr_top1 = pr.get("top1", 0.0)
+    pr_kl = pr.get("kl", 99.0)
+    accuracy_ok = pr_top1 >= ACC_TOP1_BAR and pr_kl <= ACC_KL_BAR
+    reason = speed_reason
+    if not accuracy_ok:
+        # Hard REJECT regardless of speed. This gate is differential (PR vs main on the same
+        # token stream), so failing it means the PR CHANGED this model's output distribution --
+        # exactly the class of bug a speed number cannot see. Six such bugs were found by hand
+        # during Qwen3.8-27B bring-up, every one of which left throughput untouched.
+        acc_reason = (f"accuracy gate failed vs main: top1={pr_top1:.4f} (bar >={ACC_TOP1_BAR}) "
+                      f"kl={pr_kl:.5f} (bar <={ACC_KL_BAR})")
+        reason = f"{acc_reason} | speed: {speed_reason}"
+        label = "REJECT"
+        passed = False
+
+    # LOSSLESSNESS. The gate this bot exists to enforce, and the reason throughput here is not
+    # self-validating: DSpark can be made arbitrarily fast by accepting draft tokens without
+    # verifying them, which is not a faster decoder, it is a wrong one. dspark_tau_check
+    # regenerates the same prompt with the draft disabled and requires EXACT token equality.
+    #
+    # Absolute, not differential -- like the parity gate it replaces, and for the same reason: it
+    # compares the speculative path against the AR path inside the PR's own build, so it fails a
+    # run whose defect is already on main rather than only a newly introduced one. Missing => fail
+    # (the remote _ds_metric defaults it to 0), because a losslessness result that did not run is
+    # not evidence of losslessness.
+    #
+    # Real precedent, not hypothetical: leaving verify row 0 in flight while the draft ran its own
+    # block made 5-7 of 40 repeats of the SAME generation emit different tokens, and it hid for a
+    # long time because it perturbed accept GROUPING, which is invisible until the adaptive gate
+    # turns it into a different verify path. Speed alone never saw it.
+    lossless_ok = pr.get("lossless") is True
+    if not lossless_ok:
+        ls_reason = ("losslessness gate failed: DSpark output does not match the AR reference "
+                     "token-for-token" + ("" if "lossless" in pr else " (not measured)"))
+        reason = f"{ls_reason} | {reason}"
+        label = "REJECT"
+        passed = False
+
+    res = {
+        "ok": True,
+        "label": label,
+        "pass": passed and label != "REJECT",
+        "reason": reason,
+        "delta_pct": delta_pct,
+        # Generic names kept so the dashboard/scores plumbing below reads unchanged; here they mean
+        # the SCORED dimension, DSpark speculative decode at ctx=128.
+        "pr_decode_tps": pr["dspark_tps"],
+        "main_decode_tps": main["dspark_tps"],
+        "decode_delta_pct": dspark_delta_pct,
+        "decode_regressed": dspark_label == "REJECT",
+        "pr_dspark_tps": pr["dspark_tps"],
+        "main_dspark_tps": main["dspark_tps"],
+        "pr_ar_tps": pr["ar_tps"],
+        "main_ar_tps": main["ar_tps"],
+        "ar_delta_pct": ar_delta_pct,
+        "ar_regressed": ar_label == "REJECT",
+        "pr_mean_accept": pr.get("mean_accept", 0.0),
+        "main_mean_accept": main.get("mean_accept", 0.0),
+        # How far the speculative path is from being worth running at all. Below 1.0 DSpark is a
+        # net loss against ordinary AR decode; this is the number the work is trying to move.
+        "dspark_vs_ar": round(pr["dspark_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
+        "lossless": lossless_ok,
+        "scored_dimension": best["dim"],
+        "speedup_vs_main": round(pr["dspark_tps"] / main["dspark_tps"], 3) if main.get("dspark_tps") else 0,
+        "pr_top1": pr_top1,
+        "pr_kl": pr_kl,
+        "pr_ppl": pr.get("ppl_pr"),
+        "main_ppl": pr.get("ppl_main"),
+        "token_count": pr.get("token_count"),
+        "accuracy_ok": accuracy_ok,
+        "pr_head": pr.get("head"),
+        "main_head": main.get("head"),
+    }
+    # Attestation is a RECEIPT for a measurement that has already happened, not a gate on it, so it
+    # must never be able to void one. collect_polaris_attestation() already returns None on ssh
+    # failure / non-zero rc, but anything raised OUTSIDE its internal try -- building the command,
+    # a bad constant, an env lookup -- propagated all the way out of this function and cost the
+    # caller the fully-populated `res` above. Observed for real on PR #832 (2026-08-15): a NameError
+    # on a leftover DEFAULT_GGUF discarded a measured +27.7% decode speedup with top1=1.0/kl=0.0 and
+    # published eval-qwen38:REJECT with every metric None. A REJECT is close to the most expensive
+    # verdict this bot can emit, so it must be reachable only from real measurements.
+    try:
+        polaris = collect_polaris_attestation(host, port, res, pr_ref)
+        if polaris:
+            res["polaris"] = polaris
+    except Exception as e:
+        print(f">> Polaris attestation failed ({type(e).__name__}: {e}) — keeping the measurement")
+    return res
+
+
+def format_comment(commit: str, res: dict) -> str:
+    meta = {
+        "label": res.get("label"),
+        "delta_pct": res.get("delta_pct"),
+        "pr_decode_tps": res.get("pr_decode_tps"),
+        "main_decode_tps": res.get("main_decode_tps"),
+        "pr_prefill_pp": res.get("pr_prefill_pp"),
+        "main_prefill_pp": res.get("main_prefill_pp"),
+        "pr_ar_tps": res.get("pr_ar_tps"),
+        "main_ar_tps": res.get("main_ar_tps"),
+        "pr_dspark_tps": res.get("pr_dspark_tps"),
+        "main_dspark_tps": res.get("main_dspark_tps"),
+        "scored_dimension": res.get("scored_dimension"),
+        "pr_top1": res.get("pr_top1"),
+        "pr_kl": res.get("pr_kl"),
+        "pass": res.get("pass"),
+        "accuracy_ok": res.get("accuracy_ok"),
+        "lossless": res.get("lossless"),
+    }
+    marker = (
+        f"<!-- sparkinfer-modelopt-eval:{EVAL_SCHEMA_VERSION}:{commit} "
+        f"{json.dumps(meta, separators=(',', ':'))} -->"
+    )
+    if not res.get("ok"):
+        return (
+            f"{marker}\n## sparkinfer modelopt auto-eval — error\n\n"
+            f"**reason:** `{res.get('reason')}`\n\n"
+            f"<details><summary>log tail</summary>\n\n```\n{(res.get('log') or '')[:1800]}\n```\n</details>\n"
+        )
+    lab = res["label"]
+    if res.get("accuracy_ok"):
+        acc_row = (f"| accuracy gate | ✅ top1={res.get('pr_top1', 0):.3f} "
+                    f"(bar >={ACC_TOP1_BAR}) · KL={res.get('pr_kl', 0):.4f} (bar <={ACC_KL_BAR}) |\n")
+    else:
+        acc_row = (f"| accuracy gate | ❌ **FAILED** — top1={res.get('pr_top1', 0):.3f} "
+                    f"(bar >={ACC_TOP1_BAR}) · KL={res.get('pr_kl', 0):.4f} (bar <={ACC_KL_BAR}) — "
+                    "**verdict forced to REJECT regardless of speed** |\n")
+    # No "main accuracy" row: this gate is differential, so main IS the reference -- there is no
+    # separate absolute bar for it to miss.
+    main_acc_note = ""
+    if res.get("lossless"):
+        ls_row = ("| losslessness gate | ✅ DSpark output matches the AR reference token-for-token |\n")
+    else:
+        ls_row = ("| losslessness gate | ❌ **FAILED** — DSpark diverged from the AR reference — "
+                  "**verdict forced to REJECT regardless of speed** |\n")
+    polaris = res.get("polaris") or {}
+    receipt = polaris.get("receipt")
+    if receipt:
+        rtype = "TDX (Intel hardware attestation)" if receipt.get("attestation_type") == "tdx-quote" \
+            else "Ed25519 (SparkInfer key)"
+        polaris_row = f"| Polaris receipt | `{receipt.get('receipt_id', '?')[:16]}…` — {rtype} |\n"
+    elif polaris.get("attestation"):
+        polaris_row = "| Polaris receipt | collected, not signed (no key configured) |\n"
+    else:
+        polaris_row = ""
+    return (
+        f"{marker}\n## sparkinfer DSpark auto-eval — `eval-dspark:{lab}`\n\n"
+        f"| metric | value |\n|---|---|\n"
+        f"| **label** | `eval-dspark:{lab}` |\n"
+        f"| scored at | **DSpark speculative decode @ ctx=128** on the ModelOpt NVFP4 checkpoint |\n"
+        f"| **PR DSpark tok/s** | **{res.get('pr_dspark_tps', 0):.2f}** |\n"
+        f"| **main DSpark tok/s** | **{res.get('main_dspark_tps', 0):.2f}** |\n"
+        f"| **speedup vs main** | **{res.get('speedup_vs_main', 0):.3f}×** ({res.get('decode_delta_pct', 0):+.1f}%) |\n"
+        f"| PR AR tok/s (floor) | {res.get('pr_ar_tps', 0):.2f} |\n"
+        f"| main AR tok/s (floor) | {res.get('main_ar_tps', 0):.2f} |\n"
+        f"| AR vs main (floor) | {res.get('ar_delta_pct', 0):+.1f}% |\n"
+        f"| **DSpark vs AR** | **{res.get('dspark_vs_ar', 0):.3f}×** — above 1.0 means speculation finally pays |\n"
+        f"| mean accept τ | {res.get('pr_mean_accept', 0):.3f} (main {res.get('main_mean_accept', 0):.3f}, ceiling 7) |\n"
+        f"{acc_row}"
+        f"{main_acc_note}"
+        f"{ls_row}"
+        f"| PPL PR / main | {res.get('pr_ppl') or '?'} / {res.get('main_ppl') or '?'} |\n"
+        f"{polaris_row}"
+        f"| commit | `{commit[:9]}` |\n\n"
+        f"{res.get('reason') or ''}\n\n"
+        "<sub>Scored on the pinned eval box vs same-box `origin/main`: DSpark speculative decode "
+        "throughput at ctx=128 on the ModelOpt NVFP4 checkpoint, with the AR reference measured in "
+        "the same process and the same model load. Both a regression in AR decode and any "
+        "divergence from the AR token sequence are hard REJECTs — a speculative decoder that is "
+        "fast because it skips verification is not faster, it is wrong. τ is the lever: at τ≈1.4 "
+        "against a block_size of 7, DSpark is still slower than plain AR decode, so there is real "
+        "headroom here. This is informational, not a judgment on your PR: a `none` label just "
+        "means no measurable DSpark decode@128 speedup was verified, which is expected and fine if "
+        "that isn't what your change is about. "
+        "Automated — merge behaviour depends on SPARKINFER_DSPARK_AUTOMERGE.</sub>\n"
+    )
+
+
+def auto_merge_ok_qwen38(repo, num):
+    info = json.loads(arb.gh([
+        "pr", "view", str(num), "-R", repo, "--json",
+        "state,isDraft,labels,author,mergeable,files",
+    ]).stdout or "{}")
+    if info.get("state") != "OPEN" or info.get("isDraft"):
+        return False, "not an open, non-draft PR"
+    labs = {l["name"] for l in info.get("labels", [])}
+    tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
+    if not (tiers & SPEEDUP_LABELS):
+        return False, "no verified eval-qwen38:speedup label"
+    if MODELOPT_MERGE_FIRST not in labs:
+        return False, "not qwen38-merge-first"
+    blocked = labs & AUTOMERGE_BLOCK
+    if blocked:
+        return False, f"blocking label(s): {', '.join(sorted(blocked))}"
+    author = (info.get("author") or {}).get("login", "")
+    if author.lower() in arb.load_denylist():
+        return False, f"author {author} is blocked"
+    if arb.author_penalty_until(author):
+        return False, f"author {author} is under penalty"
+    sens = [f["path"] for f in info.get("files", [])
+            if any(f["path"].startswith(p) for p in arb.AUTOMERGE_SENSITIVE)]
+    if sens:
+        return False, f"touches protected paths: {', '.join(sens[:3])}"
+    if arb.pr_merge_conflict(info.get("mergeable")):
+        return False, "merge conflict with base"
+    if info.get("mergeable") != "MERGEABLE":
+        return False, f"not cleanly mergeable ({info.get('mergeable')})"
+    return True, "ok"
+
+
+# The README's Qwen3.8 ModelOpt table is regenerated between these markers. Everything outside
+# them is prose and is never touched, so the table can be machine-written without a generator
+# owning the whole document.
+# No README auto-refresh here, unlike pr_modelopt_bot.py. See the auto-merge site below for why:
+# the published Qwen3.8 tables are AR serving speed, and DSpark is not yet faster than AR.
+
+
+def upload_qwen38_eval_log(repo, num, title, oid, res):
+    """Commit the eval result (+ Polaris receipt/attestation) to sparkinfer-log, mirroring
+    pr_dflash_bot.py's upload_dflash_eval_log with a qwen38-prefixed run id."""
+    try:
+        rid = f"qwen38-{int(num):04d}-{oid[:7]}"
+        arb._ensure_log_repo()
+        rundir = os.path.join(arb.LOG_DIR, "runs", rid)
+        os.makedirs(rundir, exist_ok=True)
+        polaris = res.get("polaris") or {}
+        receipt = polaris.get("receipt")
+        result = {
+            "id": rid, "pr": int(num), "title": title,
+            "url": f"https://github.com/{repo}/pull/{num}", "commit": oid[:7],
+            "eval_mode": "qwen38-128",
+            "label": res.get("label"), "pass": res.get("pass"), "reason": res.get("reason"),
+            "delta_pct": res.get("delta_pct"),
+            "pr_decode_tps": res.get("pr_decode_tps"), "main_decode_tps": res.get("main_decode_tps"),
+            "pr_prefill_pp": res.get("pr_prefill_pp"), "main_prefill_pp": res.get("main_prefill_pp"),
+            "prefill_delta_pct": res.get("prefill_delta_pct"),
+            "pr_ar_tps": res.get("pr_ar_tps"),
+            "main_ar_tps": res.get("main_ar_tps"),
+            "prefill16k_delta_pct": res.get("prefill16k_delta_pct"),
+            "pr_dspark_tps": res.get("pr_dspark_tps"),
+            "main_dspark_tps": res.get("main_dspark_tps"),
+            "decode16k_delta_pct": res.get("decode16k_delta_pct"),
+            "scored_dimension": res.get("scored_dimension"),
+            "speedup_vs_main": res.get("speedup_vs_main"),
+            "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
+            "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
+            "accuracy_ok": res.get("accuracy_ok"),
+            "lossless": res.get("lossless"), "dspark_vs_ar": res.get("dspark_vs_ar"),
+            "gpu": "pinned eval box", "date": arb.datetime.date.today().isoformat(),
+        }
+        if receipt:
+            result["polaris"] = True
+            result["polaris_receipt_id"] = receipt.get("receipt_id")
+        json.dump(result, open(os.path.join(rundir, "result.json"), "w"), indent=2)
+        if polaris.get("attestation"):
+            json.dump(polaris["attestation"], open(os.path.join(rundir, "attestation.json"), "w"), indent=2)
+        if receipt:
+            json.dump(receipt, open(os.path.join(rundir, "receipt.json"), "w"), indent=2)
+        ipath = os.path.join(arb.LOG_DIR, "index.json")
+        idx = json.load(open(ipath)) if os.path.exists(ipath) else []
+        idx = [e for e in idx if e.get("id") != rid]
+        idx_entry = {"id": rid, "pr": int(num), "title": title, "label": res.get("label"),
+                     "delta_pct": res.get("delta_pct"), "eval_mode": "qwen38-128", "date": result["date"]}
+        if receipt:
+            idx_entry["polaris"] = True
+            idx_entry["polaris_receipt_id"] = receipt.get("receipt_id", "")[:16]
+        idx.append(idx_entry)
+        idx.sort(key=lambda x: x["id"])
+        json.dump(idx, open(ipath, "w"), indent=2)
+        subprocess.run(["git", "-C", arb.LOG_DIR, "add", "-A"], check=True)
+        msg = f"qwen38-eval: #{num} {oid[:7]} -> eval-qwen38:{res.get('label')}"
+        if receipt:
+            msg += f" + polaris {receipt.get('receipt_id', '?')[:16]}"
+        commit = subprocess.run(["git", "-C", arb.LOG_DIR, "commit", "-q", "-m", msg], check=False)
+        if commit.returncode != 0:
+            print(">> modelopt eval-log upload skipped: nothing to commit")
+            return None
+        push = subprocess.run(["git", "-C", arb.LOG_DIR, "push", "-q"], check=False)
+        if push.returncode != 0:
+            print(f">> modelopt eval-log push failed (rc={push.returncode})")
+            return None
+        url = arb.LOG_PAGE + rid
+        print(f">> modelopt eval log: {url}")
+        return url
+    except Exception as e:
+        print(f">> modelopt eval-log upload failed: {e}")
+        return None
+
+
+def apply_result(repo, num, commit, res, title="", dry_run=False):
+    body = format_comment(commit, res)
+    label = res.get("label") if res.get("ok") else "REJECT"
+    if not res.get("ok"):
+        label = "REJECT"
+    print(f"PR #{num}: eval-modelopt:{label}  "
+          f"decode PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')}  "
+          f"prefill PR={res.get('pr_prefill_pp')} main={res.get('main_prefill_pp')}  "
+          f"from={res.get('scored_dimension')}  "
+          f"top1={res.get('pr_top1')} kl={res.get('pr_kl')}  "
+          f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
+          f"lossless={res.get('lossless')} "
+          f"tau={res.get('pr_mean_accept', 0):.3f} "
+          f"dspark_vs_ar={res.get('dspark_vs_ar', 0):.3f}x")
+    if dry_run:
+        print(body[:500])
+        return
+    strip_qwen38_eval_labels(repo, num)
+    if label in SPEEDUP_LABELS:
+        # A fresh, valid speedup score for the CURRENT head commit means this PR is caught up
+        # with main and deserves a fair shot at winning the next merge-first reconciliation --
+        # clear any stale needs-rebase from a round it lost (or an old conflict that's since been
+        # resolved). Found 2026-08-13: reconcile_qwen38_merge_labels() filters candidates on
+        # `MODELOPT_NEEDS_REBASE not in labs` (this bot's own "who's eligible to win" gate) but
+        # the ONLY place that ever removed the label was the winner-selection branch itself --
+        # a PR that lost one round, or ever hit a transient merge conflict, could never be
+        # reconsidered again even after a completely clean re-evaluation confirmed its score,
+        # since it was filtered out of candidacy before scoring was ever compared. Hit #790 and
+        # #791 both losing merge-first to a strictly worse score for exactly this reason.
+        arb.remove_label(repo, num, MODELOPT_NEEDS_REBASE)
+    arb.add_label(repo, num, f"{EVAL_PREFIX}{label}")
+    # Mirrored to the generic `eval:*` label, same as pr_dflash_bot.py -- SN74 scoring reads
+    # eval:* tiers, so this makes Qwen3.8-27B submissions count toward that live incentive
+    # mechanism. Explicit user decision, 2026-08-11 (originally deliberately NOT mirrored, given
+    # Qwen3.8-27B's youth at the time -- see git history on this line for that reasoning).
+    for lab in {l for l in arb.labels_on(repo, num) if l.startswith("eval:")}:
+        arb.remove_label(repo, num, lab)
+    arb.add_label(repo, num, f"eval:{label}")
+    # The verdict comment is the ONLY place a contributor sees why their PR was labelled and (for
+    # a non-speedup) closed, so a dropped post is worse than a dropped label. Post via the REST
+    # issues endpoint rather than `gh pr comment`: the latter resolves the PR through a GraphQL
+    # query that now fails outright on this repo with "Projects (classic) is being deprecated ...
+    # (repository.pullRequest.projectCards)", independent of any outage. Then CHECK it -- a
+    # silently-failed comment is what left PR #862 closed with a label and no result on
+    # 2026-08-17, while the round logged a clean pass.
+    c = arb.gh(["api", f"repos/{repo}/issues/{num}/comments",
+                "--method", "POST", "--field", f"body={body}"])
+    if c is None or c.returncode != 0:
+        print(f">> ERROR: PR #{num}: verdict comment FAILED to post — the PR now carries a label "
+              f"with no visible explanation. Verdict body follows so the round is not lost:\n"
+              f"{body[:900]}", file=sys.stderr)
+    if res.get("ok"):
+        upload_qwen38_eval_log(repo, num, title, commit, res)
+    if res.get("ok") and res.get("delta_pct") is not None:
+        scores = _load_scores()
+        scores[str(num)] = {
+            "commit": commit,
+            "label": label,
+            "delta_pct": res.get("delta_pct"),
+            "pr_decode_tps": res.get("pr_decode_tps"),
+            "main_decode_tps": res.get("main_decode_tps"),
+            # The full 128/4k/16k pair set, so refresh_readme_modelopt() can rebuild the published
+            # table from a merged PR's stored score without re-benchmarking. Only decode@16k is
+            # scored; the rest ride along from the same sweep.
+            "pr_dspark_tps": res.get("pr_dspark_tps"),
+            "pr_mean_accept": res.get("pr_mean_accept"),
+            "pr_prefill_pp": res.get("pr_prefill_pp"),
+            "dspark_vs_ar": res.get("dspark_vs_ar"),
+            "pr_ar_tps": res.get("pr_ar_tps"),
+            "pr_top1": res.get("pr_top1"),
+            "pr_kl": res.get("pr_kl"),
+            "pass": res.get("pass"),
+            "accuracy_ok": res.get("accuracy_ok"),
+            "lossless": res.get("lossless"),
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        _save_scores(scores)
+        # Auto-close on "none"/"REJECT" -- same policy as pr_dflash_bot.py. Re-enabled 2026-08-11
+        # after an explicit, informed decision: the very first supervised run of this bot closed a
+        # real external contributor's unrelated PR (#768) this exact same way, since
+        # arb.greenlight_status() is generic (any PR with a checked "tested" box + a decode/
+        # prefill before/after table) and matches essentially any performance PR in the repo, not
+        # just Muse-Glimmer-relevant ones -- "none" is the expected, non-judgmental outcome for
+        # most PRs this bot evaluates, not a rejection of the PR's actual purpose. That PR was
+        # reopened + apologized for. The user was told this risk explicitly and chose to accept it
+        # (broad scope, matching pr_dflash_bot.py) rather than narrow evaluation to only
+        # Muse-Glimmer-relevant PRs. If this causes another wrongful close, reopen + apologize the
+        # same way, and reconsider the scope-narrowing alternative that was declined here.
+        if label in ("none", "REJECT"):
+            if not res.get("lossless", True):
+                fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
+            elif not res.get("accuracy_ok"):
+                fail_clause = "and failed the accuracy gate"
+            elif res.get("decode_regressed") and res.get("prefill_regressed"):
+                fail_clause = "(decode@128 and prefill@128 regression)"
+            elif res.get("decode_regressed"):
+                fail_clause = "(decode@128 regression)"
+            elif res.get("prefill_regressed"):
+                fail_clause = "(prefill@128 regression)"
+            elif label == "none":
+                fail_clause = "with no verified prefill@16k improvement (the only scored dimension)"
+            else:
+                fail_clause = "(regression)"
+            close_body = (
+                "<!-- sparkinfer-qwen38-auto-close -->\n"
+                f"## Closed: sparkinfer modelopt auto-eval — `eval-modelopt:{label}`\n\n"
+                f"This PR's Qwen3.8-27B prefill@16k speed measured **{res.get('delta_pct')}%** "
+                f"vs main, {fail_clause} "
+                "— closing automatically. This bot evaluates every eligible PR in the repo "
+                "against Qwen3.8-27B's decode AND prefill@128 speed specifically, regardless of "
+                "what the PR is actually about — a close here isn't a judgment on the PR's purpose, "
+                "just that it didn't move these particular metrics. Reopen (or open a fresh PR) if "
+                "you have a fix or a different approach."
+            )
+            arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
+            arb.gh(["pr", "close", str(num), "-R", repo])
+            print(f">> auto-closed PR #{num} (eval-modelopt:{label})")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Qwen3.8-27B ModelOpt 128-decode PR eval bot")
+    ap.add_argument("--instance", type=int, default=0)
+    ap.add_argument("--repo", default="gittensor-ai-lab/sparkinfer")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--reeval", action="store_true")
+    ap.add_argument("--labels-only", action="store_true",
+                    help="reconcile qwen38-merge-first only — no GPU")
+    ap.add_argument("--only-prs", default="",
+                    help="comma-separated PR numbers (bypass greenlight)")
+    args = ap.parse_args()
+
+    only = {int(x) for x in args.only_prs.split(",") if x.strip().isdigit()}
+
+    print(f">> modelopt eval transport: "
+          f"{'ssh' if ssh_box_enabled() else f'vast.ai (instance {arb.current_instance(args.instance) or args.instance})'}")
+    print(f">> AUTOMERGE={int(AUTO_MERGE)}")
+
+    if args.labels_only:
+        reconcile_qwen38_merge_labels(args.repo, dry_run=args.dry_run)
+        print("done — modelopt labels only (no GPU).")
+        return
+
+    prs = json.loads(arb.gh([
+        "pr", "list", "-R", args.repo, "--state", "open",
+        "--json", "number,title,labels,isDraft,headRefOid,headRefName,mergeable,author,body",
+        "--limit", "80",
+    ]).stdout or "[]")
+    prs.sort(key=lambda p: p["number"])
+
+    stale_closed = close_stale_qwen38_prs(args.repo, prs, dry_run=args.dry_run) if not only else set()
+
+    denylist = arb.load_denylist()
+    pending = []
+    for pr in prs:
+        num = pr["number"]
+        if num in stale_closed:
+            continue
+        if only and num not in only:
+            continue
+        if pr.get("isDraft"):
+            continue
+        # Gate — blocked contributor: never spend GPU on a flagged/sybil PR. Checks the opener
+        # AND every commit's author/committer (arb.pr_involved_logins), not just the PR's own
+        # author field — same "Gate 1" pattern pr_eval_bot.py's AR bot already uses, reused
+        # verbatim rather than reinvented.
+        hits = arb.pr_involved_logins(args.repo, num) & denylist
+        if hits:
+            print(f"PR #{num}: BLOCKED (denylisted: {', '.join(sorted(hits))}) — flag + close, no eval")
+            if not args.dry_run:
+                arb.close_blocked_pr(args.repo, num, hits)
+            continue
+        labs = {l["name"] for l in pr.get("labels", [])}
+        if arb.HOLD_LABEL in labs:
+            print(f"PR #{num}: hold — skip")
+            continue
+        head = (pr.get("headRefOid") or "")[:40]
+        short = head[:9]
+        if not args.reeval and head and head in qwen38_evaluated_commits(args.repo, num):
+            print(f"PR #{num} @ {short}: already modelopt-evaluated — skip")
+            continue
+        if arb.pr_merge_conflict(pr.get("mergeable")):
+            print(f"PR #{num}: merge conflict — modelopt-needs-rebase")
+            if not args.dry_run:
+                arb.add_label(args.repo, num, MODELOPT_NEEDS_REBASE)
+            continue
+
+        if not only:
+            status, why = arb.greenlight_status(args.repo, num, labs)
+            if status != "ok":
+                print(f"PR #{num}: not greenlit ({why}) — skip modelopt eval")
+                continue
+            print(f"PR #{num}: greenlit ({why})")
+        else:
+            print(f"PR #{num}: --only-prs targeted")
+
+        ref = f"pull/{num}/head"
+        pending.append((num, head, short, ref, pr.get("title", "")))
+
+    if not pending:
+        reconcile_qwen38_merge_labels(args.repo, dry_run=args.dry_run)
+        print("done — no modelopt PRs to evaluate.")
+        return
+
+    if args.dry_run:
+        print("--- dry-run would evaluate: " + ", ".join(f"#{n}" for n, *_ in pending))
+        return
+
+    pin = arb.PINNED_INSTANCE
+    if pin and not ssh_box_enabled():
+        with open(arb.INSTANCE_FILE, "w") as f:
+            f.write(str(pin))
+
+    try:
+        host, port = resolve_ssh(args.instance)
+    except Exception as e:
+        print(f">> GPU unavailable: {e}")
+        reconcile_qwen38_merge_labels(args.repo, dry_run=False)
+        print("done — modelopt labels only (GPU down).")
+        return
+
+    _ssh_user = ssh_box_user() if ssh_box_enabled() else "root"
+    print(f">> SSH {_ssh_user}@{host}:{port}")
+
+    print(">> measuring main baseline (once for this round, shared across all pending PRs) …")
+    main_result = measure_main_baseline(host, port)
+    if not main_result.get("ok"):
+        # No usable baseline -> nothing in this round can be scored. Bail out here rather than
+        # burning GPU time building N different PR branches against a baseline we already know
+        # is broken, and rather than posting a misleading per-PR "main run failed" on every
+        # pending PR for what is really one shared infra problem.
+        print(f">> main baseline measurement failed: {main_result.get('reason')} — skipping round")
+        reconcile_qwen38_merge_labels(args.repo, dry_run=False)
+        print("done — modelopt round skipped (main baseline unusable).")
+        return
+    # main has no top1/kl of its own: it IS the accuracy reference, and its score dump was just
+    # written to SCORE_DUMP_MAIN for each PR in this round to diff against.
+    print(f">> main baseline: dspark@128={main_result['dspark_tps']:.2f} tok/s (scored) "
+          f"ar@128={main_result['ar_tps']:.2f} tok/s "
+          f"ratio={main_result['dspark_tps'] / main_result['ar_tps']:.3f}x "
+          f"tau={main_result.get('mean_accept', 0):.3f} lossless={main_result.get('lossless')}")
+
+    for num, head, short, ref, title in pending:
+        print(f"PR #{num} @ {short}: evaluating Qwen3.8-27B '{ref}' …")
+        try:
+            res = eval_qwen38_on_box(host, port, ref, main_result)
+        except Exception as e:
+            res = {"ok": False, "reason": f"exception: {e}"}
+        apply_result(args.repo, num, head or short, res, title=title, dry_run=False)
+
+    reconcile_qwen38_merge_labels(args.repo, dry_run=False)
+    print("done — modelopt eval pass complete.")
+
+
+if __name__ == "__main__":
+    main()

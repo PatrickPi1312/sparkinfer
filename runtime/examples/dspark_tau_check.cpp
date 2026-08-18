@@ -5,13 +5,22 @@
 // (mtp_num_hidden_layers=1). If DSpark lands tau ~4-5 it is clearly the better path; if it lands
 // ~2 then MTP is simpler for the same benefit.
 //
-// It is measured BEFORE the expensive part is built, deliberately. Both speculative paths are
-// currently gated behind the same missing piece: dflash_verify_short_run rejects dense_ffn (its
-// guards want !c.dense_ffn and n_experts==256, written for Qwen3.6-35B-A3B's MoE), and Qwen3.8 is
-// dense_ffn with n_experts==1. So dflash_generate here falls back to the token-loop verify, which
-// per DFlash's own measurements never saves a target forward -- this run reports tau and
-// LOSSLESSNESS, not throughput. Throughput needs the dense-FFN verify branch, and tau is what
-// says whether to write it.
+// Tau was measured BEFORE the expensive part was built, deliberately: both speculative paths were
+// gated behind dflash_verify_short_run rejecting dense_ffn (its guards wanted !c.dense_ffn and
+// n_experts==256, written for Qwen3.6-35B-A3B's MoE), and Qwen3.8 is dense_ffn with n_experts==1.
+// That branch now exists, so this reports THROUGHPUT as well as tau and losslessness, and is the
+// harness the hourly DSpark decode@128 eval scores.
+//
+// Read the three together. Throughput conditional on lossless=YES is the only meaningful number --
+// a speculative decoder that emits unverified tokens is not fast, it is wrong -- and tau is the
+// lever that moves it: at tau 1.42 against a block_size of 7, DSpark spends a full draft forward
+// per step to save roughly a third of one target forward, which is why DSPARK_TPS currently lands
+// BELOW AR_TPS. Closing that gap is the optimisation this tool measures.
+//
+// The env pins below are deliberately NOT production defaults; they exist to make AR and DSpark
+// comparable in one process. Both legs run under the same pins and the scored metric is relative
+// (PR vs main on the same box, same pins), so the offset cancels -- but do not read AR_TPS here as
+// the serving decode rate, which qwen3_gguf_bench measures without them.
 //
 // Usage: dspark_tau_check <qwen38_checkpoint_dir> <dspark_draft_dir> <max_new> <id0> [id1 ...]
 
@@ -170,8 +179,16 @@ int main(int argc, char** argv) {
     // does not control.
     model.set_dflash_draft(nullptr);
     model.set_dflash_capture(false, {}, 0);
-    const std::vector<int> ar = model.generate(prompt, max_new);
+    // Time the reference too. DECODE-only (not wall clock): the pins above force AR's prefill onto
+    // the token loop for comparability, so a wall-clock rate here would report a deliberately
+    // pessimised prefill, not decode. Both this and DSpark's stats.decode_s below exclude prefill,
+    // which is what makes AR_TPS and DSPARK_TPS directly comparable -- and what lets this harness
+    // report throughput at all, which it previously declined to do because the dense-FFN verify
+    // branch did not exist yet (see the header comment).
+    double ar_ttft_s = 0, ar_decode_s = 0;
+    const std::vector<int> ar = model.generate(prompt, max_new, nullptr, &ar_ttft_s, &ar_decode_s);
     if (ar.empty()) { printf("[FAIL] AR reference produced nothing\n"); return 1; }
+    const double ar_tps = ar_decode_s > 0 ? (double)ar.size() / ar_decode_s : 0.0;
 
     // AR determinism probe (SPARKINFER_DSPARK_AR_REPS=N). Repeats the SAME reference generation in
     // this one already-loaded process and reports any rep that disagrees with the first -- the
@@ -378,5 +395,20 @@ int main(int argc, char** argv) {
            stats.mean_accept, stats.steps, spec.size(), stats.decode_s);
     printf("DSPARK lossless=%s  matched %zu/%zu\n", same == n ? "YES" : "NO", same, n);
     printf("DSPARK ceiling: block_size=%d (MTP's ceiling is 2)\n", dc.block_size);
+
+    const double spec_tps = stats.decode_s > 0 ? (double)spec.size() / stats.decode_s : 0.0;
+    printf("AR     %.2f tok/s  (decode %.3fs, ttft %.3fs)\n", ar_tps, ar_decode_s, ar_ttft_s);
+    printf("DSPARK %.2f tok/s  (decode %.3fs)  = %.3fx AR\n",
+           spec_tps, stats.decode_s, ar_tps > 0 ? spec_tps / ar_tps : 0.0);
+
+    // Machine-readable tail for the eval bot. LOSSLESS is emitted as 1/0 rather than YES/NO so a
+    // parser that silently fails to find it reads as 0 (reject) and not as a pass -- the same
+    // fail-closed shape the modelopt bot uses for a missing decode metric. It is a GATE, not a
+    // score: a speculative decoder that is fast because it emits unverified tokens is not faster,
+    // it is wrong, so throughput here is only meaningful conditional on this being 1.
+    printf("METRIC AR_TPS %.4f\n", ar_tps);
+    printf("METRIC DSPARK_TPS %.4f\n", spec_tps);
+    printf("METRIC MEAN_ACCEPT %.4f\n", stats.mean_accept);
+    printf("METRIC LOSSLESS %d\n", same == n ? 1 : 0);
     return 0;
 }
