@@ -1519,8 +1519,21 @@ def auto_merge_ok_qwen38(repo, num):
         return False, f"author {author} is blocked"
     if arb.author_penalty_until(author):
         return False, f"author {author} is under penalty"
+    # arb.AUTOMERGE_SENSITIVE covers eval/ and bench/scripts/ but NOT runtime/examples/, which is
+    # where THIS bot's measuring instrument lives. dspark_tau_check.cpp decides what "DSpark decode
+    # @4k" even means: it picks the env pins both legs run under, it computes the throughput, and it
+    # renders the losslessness verdict. A PR that edits it does not make inference faster, it makes
+    # the benchmark report a different number -- and because the bot builds the PR's own harness and
+    # compares it against main's, such a change measures as a speedup and would have auto-merged
+    # into the instrument that scores everything after it.
+    #
+    # Not hypothetical: PR #871 proposed exactly this (drop the NSPLITS pin, "+6.8%
+    # dspark-decode@128") and nothing in the auto-merge gate would have stopped it. Blocking is not
+    # a veto -- harness changes can still be merged by a human, which is the right bar for a change
+    # to the thing doing the measuring.
+    sensitive = tuple(arb.AUTOMERGE_SENSITIVE) + ("runtime/examples/",)
     sens = [f["path"] for f in info.get("files", [])
-            if any(f["path"].startswith(p) for p in arb.AUTOMERGE_SENSITIVE)]
+            if any(f["path"].startswith(p) for p in sensitive)]
     if sens:
         return False, f"touches protected paths: {', '.join(sens[:3])}"
     if arb.pr_merge_conflict(info.get("mergeable")):
