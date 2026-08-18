@@ -234,6 +234,27 @@ DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "4096"))
 # therefore a strict improvement that is UNVERIFIED against a live instance -- and it becomes load
 # bearing exactly when tau rises, which is the entire point of the work it guards.
 DSPARK_SPEC_REPS = int(os.environ.get("DSPARK_SPEC_REPS", "3"))
+
+# Files that define WHAT IS MEASURED rather than what runs. A PR touching any of these is not
+# evaluated at all -- it is not a question of whether the change is good.
+#
+# dspark_tau_check.cpp picks the env both legs run under, computes the throughput, and renders the
+# losslessness verdict; bench_prompt_4k.txt is the prompt every score is taken on. Changing either
+# moves the baseline for every contributor at once, including the one proposing it. Scoring such a
+# PR would mean scoring the ruler, and the incentive that creates is to argue with the measurement
+# instead of improving the engine.
+#
+# This is policy, not a quality judgement, and it applies even when the diff is CORRECT. #871 and
+# #875 both identified a real defect in the NSPLITS pin -- verified: the pin costs 35% of decode at
+# ctx=4096 -- and both were still closed, because the fix belongs to whoever owns the harness. The
+# other half of the same problem is #872, which optimised the regime the pin creates: +11.8%
+# measured, -0.3% in production, auto-merged at tier L before anyone could read it.
+HARNESS_PATHS = (
+    "runtime/examples/dspark_tau_check.cpp",
+    "bench/scripts/bench_prompt_4k.txt",
+    "eval/",
+    "bench/scripts/",
+)
 BENCH_TOKENS = int(os.environ.get("MODELOPT_BENCH_TOKENS", "128"))
 ACC_TOPK = int(os.environ.get("MODELOPT_ACC_TOPK", "128"))
 # Batched-prefill parity floor: the fraction of the continuation that batched prefill must still
@@ -1843,7 +1864,9 @@ def main():
 
     prs = json.loads(arb.gh([
         "pr", "list", "-R", args.repo, "--state", "open",
-        "--json", "number,title,labels,isDraft,headRefOid,headRefName,mergeable,author,body",
+        # `files` is REQUIRED by the harness-touch check below. Without it pr.get("files") is None,
+        # the check silently never fires, and a harness PR sails through to a full round.
+        "--json", "number,title,labels,isDraft,headRefOid,headRefName,mergeable,author,body,files",
         "--limit", "80",
     ]).stdout or "[]")
     prs.sort(key=lambda p: p["number"])
@@ -1878,6 +1901,28 @@ def main():
         short = head[:9]
         if not args.reeval and head and head in qwen38_evaluated_commits(args.repo, num):
             print(f"PR #{num} @ {short}: already dspark-evaluated — skip")
+            continue
+        # Before the greenlight and before any GPU time: does this PR edit the measuring
+        # instrument? Checked here rather than at auto-merge because a harness PR should not
+        # consume a 20-minute round to produce a number that cannot be accepted either way.
+        touched = [f.get("path", "") for f in (pr.get("files") or [])]
+        harness_hits = [t for t in touched if any(t.startswith(h) for h in HARNESS_PATHS)]
+        if harness_hits:
+            print(f"PR #{num}: touches the eval harness ({', '.join(harness_hits[:3])}) — not evaluated")
+            if not args.dry_run and not qwen38_evaluated_commits(args.repo, num):
+                arb.gh(["pr", "comment", str(num), "-R", args.repo, "--body",
+                        "<!-- sparkinfer-dspark-harness -->\n"
+                        "**Not evaluated — this PR changes the eval harness.**\n\n"
+                        f"Touched: {', '.join('`' + h + '`' for h in harness_hits)}\n\n"
+                        "These files define what every PR is *measured against* — the env both legs "
+                        "run under, how throughput is computed, what counts as lossless, and the "
+                        "prompt every score is taken on. A change to them moves the baseline for "
+                        "everyone at once, so they are maintained by the project rather than "
+                        "accepted through the contribution flow. This is policy and applies even "
+                        "when the change is correct.\n\n"
+                        "If you have found a genuine defect in the harness, please open an **issue** "
+                        "describing it — that is welcome and useful, and at least one such report "
+                        "has already led to a fix. Engine changes are evaluated as normal."])
             continue
         if arb.pr_merge_conflict(pr.get("mergeable")):
             print(f"PR #{num}: merge conflict — dspark-needs-rebase")
