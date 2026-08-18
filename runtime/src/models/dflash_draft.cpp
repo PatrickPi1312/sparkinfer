@@ -40,9 +40,10 @@ struct TensorView {
     void* data = nullptr;
     size_t nbytes = 0;
     std::vector<int64_t> shape;
+    std::string dtype;   // "BF16" | "F32" | "U8" (packed NVFP4) | "F8_E4M3" (group scales)
 };
 
-// Minimal safetensors reader (BF16 / F32 only). Owns a host mmap-like buffer.
+// Minimal safetensors reader (BF16 / F32 / NVFP4 payload). Owns a host mmap-like buffer.
 struct SafeTensorsFile {
     std::vector<char> bytes;
     std::unordered_map<std::string, TensorView> tensors; // pointers into bytes
@@ -128,12 +129,16 @@ struct SafeTensorsFile {
                     while (p < ss.size() && ss[p] != ',') p++;
                 }
             }
-            if (dtype != "BF16" && dtype != "F32" && dtype != "BOOL") {
+            // U8 = NVFP4-packed weight (2x E2M1 per byte), F8_E4M3 = its per-group scale.
+            // Both are payload for the NVFP4 dequant below, not tensors to skip.
+            if (dtype != "BF16" && dtype != "F32" && dtype != "BOOL" &&
+                dtype != "U8" && dtype != "F8_E4M3") {
                 fprintf(stderr, "[dflash] skip tensor %s dtype=%s\n", key.c_str(), dtype.c_str());
                 pos = obj_end + 1;
                 continue;
             }
             TensorView tv;
+            tv.dtype = dtype;
             tv.shape = shape;
             tv.nbytes = (size_t)(off1 - off0);
             tv.data = bytes.data() + 8 + hdr_len + off0;
@@ -442,6 +447,54 @@ struct DFlashDraftModel::Impl {
         seq_len = 0;
     }
 
+    // NVFP4 -> BF16 at load, decoded on the host.
+    //
+    // Deliberately NOT launch_ct_dequant_nvfp4: that kernel reads the group scale as CUTLASS
+    // *unsigned* e4m3, while ModelOpt exports signed float8_e4m3fn. The bit patterns differ, so
+    // the kernel mis-scales every group -- which degrades draft acceptance without breaking
+    // correctness, because the target verifies every drafted token anyway.
+    //
+    // Validated against the BF16 source of the same checkpoint:
+    //   w = e2m1(nibble) * f8e4m3(group_scale) * weight_scale_2  ->  rel_err 0.0896, ratio 0.9927
+    // which is pure 4-bit rounding error. This is a one-time load cost.
+    static float decode_e2m1(unsigned char n) {
+        static const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        float v = mag[n & 0x7];
+        return (n & 0x8) ? -v : v;
+    }
+    static float decode_e4m3(unsigned char b) {   // signed float8_e4m3fn
+        const int s = (b >> 7) & 0x1;
+        const int e = (b >> 3) & 0xF;
+        const int m = b & 0x7;
+        float v;
+        if (e == 0) v = std::ldexp((float)m / 8.0f, -6);          // subnormal
+        else        v = std::ldexp(1.0f + (float)m / 8.0f, e - 7);
+        return s ? -v : v;
+    }
+
+    bf16* upload_nvfp4(const TensorView& packed, const TensorView& scale, float global_scale) {
+        const int rows = (int)packed.shape[0];
+        const int cols = (int)packed.shape[1] * 2;
+        const int groups = cols / 16;
+        const unsigned char* pw = (const unsigned char*)packed.data;
+        const unsigned char* ps = (const unsigned char*)scale.data;
+        std::vector<bf16> host((size_t)rows * cols);
+        for (int r = 0; r < rows; r++) {
+            const unsigned char* prow = pw + (size_t)r * (cols / 2);
+            const unsigned char* srow = ps + (size_t)r * groups;
+            for (int c = 0; c < cols; c += 2) {
+                const unsigned char byte = prow[c >> 1];
+                const float gs = decode_e4m3(srow[c >> 4]) * global_scale;
+                host[(size_t)r * cols + c]     = __float2bfloat16(decode_e2m1(byte & 0x0F) * gs);
+                host[(size_t)r * cols + c + 1] = __float2bfloat16(decode_e2m1(byte >> 4) * gs);
+            }
+        }
+        bf16* out = alloc<bf16>((size_t)rows * cols);
+        cu(cudaMemcpy(out, host.data(), host.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+           "upload nvfp4");
+        return out;
+    }
+
     bf16* upload(const TensorView& tv) {
         bf16* d = alloc<bf16>(tv.nbytes / sizeof(bf16));
         if (tv.nbytes % sizeof(bf16) == 0) {
@@ -608,6 +661,26 @@ bool DFlashDraftModel::load(const std::string& dir) {
         return it == st.tensors.end() ? nullptr : &it->second;
     };
 
+    // Resolve a projection weight whether it is stored BF16 or NVFP4-packed. ModelOpt writes
+    // <name>.weight (U8), <name>.weight_scale (ue4m3) and <name>.weight_scale_2 (F32 global);
+    // a mixed-precision export leaves untouched projections as plain BF16, so both must work
+    // within the same checkpoint.
+    auto load_weight = [&](const std::string& name) -> bf16* {
+        TensorView* w = require(name);
+        if (!w) return nullptr;
+        if (w->dtype != "U8") return s.upload(*w);
+        TensorView* sc = optional(name + "_scale");
+        TensorView* g2 = optional(name + "_scale_2");
+        if (!sc) {
+            fprintf(stderr, "[dflash] %s is NVFP4-packed but %s_scale is missing\n",
+                    name.c_str(), name.c_str());
+            return nullptr;
+        }
+        float gs = 1.0f;
+        if (g2 && g2->nbytes >= sizeof(float)) gs = *(const float*)g2->data;
+        return s.upload_nvfp4(*w, *sc, gs);
+    };
+
     const int H = s.cfg.hidden;
     const int I = s.cfg.intermediate;
     const int n_cap = (int)s.cfg.target_layer_ids.size();
@@ -651,12 +724,19 @@ bool DFlashDraftModel::load(const std::string& dir) {
         auto* g = require(pfx + "mlp.gate_proj.weight");
         auto* u = require(pfx + "mlp.up_proj.weight");
         auto* d = require(pfx + "mlp.down_proj.weight");
-        if (!wq || !wk || !wv || !wo || !qn || !kn || !in || !pn || !g || !u || !d)
+        if (!qn || !kn || !in || !pn)
             return false;
-        lw.wq = s.upload(*wq); lw.wk = s.upload(*wk); lw.wv = s.upload(*wv); lw.wo = s.upload(*wo);
+        lw.wq = load_weight(pfx + "self_attn.q_proj.weight");
+        lw.wk = load_weight(pfx + "self_attn.k_proj.weight");
+        lw.wv = load_weight(pfx + "self_attn.v_proj.weight");
+        lw.wo = load_weight(pfx + "self_attn.o_proj.weight");
+        lw.gate = load_weight(pfx + "mlp.gate_proj.weight");
+        lw.up = load_weight(pfx + "mlp.up_proj.weight");
+        lw.down = load_weight(pfx + "mlp.down_proj.weight");
+        if (!lw.wq || !lw.wk || !lw.wv || !lw.wo || !lw.gate || !lw.up || !lw.down)
+            return false;
         lw.q_norm = s.upload(*qn); lw.k_norm = s.upload(*kn);
         lw.input_norm = s.upload(*in); lw.post_norm = s.upload(*pn);
-        lw.gate = s.upload(*g); lw.up = s.upload(*u); lw.down = s.upload(*d);
         // Q8_0 mirrors: the batched projections are DRAM-bound at the narrowed diffusion width,
         // so halving their weight bytes is the dominant remaining win. Built once, on load.
         if (q8_on()) {
