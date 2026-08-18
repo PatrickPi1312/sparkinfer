@@ -279,7 +279,7 @@ def _save_scores(data):
         with open(SCORES_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        print(f">> modelopt scores save skipped: {e}")
+        print(f">> dspark scores save skipped: {e}")
 
 
 def _report_pct(pct: float, reject: bool = False) -> float:
@@ -1118,7 +1118,7 @@ def measure_main_baseline(host, port):
 def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     """Run the PR ref's speed+accuracy script on the same box and compare against `main`, an
     already-measured baseline shared across every PR in the round (see measure_main_baseline)."""
-    print(f">> Qwen3.8-27B eval on box: PR ref={pr_ref}")
+    print(f">> DSpark eval on box: PR ref={pr_ref}")
     r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr"), "PR run")
     if r.returncode != 0:
         tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
@@ -1419,7 +1419,7 @@ def auto_merge_ok_qwen38(repo, num):
     if not (tiers & SPEEDUP_LABELS):
         return False, "no verified eval-qwen38:speedup label"
     if MODELOPT_MERGE_FIRST not in labs:
-        return False, "not qwen38-merge-first"
+        return False, "not dspark-merge-first"
     blocked = labs & AUTOMERGE_BLOCK
     if blocked:
         return False, f"blocking label(s): {', '.join(sorted(blocked))}"
@@ -1458,10 +1458,10 @@ def try_auto_merge_qwen38(repo, num):
             print(">> dspark auto-merge: branch policy blocked — retrying with --admin")
             r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash", "--admin"])
     if r.returncode == 0:
-        print(f">> DSPARK AUTO-MERGED #{num} (qwen38-merge-first)")
+        print(f">> DSPARK AUTO-MERGED #{num} (dspark-merge-first)")
         arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
                 "<!-- sparkinfer-dspark-automerge -->\n"
-                "Auto-merged as the round's `qwen38-merge-first` winner — verified same-box "
+                "Auto-merged as the round's `dspark-merge-first` winner — verified same-box "
                 "128-token decode speedup over `main`, accuracy-gated vs llama.cpp."])
         return True
     print(f">> dspark auto-merge BLOCKED #{num}: {(r.stderr or r.stdout or '')[:200]}")
@@ -1580,17 +1580,17 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
             msg += f" + polaris {receipt.get('receipt_id', '?')[:16]}"
         commit = subprocess.run(["git", "-C", arb.LOG_DIR, "commit", "-q", "-m", msg], check=False)
         if commit.returncode != 0:
-            print(">> modelopt eval-log upload skipped: nothing to commit")
+            print(">> dspark eval-log upload skipped: nothing to commit")
             return None
         push = subprocess.run(["git", "-C", arb.LOG_DIR, "push", "-q"], check=False)
         if push.returncode != 0:
-            print(f">> modelopt eval-log push failed (rc={push.returncode})")
+            print(f">> dspark eval-log push failed (rc={push.returncode})")
             return None
         url = arb.LOG_PAGE + rid
         print(f">> dspark eval log: {url}")
         return url
     except Exception as e:
-        print(f">> modelopt eval-log upload failed: {e}")
+        print(f">> dspark eval-log upload failed: {e}")
         return None
 
 
@@ -1721,7 +1721,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--reeval", action="store_true")
     ap.add_argument("--labels-only", action="store_true",
-                    help="reconcile qwen38-merge-first only — no GPU")
+                    help="reconcile dspark-merge-first only — no GPU")
     ap.add_argument("--only-prs", default="",
                     help="comma-separated PR numbers (bypass greenlight)")
     args = ap.parse_args()
@@ -1734,7 +1734,7 @@ def main():
 
     if args.labels_only:
         reconcile_qwen38_merge_labels(args.repo, dry_run=args.dry_run)
-        print("done — modelopt labels only (no GPU).")
+        print("done — dspark labels only (no GPU).")
         return
 
     prs = json.loads(arb.gh([
@@ -1773,10 +1773,10 @@ def main():
         head = (pr.get("headRefOid") or "")[:40]
         short = head[:9]
         if not args.reeval and head and head in qwen38_evaluated_commits(args.repo, num):
-            print(f"PR #{num} @ {short}: already modelopt-evaluated — skip")
+            print(f"PR #{num} @ {short}: already dspark-evaluated — skip")
             continue
         if arb.pr_merge_conflict(pr.get("mergeable")):
-            print(f"PR #{num}: merge conflict — modelopt-needs-rebase")
+            print(f"PR #{num}: merge conflict — dspark-needs-rebase")
             if not args.dry_run:
                 arb.add_label(args.repo, num, MODELOPT_NEEDS_REBASE)
             continue
@@ -1784,7 +1784,7 @@ def main():
         if not only:
             status, why = arb.greenlight_status(args.repo, num, labs)
             if status != "ok":
-                print(f"PR #{num}: not greenlit ({why}) — skip modelopt eval")
+                print(f"PR #{num}: not greenlit ({why}) — skip dspark eval")
                 continue
             print(f"PR #{num}: greenlit ({why})")
         else:
@@ -1812,7 +1812,7 @@ def main():
     except Exception as e:
         print(f">> GPU unavailable: {e}")
         reconcile_qwen38_merge_labels(args.repo, dry_run=False)
-        print("done — modelopt labels only (GPU down).")
+        print("done — dspark labels only (GPU down).")
         return
 
     _ssh_user = ssh_box_user() if ssh_box_enabled() else "root"
