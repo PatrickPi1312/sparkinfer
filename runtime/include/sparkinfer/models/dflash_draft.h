@@ -34,6 +34,16 @@ struct DFlashDraftConfig {
     // UNVERIFIED carry-over (no DFlash accuracy/SPEC_AGREE evaluation has run yet) -- if Muse
     // Glimmer draft proposals look wrong, check this flag first.
     bool rope_normal = false;
+
+    // YaRN rotary scaling (RadixArk/Qwen3.8-27B-DSpark ships rope_type: "yarn"). factor <= 1
+    // disables it and the draft uses plain theta^(-2i/d), so existing checkpoints are unaffected.
+    // These cannot be folded into rope_theta: YaRN's NTK-by-parts ramp scales each frequency band
+    // differently -- measured on this checkpoint, 36 of 64 bands are divided by `factor` and only
+    // 15 are untouched -- and it additionally scales cos/sin magnitude by 0.1*ln(factor)+1.
+    float yarn_factor = 0.f;          // "factor" (32.0 for DSpark); <= 1 => no YaRN
+    int   yarn_orig_max_pos = 0;      // "original_max_position_embeddings" (8192)
+    float yarn_beta_fast = 32.f;
+    float yarn_beta_slow = 1.f;
 };
 
 class DFlashDraftModel {
@@ -80,10 +90,14 @@ public:
     //   proposals:     how many rows after the seed to score (0 = the built-in default). The
     //                  verifier picks this by context length, so the draft has to be told rather
     //                  than deciding for itself, or the two disagree on how long a block is.
+    //   out_confidence: optional, [1..proposals] host logits from DSpark's confidence head (raw
+    //                  logit, not sigmoid'd -- sigmoid on the caller side if a probability is
+    //                  needed). Left untouched (whatever the caller passed in) for checkpoints
+    //                  without a confidence head, or when nullptr.
     bool forward_block(const void* target_hidden, int ctx_len,
                        const int* noise_ids, int pos0,
                        int* out_argmax, cudaStream_t stream = nullptr,
-                       int proposals = 0);
+                       int proposals = 0, float* out_confidence = nullptr);
 
     // Apply target lm_head to last forward's hidden states; writes device logits [block, vocab]
     // and host argmax. Called internally by forward_block; exposed for debugging.

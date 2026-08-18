@@ -765,6 +765,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph);
         s.cu_exec = nullptr; s.cu_graph = nullptr; s.graph_ready = false;
     }
+    // The check above only forces recapture of the PLAIN decode graph. DFlash's own forward_token
+    // calls (AR+capture isolation, and the token-loop verify) route through dflash_cap=true, which
+    // replays s.cu_dflash_exec instead -- an early return further below that skips all the
+    // debug/dump code entirely once that graph is warm, so SPARKINFER_MG_DUMP_STEP silently only
+    // ever captured the plain-AR-reference call otherwise (found 2026-08-17 bisecting a dspark
+    // divergence that turned out to be unrelated -- kept because the gap was real).
+    if (mgd && s.dflash_graph_ready) {
+        cudaGraphExecDestroy(s.cu_dflash_exec); cudaGraphDestroy(s.cu_dflash_graph);
+        s.cu_dflash_exec = nullptr; s.cu_dflash_graph = nullptr; s.dflash_graph_ready = false;
+    }
     auto dbg_bf16 = [&](const void* p, int n, int tag, int layer) {
         if (mgd) kernels::launch_mg_debug_bf16(p, n, tag, layer, position, st);
     };
@@ -1977,10 +1987,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         cu(cudaMemcpy(host.data(), s.dbg_xn_dump, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
            "dbg_xn_dump readback");
         const char* path = getenv("SPARKINFER_MG_DUMP_FILE");
-        FILE* f = fopen(path ? path : "/tmp/mg_xn_dump.bin", "wb");
+        // This fires on EVERY call at this position, not just the first, so a process that calls
+        // forward_token(_, dump_step, true) more than once (AR ref, then AR+capture isolation, then
+        // DFlash's own token loop) used to silently overwrite the same file. Suffix with a call
+        // counter so each occurrence survives.
+        static int mgdump_call = 0;
+        std::string path_s = std::string(path ? path : "/tmp/mg_xn_dump.bin") + "." + std::to_string(mgdump_call++);
+        FILE* f = fopen(path_s.c_str(), "wb");
         if (f) { fwrite(host.data(), sizeof(bf16), host.size(), f); fclose(f); }
         fprintf(stderr, "[mg-debug] dumped xn[layer,H=%d] for step=%d, %d layers -> %s\n",
-                H, position, c.n_layers, path ? path : "/tmp/mg_xn_dump.bin");
+                H, position, c.n_layers, path_s.c_str());
     }
     return *s.h_out_id;
 }
@@ -2252,6 +2268,20 @@ void Qwen35Model::invalidate_decode_graph() {
         s.dflash_graph_ready = false;
         s.dflash_graph_attn_mode = -1;
         s.dflash_graph_sparse = false;
+    }
+    // The PREFILL graph has to go too, for the same reason as the two above: every attention
+    // kernel node in it was captured with `btable` (kv->block_table(active_seq_id)) baked in as a
+    // literal argument, so replaying it after the active session changed reads and appends KV
+    // through the OLD session's block table -- which by then is typically freed. This function is
+    // what activate_session() calls precisely to mean "the session identity underneath the graphs
+    // just moved", and leaving one of the three graphs behind made that promise false.
+    if (s.graph_prefill_ready) {
+        cudaGraphExecDestroy(s.cu_prefill_exec);
+        cudaGraphDestroy(s.cu_prefill_graph);
+        s.cu_prefill_exec = nullptr;
+        s.cu_prefill_graph = nullptr;
+        s.graph_prefill_ready = false;
+        s.graph_prefill_attn_mode = -1;
     }
 }
 
@@ -3019,6 +3049,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     int th_len = n;
 
     std::vector<int> block(B), posterior(B), draft_ids(B);
+    std::vector<float> draft_confidence(B + 1, 0.f);
     // Proposal depth (also sets the draft's active diffusion width, depth+1). 5 is the measured
     // optimum at short context: accept length rises only 5.33 -> 5.95 -> 6.43 going to depth 6 and
     // 7, while each extra verify row costs a flat ~0.74 ms, so depth 6 already loses there.
@@ -3169,15 +3200,54 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // draft block on its own stream. Ordering matters: the target must be in flight before
         // the draft's launches start, or the draft queues ahead of it. A deferred collect also
         // avoids spawning and joining a std::thread on every decode step.
+        // Overlap DEFAULT OFF (2026-08-17): leaving verify row 0 in flight while the draft issues
+        // its block on another stream breaks DFlash's lossless guarantee. Measured on
+        // Qwen3.8-27B + DSpark by repeating the SAME speculative generation in one process
+        // (dspark_tau_check's SPARKINFER_DSPARK_SPEC_REPS): 5-7 of 40 repeats emitted a different
+        // token sequence, and those repeats also stopped matching plain AR. Serialising here --
+        // the ONLY change -- gives 0 of 40 on the same prompt, twice, on two different prompts.
+        //
+        // What the overlap perturbs is the ACCEPT GROUPING, and that is why this hid for so long:
+        // in the token loop a different grouping is invisible, because every emitted token is a
+        // target argmax at its own position either way, so the output is identical and only `keep`
+        // moves. The adaptive gate is what turns it into a correctness bug -- compact_score arms
+        // the batched verify on a full-block accept, so a grouping that races into keep ==
+        // kProposalDepth+1 switches the next step's verify path and changes what is emitted.
+        // Consistent with every bisection result: the compact path alone (which never overlaps)
+        // was clean 0/25, the token loop alone was clean 0/40 despite ALSO overlapping (grouping
+        // varies but tokens do not), and only the adaptive mix flaked.
+        //
+        // Ruled out first, each with its own experiment: uninitialised capture buffers (poisoning
+        // dflash_hidden/dflash_context/th_scratch with 0x00 and 0xff both still flaked), the GDN
+        // projection fork onto stream_k (SPARKINFER_DFLASH_SHARED_STREAM=0 still flaked 7/40),
+        // mid-stream entry into the batched verify (forced at steps 0/1/3/8: all lossless), a
+        // single armed compact step followed by a return to the token loop (lossless), the plain
+        // AR path (30 in-process repeats plus 20 fresh processes, identical) and the capture-ON
+        // target path with no draft at all (40 repeats, identical).
+        //
+        // The exact racing object is NOT yet identified, so this disables the optimisation rather
+        // than claiming to have repaired it. Cost, measured: decode 1.322 -> 1.376 s on the prose
+        // prompt (+4.1%) and 1.303 -> 1.347 s on the numeric one (+3.4%), tau unchanged in both.
+        // SPARKINFER_DFLASH_OVERLAP=1 restores it for anyone measuring that trade deliberately.
+        static const bool overlap_on = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_OVERLAP");
+            return e && e[0] == '1';
+        }();
         int p0 = -1;
         if (!compact_verify) {
             set_dflash_capture_row(0);
-            s.defer_decode_sync = true;
+            s.defer_decode_sync = overlap_on;
             p0 = forward_token(block[0], start, true);
             s.defer_decode_sync = false;
         }
         const bool draft_ok = draft.forward_block(
-            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth);
+            draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth,
+            draft_confidence.data());
+        if (getenv("SPARKINFER_DFLASH_CONFIDENCE_DEBUG")) {
+            fprintf(stderr, "[confidence-debug] start=%d confidence=[", start);
+            for (int i = 1; i <= kProposalDepth; i++) fprintf(stderr, "%.3f ", draft_confidence[i]);
+            fprintf(stderr, "]\n");
+        }
         if (!compact_verify && p0 == kDFlashDeferred) {
             cu(cudaStreamSynchronize(s.stream), "verify0 sync");
             s.decode_pending = false;
@@ -3207,8 +3277,23 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             vfail = p0 < 0;
             posterior[0] = p0;
         }
+        // Confidence-gated early stop (opt-in, off by default -- SPARKINFER_DFLASH_CONFIDENCE_GATE
+        // sets the raw-logit threshold, no default because there is no calibration data yet for
+        // this checkpoint's actual accept-rate distribution against THIS target). DSpark's
+        // confidence head predicts position i's own accept probability; comparing raw logits
+        // against a raw-logit threshold is equivalent to comparing sigmoid(logit) against
+        // sigmoid(threshold), so no sigmoid is needed here. This forfeits an occasional accept
+        // (a position gated out that would have matched) in exchange for skipping a target
+        // forward predicted unlikely to pay off -- a lossless-preserving trade since forfeiting an
+        // accept just means treating it as rejected, never emitting an unverified token.
+        static const float kConfidenceGate = []{
+            const char* e = getenv("SPARKINFER_DFLASH_CONFIDENCE_GATE");
+            return e ? (float)atof(e) : 0.f;
+        }();
+        static const bool confidence_gate_on = getenv("SPARKINFER_DFLASH_CONFIDENCE_GATE") != nullptr;
         if (!compact_verify && !vfail && block[1] == p0) {
             for (int i = 1; i <= kProposalDepth; i++) {
+                if (i > 1 && confidence_gate_on && draft_confidence[i] < kConfidenceGate) break;
                 set_dflash_capture_row(i);
                 const int p = forward_token(block[i], start + i, true);
                 if (p < 0) { vfail = true; break; }

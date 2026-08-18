@@ -125,8 +125,18 @@ __global__ void k_rms_heads(bf16* x, const bf16* w, int seq, int n_heads, int d,
 // two per layer for q and k is 24 launches a draft block spends on ~37 us of work; the draft is
 // launched eagerly (no graph), so each one also pays a full launch gap. One warp per (token, head)
 // as in k_rms_heads, then the same rotation k_rope applies, in the same order per element.
+// inv_freq (optional, [d/2]): precomputed per-dimension rotary frequencies. Null keeps the
+// original inline theta^(-2i/d), so every existing caller is bit-identical. Non-null is how YaRN
+// is expressed: its NTK-by-parts ramp scales each frequency band differently, so it CANNOT be
+// folded into a single theta. Measured for RadixArk/Qwen3.8-27B-DSpark (factor 32, orig_max 8192):
+// 36 of 64 bands are divided by 32 and only 15 are untouched, so running plain RoPE here leaves
+// the draft's attention badly mis-phased -- the silent failure mode that shows up purely as a
+// collapsed acceptance rate.
+// att_scale: YaRN's attention_factor (0.1*ln(factor)+1 = 1.3466 here), a magnitude scaling on
+// cos/sin. 1.0f for non-YaRN callers.
 __global__ void k_rms_heads_rope(bf16* x, const bf16* w, int seq, int n_heads, int d,
-                                 float eps, int pos0, float theta) {
+                                 float eps, int pos0, float theta,
+                                 const float* inv_freq, float att_scale) {
     const int idx = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (idx >= seq * n_heads) return;
     bf16* h = x + (size_t)idx * d;
@@ -145,9 +155,10 @@ __global__ void k_rms_heads_rope(bf16* x, const bf16* w, int seq, int n_heads, i
     const int pos = pos0 + (idx / n_heads);
     const int half = d / 2;
     for (int i = lane; i < half; i += 32) {
-        const float freq = 1.f / powf(theta, (float)(2 * i) / (float)d);
+        const float freq = inv_freq ? inv_freq[i]
+                                    : 1.f / powf(theta, (float)(2 * i) / (float)d);
         const float ang = (float)pos * freq;
-        const float c = cosf(ang), sn = sinf(ang);
+        const float c = cosf(ang) * att_scale, sn = sinf(ang) * att_scale;
         const float x0 = b2f(h[i]), x1 = b2f(h[i + half]);
         h[i] = f2b(x0 * c - x1 * sn);
         h[i + half] = f2b(x0 * sn + x1 * c);
@@ -1195,12 +1206,13 @@ void launch_add_rms(const void* a, const void* b, void* sum, const void* w, void
 }
 
 void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
-                           int pos0, float theta, cudaStream_t stream) {
+                           int pos0, float theta, cudaStream_t stream,
+                           const float* inv_freq, float att_scale) {
     if (seq <= 0 || n_heads <= 0) return;
     constexpr int WPB = 4;
     const int total = seq * n_heads;
     k_rms_heads_rope<<<(total + WPB - 1) / WPB, WPB * 32, 0, stream>>>(
-        (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta);
+        (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta, inv_freq, att_scale);
 }
 
 // See k_rms_heads_rope_normal for why Muse Glimmer's DFlash draft needs this consecutive-pair
@@ -1423,7 +1435,7 @@ __global__ void k_gdn_scan_commit_layers(
     const bf16* __restrict__ beta_base,
     const GdnCommitLayer* __restrict__ layers,
     float* __restrict__ live_base, size_t live_stride,
-    int n_tokens, int q_heads, int v_heads) {
+    int n_tokens, int q_heads, int v_heads, bool qh_block) {
     constexpr int NROW = HEAD_DIM / 32;
     const int li = blockIdx.z;
     const int vh = blockIdx.x;
@@ -1439,7 +1451,11 @@ __global__ void k_gdn_scan_commit_layers(
     const bf16* a = reinterpret_cast<const bf16*>(layers[li].a);
     float* live_state = live_base + live_stride * L;
 
-    const int qh = vh % q_heads;
+    // Must match df_gdn_scan_checkpoint_kernel's qh mapping exactly (batched_prefill.cu) -- this
+    // used to hardcode vh % q_heads unconditionally, silently using the wrong K/Q head for every
+    // qh_block=true model (Qwen3.8-27B) on every commit, corrupting the carried-forward GDN state
+    // one round at a time even though each round's own verify computation was itself correct.
+    const int qh = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
     const int q_dim = q_heads * HEAD_DIM;
     const int v_dim = v_heads * HEAD_DIM;
     const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
@@ -1494,14 +1510,14 @@ void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
                                    const void* beta_base, const GdnCommitLayer* layers,
                                    float* live_base, size_t live_layer_stride,
                                    int n_layers, int n_tokens, int q_heads, int v_heads,
-                                   int head_dim, cudaStream_t stream) {
+                                   int head_dim, bool qh_block, cudaStream_t stream) {
     if (n_tokens <= 0 || head_dim != 128 || n_layers <= 0) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS, n_layers);
     k_gdn_scan_commit_layers<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
         (const bf16*)k_base, k_layer_stride, (const bf16*)v_base, v_layer_stride,
         (const bf16*)alpha_base, ab_layer_stride, (const bf16*)beta_base, layers,
-        live_base, live_layer_stride, n_tokens, q_heads, v_heads);
+        live_base, live_layer_stride, n_tokens, q_heads, v_heads, qh_block);
 }
 
 namespace {
@@ -1521,6 +1537,49 @@ __global__ void k_broadcast_rows_i32(const int* __restrict__ src, int* __restric
     if (i >= n * rows) return;
     dst[i] = src[i % n];
 }
+
+// bias[v] = sum_r(w1[prev_token][r] * w2[v][r]), added in place to logits[v]. rank is small
+// (256 for the checkpoints this has been measured against) so the whole latent vector for this
+// call's prev_token fits comfortably in shared memory and is reused by every thread in the block.
+// out_latent (optional, nullptr to skip) gets the same latent -- the confidence head reads it
+// back as part of its own input, so it's cheaper to save it here than re-look-up the embedding.
+__global__ void k_markov_bias_add(const bf16* __restrict__ w1, const bf16* __restrict__ w2,
+                                  const int* __restrict__ prev_token, float* __restrict__ logits,
+                                  int vocab, int rank, float* __restrict__ out_latent) {
+    extern __shared__ float latent[];
+    const int tok = *prev_token;
+    const bf16* w1_row = w1 + (size_t)tok * rank;
+    for (int r = threadIdx.x; r < rank; r += blockDim.x) latent[r] = b2f(w1_row[r]);
+    __syncthreads();
+    if (out_latent && blockIdx.x == 0)
+        for (int r = threadIdx.x; r < rank; r += blockDim.x) out_latent[r] = latent[r];
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= vocab) return;
+    const bf16* w2_row = w2 + (size_t)v * rank;
+    float acc = 0.f;
+    for (int r = 0; r < rank; r++) acc += latent[r] * b2f(w2_row[r]);
+    logits[v] += acc;
+}
+
+// confidence_logit = dot(hidden[H], w[0:H]) + dot(latent[rank], w[H:H+rank]) + bias -- a single
+// linear layer over the concatenation of this row's hidden state and its Markov latent, matching
+// DSpark's AcceptRatePredictor(confidence_head_with_markov=True). One block, block-wide reduction
+// (H+rank is a few thousand elements, comfortably one launch).
+__global__ void k_confidence_head(const bf16* __restrict__ hidden, const float* __restrict__ latent,
+                                  const bf16* __restrict__ w, float bias_val, int H, int rank,
+                                  float* __restrict__ out_confidence) {
+    extern __shared__ float sred[];
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) acc += b2f(hidden[i]) * b2f(w[i]);
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) acc += latent[i] * b2f(w[H + i]);
+    sred[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sred[threadIdx.x] += sred[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out_confidence = sred[0] + bias_val;
+}
 } // namespace
 
 void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int dst_row_stride,
@@ -1537,6 +1596,24 @@ void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaSt
     if (total <= 0) return;
     const int threads = 256;
     k_broadcast_rows_i32<<<(total + threads - 1) / threads, threads, 0, stream>>>(src, dst, n, rows);
+}
+
+void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,
+                            float* logits, int vocab, int rank, cudaStream_t stream,
+                            float* out_latent) {
+    if (vocab <= 0 || rank <= 0) return;
+    const int threads = 256;
+    const int blocks = (vocab + threads - 1) / threads;
+    k_markov_bias_add<<<blocks, threads, rank * sizeof(float), stream>>>(
+        (const bf16*)w1, (const bf16*)w2, prev_token, logits, vocab, rank, out_latent);
+}
+
+void launch_confidence_head(const void* hidden, const float* latent, const void* w, float bias,
+                            int H, int rank, float* out_confidence, cudaStream_t stream) {
+    if (H <= 0 || rank < 0) return;
+    const int threads = 256;
+    k_confidence_head<<<1, threads, threads * sizeof(float), stream>>>(
+        (const bf16*)hidden, latent, (const bf16*)w, bias, H, rank, out_confidence);
 }
 
 } // namespace dflash_kernels

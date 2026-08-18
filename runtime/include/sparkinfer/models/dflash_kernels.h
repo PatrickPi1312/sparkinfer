@@ -122,8 +122,12 @@ void launch_rms_heads(void* x, const void* w, int seq, int n_heads, int d,
 
 // Per-head RMSNorm followed by RoPE, same buffer, one launch. Same math and order as calling
 // launch_rms_heads then launch_rope_seq.
+// inv_freq (optional, [d/2]) + att_scale carry YaRN. Null/1.0f => the original inline
+// theta^(-2i/d), bit-identical for every pre-existing caller. YaRN's NTK-by-parts ramp scales each
+// frequency band differently, so it cannot be folded into theta; see k_rms_heads_rope.
 void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
-                           int pos0, float theta, cudaStream_t stream);
+                           int pos0, float theta, cudaStream_t stream,
+                           const float* inv_freq = nullptr, float att_scale = 1.0f);
 
 // Same as launch_rms_heads_rope, but "normal" (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE
 // pairing instead of NeoX split-half. Needed for the Muse Glimmer DFlash draft checkpoint --
@@ -144,7 +148,11 @@ void launch_rms_heads_rope_normal(void* x, const void* w, int seq, int n_heads, 
 // two per-layer weight vectors are not strided and are passed as device pointers.
 //
 // The per-layer arithmetic and reduction order are unchanged, so each layer's committed state is
-// bit-identical to running the single-layer kernels one at a time.
+// bit-identical to running the single-layer kernels one at a time -- PROVIDED qh_block is threaded
+// through (fixed 2026-08-17, see launch_gdn_scan_commit_layers's own note below; this comment was
+// wrong from the day the optimization was written -- k_gdn_scan_commit_layers hardcoded the
+// vh % q_heads mapping and silently dropped the vh / (v_heads/q_heads) branch checkpoint kernels
+// use for qh_block models like Qwen3.8-27B).
 struct GdnCommitLayer { const void* dt; const void* a; int layer; };
 
 void launch_gdn_conv_commit_layers(const void* qkv_base, size_t qkv_layer_stride,
@@ -159,7 +167,7 @@ void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
                                    const void* beta_base, const GdnCommitLayer* layers,
                                    float* live_base, size_t live_layer_stride,
                                    int n_layers, int n_tokens, int q_heads, int v_heads,
-                                   int head_dim, cudaStream_t stream);
+                                   int head_dim, bool qh_block, cudaStream_t stream);
 
 // Copy nodes are barriers inside the verify graph. The batched verify records two kinds of
 // device-to-device copy per replay -- one 2-D copy per captured layer to stage the draft's target
@@ -174,6 +182,27 @@ void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int d
                          cudaStream_t stream);
 
 void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream);
+
+// DSpark's Markov head: a low-rank learned bigram bias, added in place to one row of draft
+// logits. bias[v] = sum_r(w1[prev_token][r] * w2[v][r]) -- w1 is a [verifier_vocab, rank]
+// embedding table (indexed by the token id immediately preceding the position being predicted),
+// w2 is a [draft_vocab, rank] projection back to vocab space. prev_token is read from DEVICE
+// memory (not passed by value) so a chain of calls on the same stream can each depend on the
+// previous call's own argmax result without a host round-trip in between -- required because the
+// bias for block position k conditions on position k's own token, which for k>0 is only known
+// once position k-1's (already Markov-corrected) argmax has been computed. out_latent (optional,
+// nullptr to skip) receives the same [rank] latent vector this call already computed, for the
+// confidence head below to reuse instead of re-doing the embedding lookup.
+void launch_markov_bias_add(const void* w1, const void* w2, const int* prev_token,
+                            float* logits, int vocab, int rank, cudaStream_t stream,
+                            float* out_latent = nullptr);
+
+// DSpark's confidence head (AcceptRatePredictor): a single linear layer over concat(hidden[H],
+// markov_latent[rank]) -> one logit, predicting this draft position's acceptance probability
+// (sigmoid it on the host if a probability is needed; raw logit is enough for threshold
+// comparisons). `latent` must already hold the SAME row's Markov latent (see out_latent above).
+void launch_confidence_head(const void* hidden, const float* latent, const void* w, float bias,
+                            int H, int rank, float* out_confidence, cudaStream_t stream);
 
 } // namespace dflash_kernels
 } // namespace sparkinfer

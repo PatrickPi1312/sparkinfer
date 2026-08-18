@@ -40,9 +40,10 @@ struct TensorView {
     void* data = nullptr;
     size_t nbytes = 0;
     std::vector<int64_t> shape;
+    std::string dtype;   // "BF16" | "F32" | "U8" (packed NVFP4) | "F8_E4M3" (group scales)
 };
 
-// Minimal safetensors reader (BF16 / F32 only). Owns a host mmap-like buffer.
+// Minimal safetensors reader (BF16 / F32 / NVFP4 payload). Owns a host mmap-like buffer.
 struct SafeTensorsFile {
     std::vector<char> bytes;
     std::unordered_map<std::string, TensorView> tensors; // pointers into bytes
@@ -128,12 +129,16 @@ struct SafeTensorsFile {
                     while (p < ss.size() && ss[p] != ',') p++;
                 }
             }
-            if (dtype != "BF16" && dtype != "F32" && dtype != "BOOL") {
+            // U8 = NVFP4-packed weight (2x E2M1 per byte), F8_E4M3 = its per-group scale.
+            // Both are payload for the NVFP4 dequant below, not tensors to skip.
+            if (dtype != "BF16" && dtype != "F32" && dtype != "BOOL" &&
+                dtype != "U8" && dtype != "F8_E4M3") {
                 fprintf(stderr, "[dflash] skip tensor %s dtype=%s\n", key.c_str(), dtype.c_str());
                 pos = obj_end + 1;
                 continue;
             }
             TensorView tv;
+            tv.dtype = dtype;
             tv.shape = shape;
             tv.nbytes = (size_t)(off1 - off0);
             tv.data = bytes.data() + 8 + hdr_len + off0;
@@ -176,6 +181,42 @@ bool parse_config_json(const std::string& path, DFlashDraftConfig& cfg) {
     find_int("vocab_size", cfg.vocab);
     find_int("sliding_window", cfg.sliding_window);
     find_float("rms_norm_eps", cfg.rms_eps);
+    find_int("block_size", cfg.block_size);
+    // YaRN lives under "rope_parameters". Only applied when rope_type is actually yarn -- a
+    // checkpoint carrying factor but rope_type "linear"/"default" must not silently get YaRN.
+    if (j.find("\"yarn\"") != std::string::npos) {
+        find_float("factor", cfg.yarn_factor);
+        find_int("original_max_position_embeddings", cfg.yarn_orig_max_pos);
+        find_float("beta_fast", cfg.yarn_beta_fast);
+        find_float("beta_slow", cfg.yarn_beta_slow);
+    }
+    find_int("mask_token_id", cfg.mask_token_id);
+
+    // DSpark (RadixArk/Qwen3.8-27B-DSpark) nests the draft-specific settings under
+    // "dflash_config", and its target_layer_ids differ from this struct's Qwen3.6 default both in
+    // VALUE and in COUNT: [4,16,28,40,52] (5 captures) vs {1,6,11,16,22,27,32,37} (8). The count
+    // is load-bearing -- fc.weight is [hidden, n_cap*hidden], so leaving the default in place
+    // makes the loader demand a [5120, 40960] projector against the checkpoint's [5120, 25600]
+    // and fail outright. Parse the list rather than inheriting it.
+    {
+        size_t p = j.find("\"target_layer_ids\"");
+        if (p != std::string::npos) {
+            size_t a = j.find('[', p), b = j.find(']', a);
+            if (a != std::string::npos && b != std::string::npos) {
+                std::vector<int> ids;
+                const char* q = j.c_str() + a + 1;
+                const char* end = j.c_str() + b;
+                while (q < end) {
+                    char* nx = nullptr;
+                    long v = strtol(q, &nx, 10);
+                    if (nx == q) { q++; continue; }
+                    ids.push_back((int)v);
+                    q = nx;
+                }
+                if (!ids.empty()) cfg.target_layer_ids = ids;
+            }
+        }
+    }
     // rope_theta nested
     size_t rp = j.find("\"rope_theta\"");
     if (rp != std::string::npos) {
@@ -262,6 +303,9 @@ struct DFlashDraftModel::Impl {
     DFlashDraftConfig cfg;
     std::vector<LayerWeights> layers;
     bf16* fc = nullptr;           // [H, n_cap * H] as [out, in] for gemv
+    // YaRN rotary table (null unless the checkpoint configures rope_type "yarn").
+    float* d_yarn_inv_freq = nullptr;   // [head_dim/2]
+    float  yarn_att_scale = 1.0f;
     bf16* hidden_norm = nullptr;
     bf16* final_norm = nullptr;
     std::vector<void*> owned;
@@ -278,6 +322,22 @@ struct DFlashDraftModel::Impl {
     unsigned char* lm_head_i4 = nullptr;
     float* lm_head_i4_scale = nullptr;
 
+    // DSpark's Markov head (optional -- absent for plain DFlash drafts, e.g. Qwen3.6-35B-A3B's).
+    // markov_w1 [vocab, markov_rank]: embedding table indexed by the previous token id.
+    // markov_w2 [vocab, markov_rank]: projection back to vocab space, added to the base logits.
+    // Shared vocab with the target (this draft has no embed_tokens of its own either), so no
+    // verifier/draft vocab remapping is needed.
+    bf16* markov_w1 = nullptr;
+    bf16* markov_w2 = nullptr;
+    int markov_rank = 0;
+
+    // DSpark's confidence head (AcceptRatePredictor): predicts a per-position accept
+    // probability from concat(hidden, markov_latent). Optional -- requires the Markov head
+    // (confidence_head_with_markov=True for every DSpark checkpoint released so far).
+    bf16* confidence_w = nullptr;   // [hidden + markov_rank]
+    float confidence_bias = 0.f;    // scalar, read back to host once at load (cheap, load-time only)
+    float* markov_latent = nullptr; // [markov_rank] scratch, reused per row of the sequential loop
+
     // Scratch
     cudaStream_t stream{};
     bf16 *noise = nullptr;          // [B, H]
@@ -291,6 +351,7 @@ struct DFlashDraftModel::Impl {
     void* head_q8 = nullptr;        // [B] Q8_1 rows of xn for the multi-row head MMVQ
     int *d_ids = nullptr, *d_out = nullptr;
     int *h_out = nullptr;
+    float *d_confidence = nullptr, *h_confidence = nullptr;   // [B], confidence head output
 
     // Per-layer contiguous KV cache: [max_seq, n_kv, d]
     std::vector<bf16*> k_cache, v_cache;
@@ -372,6 +433,10 @@ struct DFlashDraftModel::Impl {
         d_ids = alloc<int>(B);
         d_out = alloc<int>(B);
         cu(cudaHostAlloc(&h_out, B * sizeof(int), cudaHostAllocDefault), "h_out");
+        if (confidence_w) {
+            d_confidence = alloc<float>(B);
+            cu(cudaHostAlloc(&h_confidence, B * sizeof(float), cudaHostAllocDefault), "h_confidence");
+        }
 
         k_cache.resize(cfg.n_layers);
         v_cache.resize(cfg.n_layers);
@@ -380,6 +445,54 @@ struct DFlashDraftModel::Impl {
             v_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
         }
         seq_len = 0;
+    }
+
+    // NVFP4 -> BF16 at load, decoded on the host.
+    //
+    // Deliberately NOT launch_ct_dequant_nvfp4: that kernel reads the group scale as CUTLASS
+    // *unsigned* e4m3, while ModelOpt exports signed float8_e4m3fn. The bit patterns differ, so
+    // the kernel mis-scales every group -- which degrades draft acceptance without breaking
+    // correctness, because the target verifies every drafted token anyway.
+    //
+    // Validated against the BF16 source of the same checkpoint:
+    //   w = e2m1(nibble) * f8e4m3(group_scale) * weight_scale_2  ->  rel_err 0.0896, ratio 0.9927
+    // which is pure 4-bit rounding error. This is a one-time load cost.
+    static float decode_e2m1(unsigned char n) {
+        static const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        float v = mag[n & 0x7];
+        return (n & 0x8) ? -v : v;
+    }
+    static float decode_e4m3(unsigned char b) {   // signed float8_e4m3fn
+        const int s = (b >> 7) & 0x1;
+        const int e = (b >> 3) & 0xF;
+        const int m = b & 0x7;
+        float v;
+        if (e == 0) v = std::ldexp((float)m / 8.0f, -6);          // subnormal
+        else        v = std::ldexp(1.0f + (float)m / 8.0f, e - 7);
+        return s ? -v : v;
+    }
+
+    bf16* upload_nvfp4(const TensorView& packed, const TensorView& scale, float global_scale) {
+        const int rows = (int)packed.shape[0];
+        const int cols = (int)packed.shape[1] * 2;
+        const int groups = cols / 16;
+        const unsigned char* pw = (const unsigned char*)packed.data;
+        const unsigned char* ps = (const unsigned char*)scale.data;
+        std::vector<bf16> host((size_t)rows * cols);
+        for (int r = 0; r < rows; r++) {
+            const unsigned char* prow = pw + (size_t)r * (cols / 2);
+            const unsigned char* srow = ps + (size_t)r * groups;
+            for (int c = 0; c < cols; c += 2) {
+                const unsigned char byte = prow[c >> 1];
+                const float gs = decode_e4m3(srow[c >> 4]) * global_scale;
+                host[(size_t)r * cols + c]     = __float2bfloat16(decode_e2m1(byte & 0x0F) * gs);
+                host[(size_t)r * cols + c + 1] = __float2bfloat16(decode_e2m1(byte >> 4) * gs);
+            }
+        }
+        bf16* out = alloc<bf16>((size_t)rows * cols);
+        cu(cudaMemcpy(out, host.data(), host.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+           "upload nvfp4");
+        return out;
     }
 
     bf16* upload(const TensorView& tv) {
@@ -411,6 +524,7 @@ DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
     for (void* p : p_->owned) cudaFree(p);
     if (p_->h_out) cudaFreeHost(p_->h_out);
+    if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
     if (p_->stream) cudaStreamDestroy(p_->stream);
     delete p_;
     p_ = nullptr;
@@ -429,7 +543,13 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
     // native [vocab,hidden] ("out,in") layout -- dflash_kernels::launch_gemv_batched16_f32
     // reads W the same way a single-row GEMV does, so no relayout is needed. Lets
     // forward_block score a whole block with one batched GEMV instead of a per-token loop.
-    if (!p_->lm_head_bf16 && vocab > 0 && hidden > 0) {
+    // ONLY the BW==16 batched-head path (launch_gemv_batched16_f32 below) reads this bf16 copy;
+    // every other block width already scores against the target's QUANTIZED head on-read, via
+    // launch_gemv_q4k_dp4a_multirow_f32 or the per-row launch_gemv_q_f32 fallback. Materializing
+    // it regardless costs vocab*hidden*2 bytes for nothing at any other block size -- 2.54 GB for
+    // DSpark (V=248320, H=5120), which is precisely what pushed Qwen3.8-27B + DSpark past 32 GB
+    // and made the draft OOM in its own lm_head dequant while the weights themselves fit.
+    if (p_->cfg.block_size == 16 && !p_->lm_head_bf16 && vocab > 0 && hidden > 0) {
         p_->lm_head_bf16 = p_->alloc<bf16>((size_t)vocab * hidden);
         if (lm_head_type != 0) {
             kernels::launch_gguf_dequant(lm_head_type, lm_head, p_->lm_head_bf16,
@@ -487,6 +607,37 @@ int DFlashDraftModel::seq_len() const { return p_->seq_len; }
 
 const float* DFlashDraftModel::last_logits() const { return p_->logits; }
 
+// YaRN inverse-frequency table, computed exactly as HuggingFace's _compute_yarn_parameters does
+// (transformers/modeling_rope_utils.py) -- the reference dspark.py/dflash.py do not implement RoPE
+// themselves, they inherit transformers' Qwen3 classes, so that IS the authority here.
+//   inv_freq[i] = interp*(1-ramp_i) + extrap*ramp_i, ramp over the NTK-by-parts correction range
+//   att_scale   = 0.1*ln(factor) + 1
+static void compute_yarn_inv_freq(const DFlashDraftConfig& cfg, std::vector<float>& inv_freq,
+                                  float& att_scale) {
+    const int d = cfg.head_dim, half = d / 2;
+    const double base = cfg.rope_theta, factor = cfg.yarn_factor;
+    const double orig = cfg.yarn_orig_max_pos > 0 ? cfg.yarn_orig_max_pos : 8192.0;
+    auto find_dim = [&](double nrot) {
+        return (d * std::log(orig / (nrot * 2.0 * M_PI))) / (2.0 * std::log(base));
+    };
+    double low  = std::floor(find_dim(cfg.yarn_beta_fast));
+    double high = std::ceil (find_dim(cfg.yarn_beta_slow));
+    low  = std::max(low, 0.0);
+    high = std::min(high, (double)d - 1.0);
+    if (high - low < 1e-3) high = low + 1e-3;   // guard the degenerate range
+    inv_freq.resize(half);
+    for (int i = 0; i < half; i++) {
+        const double pos_freq = std::pow(base, (2.0 * i) / (double)d);
+        const double extrap = 1.0 / pos_freq;
+        const double interp = 1.0 / (factor * pos_freq);
+        double ramp = ((double)i - low) / (high - low);
+        ramp = std::min(std::max(ramp, 0.0), 1.0);
+        const double extrap_w = 1.0 - ramp;     // 1 => untouched band, 0 => fully interpolated
+        inv_freq[i] = (float)(interp * (1.0 - extrap_w) + extrap * extrap_w);
+    }
+    att_scale = (float)(0.1 * std::log(factor) + 1.0);
+}
+
 bool DFlashDraftModel::load(const std::string& dir) {
     Impl& s = *p_;
     const std::string cfg_path = dir + "/config.json";
@@ -505,11 +656,50 @@ bool DFlashDraftModel::load(const std::string& dir) {
         }
         return &it->second;
     };
+    auto optional = [&](const std::string& name) -> TensorView* {
+        auto it = st.tensors.find(name);
+        return it == st.tensors.end() ? nullptr : &it->second;
+    };
+
+    // Resolve a projection weight whether it is stored BF16 or NVFP4-packed. ModelOpt writes
+    // <name>.weight (U8), <name>.weight_scale (ue4m3) and <name>.weight_scale_2 (F32 global);
+    // a mixed-precision export leaves untouched projections as plain BF16, so both must work
+    // within the same checkpoint.
+    auto load_weight = [&](const std::string& name) -> bf16* {
+        TensorView* w = require(name);
+        if (!w) return nullptr;
+        if (w->dtype != "U8") return s.upload(*w);
+        TensorView* sc = optional(name + "_scale");
+        TensorView* g2 = optional(name + "_scale_2");
+        if (!sc) {
+            fprintf(stderr, "[dflash] %s is NVFP4-packed but %s_scale is missing\n",
+                    name.c_str(), name.c_str());
+            return nullptr;
+        }
+        float gs = 1.0f;
+        if (g2 && g2->nbytes >= sizeof(float)) gs = *(const float*)g2->data;
+        return s.upload_nvfp4(*w, *sc, gs);
+    };
 
     const int H = s.cfg.hidden;
     const int I = s.cfg.intermediate;
     const int n_cap = (int)s.cfg.target_layer_ids.size();
     const int B = s.cfg.block_size;
+
+    if (s.cfg.yarn_factor > 1.0f) {
+        std::vector<float> ifreq;
+        compute_yarn_inv_freq(s.cfg, ifreq, s.yarn_att_scale);
+        if (cudaMalloc(&s.d_yarn_inv_freq, ifreq.size() * sizeof(float)) == cudaSuccess) {
+            cudaMemcpy(s.d_yarn_inv_freq, ifreq.data(), ifreq.size() * sizeof(float),
+                       cudaMemcpyHostToDevice);
+            fprintf(stderr, "[dflash] YaRN: factor=%.1f orig_max=%d att_scale=%.4f "
+                            "(inv_freq[0]=%.3e inv_freq[%d]=%.3e)\n",
+                    s.cfg.yarn_factor, s.cfg.yarn_orig_max_pos, s.yarn_att_scale,
+                    ifreq.front(), (int)ifreq.size() - 1, ifreq.back());
+        } else {
+            fprintf(stderr, "[dflash] YaRN table alloc failed -- falling back to plain RoPE\n");
+        }
+    }
 
     auto* fc = require("fc.weight");
     auto* hn = require("hidden_norm.weight");
@@ -534,12 +724,19 @@ bool DFlashDraftModel::load(const std::string& dir) {
         auto* g = require(pfx + "mlp.gate_proj.weight");
         auto* u = require(pfx + "mlp.up_proj.weight");
         auto* d = require(pfx + "mlp.down_proj.weight");
-        if (!wq || !wk || !wv || !wo || !qn || !kn || !in || !pn || !g || !u || !d)
+        if (!qn || !kn || !in || !pn)
             return false;
-        lw.wq = s.upload(*wq); lw.wk = s.upload(*wk); lw.wv = s.upload(*wv); lw.wo = s.upload(*wo);
+        lw.wq = load_weight(pfx + "self_attn.q_proj.weight");
+        lw.wk = load_weight(pfx + "self_attn.k_proj.weight");
+        lw.wv = load_weight(pfx + "self_attn.v_proj.weight");
+        lw.wo = load_weight(pfx + "self_attn.o_proj.weight");
+        lw.gate = load_weight(pfx + "mlp.gate_proj.weight");
+        lw.up = load_weight(pfx + "mlp.up_proj.weight");
+        lw.down = load_weight(pfx + "mlp.down_proj.weight");
+        if (!lw.wq || !lw.wk || !lw.wv || !lw.wo || !lw.gate || !lw.up || !lw.down)
+            return false;
         lw.q_norm = s.upload(*qn); lw.k_norm = s.upload(*kn);
         lw.input_norm = s.upload(*in); lw.post_norm = s.upload(*pn);
-        lw.gate = s.upload(*g); lw.up = s.upload(*u); lw.down = s.upload(*d);
         // Q8_0 mirrors: the batched projections are DRAM-bound at the narrowed diffusion width,
         // so halving their weight bytes is the dominant remaining win. Built once, on load.
         if (q8_on()) {
@@ -554,10 +751,54 @@ bool DFlashDraftModel::load(const std::string& dir) {
         }
     }
 
+    // DSpark's Markov head: trained weights sitting in the checkpoint but unused by plain DFlash
+    // drafting. Both tensors must be present and agree on rank, or the head is silently skipped
+    // (a malformed pair is worth surfacing, but a genuinely draft-without-Markov checkpoint --
+    // Qwen3.6-35B-A3B's, for one -- is the normal case and should load exactly as before).
+    auto* mw1 = optional("markov_head.markov_w1.weight");
+    auto* mw2 = optional("markov_head.markov_w2.weight");
+    if (mw1 && mw2 && mw1->shape.size() == 2 && mw2->shape.size() == 2 &&
+        mw1->shape[1] == mw2->shape[1] && mw1->shape[1] > 0) {
+        s.markov_w1 = s.upload(*mw1);
+        s.markov_w2 = s.upload(*mw2);
+        s.markov_rank = (int)mw1->shape[1];
+    } else if (mw1 || mw2) {
+        fprintf(stderr, "[dflash] markov_head tensors present but malformed "
+                        "(w1=%zux%zu w2=%zux%zu) -- skipping\n",
+                mw1 ? (size_t)mw1->shape[0] : 0, mw1 ? (size_t)mw1->shape[1] : 0,
+                mw2 ? (size_t)mw2->shape[0] : 0, mw2 ? (size_t)mw2->shape[1] : 0);
+    }
+
+    // Confidence head: requires the Markov head (confidence_head_with_markov=True on every
+    // DSpark checkpoint released so far concatenates the Markov latent into its input), so only
+    // look for it once the Markov head itself loaded successfully.
+    if (s.markov_w1) {
+        auto* cw = optional("confidence_head.proj.weight");
+        auto* cb = optional("confidence_head.proj.bias");
+        const int want_dim = H + s.markov_rank;
+        if (cw && cb && cw->shape.size() == 2 && cw->shape[0] == 1 &&
+            (int)cw->shape[1] == want_dim && cb->shape.size() == 1 && cb->shape[0] == 1) {
+            s.confidence_w = s.upload(*cw);
+            // Bias is a single scalar -- read it back to host once here rather than carrying a
+            // device pointer the kernel would have to dereference on every call for no reason.
+            const unsigned short raw = *reinterpret_cast<const unsigned short*>(cb->data);
+            unsigned int bits = (unsigned int)raw << 16;
+            std::memcpy(&s.confidence_bias, &bits, sizeof(float));
+            if (cudaMalloc(&s.markov_latent, (size_t)s.markov_rank * sizeof(float)) != cudaSuccess)
+                s.confidence_w = nullptr;  // can't run the head without scratch -- disable cleanly
+            else
+                s.owned.push_back(s.markov_latent);
+        } else if (cw || cb) {
+            fprintf(stderr, "[dflash] confidence_head tensors present but malformed "
+                            "(want proj.weight=[1,%d]) -- skipping\n", want_dim);
+        }
+    }
+
     // Scratch + KV cache (shared with load_gguf(), see Impl::alloc_scratch).
     s.alloc_scratch();
-    fprintf(stderr, "[dflash] loaded draft: layers=%d H=%d B=%d n_cap=%d mask=%d\n",
-            s.cfg.n_layers, H, B, n_cap, s.cfg.mask_token_id);
+    fprintf(stderr, "[dflash] loaded draft: layers=%d H=%d B=%d n_cap=%d mask=%d markov_rank=%d "
+                    "confidence=%d\n",
+            s.cfg.n_layers, H, B, n_cap, s.cfg.mask_token_id, s.markov_rank, s.confidence_w != nullptr);
     return true;
 }
 
@@ -684,7 +925,8 @@ void DFlashDraftModel::ensure_quant() { if (p_) p_->ensure_quant(); }
 
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
-                                     int* out_argmax, cudaStream_t stream, int proposals) {
+                                     int* out_argmax, cudaStream_t stream, int proposals,
+                                     float* out_confidence) {
     Impl& s = *p_;
     s.ensure_quant();
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
@@ -913,11 +1155,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                                          c.rms_eps, k_pos0 + ctx_skip,
                                                          c.rope_theta, st);
         } else {
+            // s.d_yarn_inv_freq is null unless the checkpoint configures rope_type "yarn", in
+            // which case these two calls are the ONLY behavioural change -- Q and K must be
+            // rotated with the same table or their relative phase is wrong.
             dflash_kernels::launch_rms_heads_rope(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
-                                                 q_pos0, c.rope_theta, st);
+                                                 q_pos0, c.rope_theta, st,
+                                                 s.d_yarn_inv_freq, s.yarn_att_scale);
             dflash_kernels::launch_rms_heads_rope(kdst + (size_t)ctx_skip * kvdim, w.k_norm,
                                                  new_len - ctx_skip, c.n_kv_heads, d,
-                                                 c.rms_eps, k_pos0 + ctx_skip, c.rope_theta, st);
+                                                 c.rms_eps, k_pos0 + ctx_skip, c.rope_theta, st,
+                                                 s.d_yarn_inv_freq, s.yarn_att_scale);
         }
 
         // K/V are already in the cache at offset `past` -- attend over the full past+new.
@@ -1045,14 +1292,49 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         }
     }
     }
-    kernels::launch_argmax(s.logits + (head_done ? V : 0),
-                           s.d_out + (head_done ? 1 : 0),
-                           head_done ? kProposalDepth : B, V, st);
+    // DSpark's Markov head: position r's logit bias conditions on the token AT position r itself
+    // (the anchor for r==0, its own -- just-chosen -- prediction for r>0), predicting position
+    // r+1. That token is only known once position r-1's own Markov-corrected argmax has run, so
+    // rows 1..kProposalDepth chain sequentially instead of the single batched argmax below --
+    // each launch reads its "previous token" from device memory (s.d_ids[0], the real anchor, for
+    // r==1; this same loop's own s.d_out[r-1] for r>1), so the chain needs no host round-trip
+    // until the final readback already below. Row 0 itself is never consumed by the caller (its
+    // prediction for position start+1 is redundant with the target's own verify-row-0 call, which
+    // is strictly more reliable than any draft guess), so it only needs a plain argmax in the
+    // !head_done path, where the batched LM-head GEMV computed it too and left it unscored.
+    if (s.markov_w1 && s.markov_w2) {
+        if (!head_done) kernels::launch_argmax(s.logits, s.d_out, 1, V, st);
+        for (int r = 1; r <= kProposalDepth; r++) {
+            const int* prev = (r == 1) ? s.d_ids : (s.d_out + (r - 1));
+            dflash_kernels::launch_markov_bias_add(s.markov_w1, s.markov_w2, prev,
+                                                   s.logits + (size_t)r * V, V, s.markov_rank, st,
+                                                   s.confidence_w ? s.markov_latent : nullptr);
+            // Confidence head (optional): reads THIS row's hidden state + the Markov latent the
+            // bias call above just wrote, predicting how likely this row's (about to be computed)
+            // argmax is to be accepted. Order doesn't matter relative to the argmax call below --
+            // it depends on s.xn and s.markov_latent, neither of which the argmax touches.
+            if (s.confidence_w)
+                dflash_kernels::launch_confidence_head(s.xn + (size_t)r * H, s.markov_latent,
+                                                       s.confidence_w, s.confidence_bias, H,
+                                                       s.markov_rank, s.d_confidence + r, st);
+            kernels::launch_argmax(s.logits + (size_t)r * V, s.d_out + r, 1, V, st);
+        }
+    } else {
+        kernels::launch_argmax(s.logits + (head_done ? V : 0),
+                               s.d_out + (head_done ? 1 : 0),
+                               head_done ? kProposalDepth : B, V, st);
+    }
     cu(cudaMemcpyAsync(s.h_out, s.d_out,
                        (head_done ? kProposalDepth + 1 : B) * sizeof(int),
                        cudaMemcpyDeviceToHost, st), "argmax");
+    if (out_confidence && s.confidence_w)
+        cu(cudaMemcpyAsync(s.h_confidence + 1, s.d_confidence + 1,
+                           kProposalDepth * sizeof(float), cudaMemcpyDeviceToHost, st),
+           "confidence readback");
     cu(cudaStreamSynchronize(st), "draft sync");
     for (int t = 0; t <= kProposalDepth; t++) out_argmax[t] = s.h_out[t];
+    if (out_confidence && s.confidence_w)
+        for (int t = 1; t <= kProposalDepth; t++) out_confidence[t] = s.h_confidence[t];
 
     // Advance past the just-appended ctx+noise, then crop to `pos0` (= block start).
     // Matches z-lab dflash: past_key_values_draft.update(...) then .crop(start).
