@@ -41,11 +41,33 @@ narrowed to one question: how fast is DSpark speculative decode at ctx=128, and 
               target forward), or by slowing ordinary serving decode to help the speculative path.
               A regression here is a hard REJECT regardless of the DSpark number.
 
-Deliberately NOT run, and why — each of these costs real GPU time per round and none of them can
-move the scored dimension: the Qwen3.6/Qwen3.8 sweep guards (this bot never touches the prefill or
-long-context paths they cover) and the batched-prefill parity check (DSpark prefills through the
-token loop, see dspark_tau_check.cpp's SPARKINFER_PREFILL_BATCHED pin). If DSpark work starts
-touching shared prefill code, put them back.
+  4. LONG-CONTEXT no-regression guards @ ctx=16k, decode AND prefill, on TWO models (added
+              2026-08-18 by explicit request). Differential, PR vs freshly-measured main, same box,
+              same round, REGRESS_TOL. Both are hard REJECTs.
+
+                qwen3.8 (MODEL_DIR)  the ModelOpt NVFP4 checkpoint — the DSpark target itself, and
+                                     the build the published benchmark table quotes. It used to be
+                                     covered because pr_modelopt_bot.py SCORED decode@16k and
+                                     prefill@16k on it; when DSpark decode@128 became the only
+                                     scored dimension that coverage vanished, and this closes it.
+
+                qwen3.6 (Q36_GGUF)   Qwen3.6-35B-A3B, a different architecture (MoE, not dense) on
+                                     a separate model load. DSpark work lands in qwen35.cpp /
+                                     qwen35_prefill.cpp / the shared kernels, all of which Qwen3.6
+                                     uses — the exact surface through which PR #775 regressed a
+                                     model nobody was scoring at the time.
+
+              16k only, not the sibling bots' full 0/512/4k/16k/32k sweep: one context per model
+              keeps a round to two extra model loads, and 16k is where long-context prefill and a
+              large KV read both actually cost something.
+
+              If either guard produces no MAIN baseline the whole round bails, rather than letting
+              every PR collect a REJECT for one shared infra fault.
+
+Still deliberately NOT run: the batched-prefill parity check. It is absolute rather than
+differential, and main currently fails it at n=128 (~0.58 against a 0.75 bar) — a real pre-existing
+divergence that stayed hidden until the gate's prompt corpus was lengthened enough for that case to
+run at all. Enabling it here would REJECT every PR until that is fixed.
 
 Applies `eval-dspark:<TIER>` AND mirrors it to the generic `eval:<TIER>` label (SN74 scoring reads
 eval:* tiers). Auto-close on none/REJECT is live; auto-merge stays OFF unless
@@ -672,13 +694,14 @@ test -f "$MODEL_DIR/config.json" || {{ echo "FAIL $MODEL_DIR has no config.json"
 # underneath it (the sibling bots hit exactly this, #693/#694).
 mkdir -p build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/mopt_cmake.log 2>&1
-cmake --build build --target dspark_tau_check qwen3_gguf_score -j"$(nproc)" >/tmp/mopt_build.log 2>&1 || {{
+cmake --build build --target dspark_tau_check qwen3_gguf_score qwen3_gguf_bench -j"$(nproc)" >/tmp/mopt_build.log 2>&1 || {{
   echo "BUILD_FAILED -- tail of /tmp/mopt_build.log:" >&2
   tail -80 /tmp/mopt_build.log >&2
   exit 1
 }}
 test -x build/runtime/dspark_tau_check
 test -x build/runtime/qwen3_gguf_score
+test -x build/runtime/qwen3_gguf_bench
 
 # --- DSpark speculative decode @ ctx=CTX ---
 # ONE process runs both legs against one loaded model: the AR reference first (on clean state --
@@ -758,11 +781,59 @@ if [ "$IS_PR" = "1" ]; then
   fi
 fi
 
-# Deliberately NOT run here: the batched-prefill parity check and the Qwen3.6/Qwen3.8 sweep
-# guards that pr_modelopt_bot.py runs. DSpark prefills through its own token loop (see the
-# SPARKINFER_PREFILL_BATCHED pin in dspark_tau_check.cpp) and this bot never scores prefill or
-# long context, so those three cost real GPU time per round and cannot move the scored dimension.
-# Put them back if DSpark work starts touching shared prefill code.
+# --- no-regression guards @ ctx=16k (added 2026-08-18 by explicit request) ---
+# The scored dimension is speculative decode at ctx=128. Nothing in it looks at long context or at
+# batched prefill, so without these two guards a DSpark PR could speed up its own path while
+# silently regressing what actually ships -- the AR serving numbers the README publishes. Both are
+# differential (PR vs freshly-measured main, same box, same round, REGRESS_TOL) and both are hard
+# REJECTs, exactly like the sibling bots' guards.
+#
+# 16k ONLY, not the sibling bots' full 0/512/4k/16k/32k sweep: one context per model keeps a round
+# to two extra model loads, and 16k is where long-context prefill and a large KV read both
+# actually cost something -- a regression in the shared prefill/decode paths shows there first.
+#
+# Synthetic prompts on purpose (SPARKINFER_BENCH_PROMPT_FILE is never set in this script). These
+# are PR-vs-main comparisons, not absolute numbers, and a real prompt file would be Qwen3.8 token
+# ids that mean different text -- or nothing -- in Qwen3.6's vocabulary.
+source bench/scripts/_common.sh
+source bench/scripts/_eval_speed.sh
+SI_BIN="$PWD/build/runtime"; SI_LD=""
+
+# Qwen3.8, the ModelOpt checkpoint -- the one this bot's DSpark target loads, and the one the
+# published benchmark table quotes. It used to be covered by pr_modelopt_bot.py SCORING it at
+# decode@16k/prefill@16k; once DSpark decode@128 became the only scored dimension that coverage
+# vanished, which is the gap this closes.
+echo "GUARD38_START"
+wait_gpu_clear
+if bench_sweep_run "$MODEL_DIR" 128 16384 5; then
+  echo "GUARD38 16384 $(_bench_sweep_get 16384 decode_tps) $(_bench_sweep_get 16384 prefill_pp)"
+else
+  echo "GUARD38_FAILED"
+fi
+echo "GUARD38_END"
+
+# Qwen3.6-35B-A3B. A separate model load and a different architecture (MoE, not dense): a
+# shared-code regression that only shows on Qwen3.6 would otherwise slip past entirely, as it did
+# for the LMCache integration (PR #775) until it was caught by hand.
+export MODELS_DIR="$Q36_GUARD_MODELS_DIR" MODEL_REPO="$Q36_GUARD_MODEL_REPO" \
+       MODEL_FILE="$Q36_GUARD_MODEL_FILE" TOK_REPO="$Q36_GUARD_TOK_REPO"
+export MODEL_SHA256="${{QWEN36_MODEL_SHA256:-}}"
+( ensure_model && ensure_tokenizer ) || echo "WARN: qwen3.6 guard model setup failed" >&2
+Q36_GGUF="$Q36_GUARD_MODELS_DIR/$Q36_GUARD_MODEL_FILE"
+
+echo "GUARD_START"
+wait_gpu_clear
+if bench_sweep_run "$Q36_GGUF" 128 16384 5; then
+  echo "GUARD36 16384 $(_bench_sweep_get 16384 decode_tps) $(_bench_sweep_get 16384 prefill_pp)"
+else
+  echo "GUARD36_FAILED"
+fi
+echo "GUARD_END"
+
+# Still NOT run: the batched-prefill parity check. It is absolute rather than differential, and
+# main currently fails it at n=128 (~0.58 against a 0.75 bar) -- a real pre-existing divergence
+# that was hidden until the gate's prompt corpus was lengthened. Enabling it here would REJECT
+# every PR until that is fixed, which is a separate piece of work.
 """
 
 
@@ -1030,6 +1101,16 @@ def measure_main_baseline(host, port):
         return {"ok": False, "reason": "main run is NOT lossless — DSpark diverged from AR on main, "
                                        "so there is no valid baseline to score against",
                 "log": (r.stdout or "")[-1500:]}
+    # Both guards need a main reference set. If either did not measure, EVERY PR this round would
+    # fail its guard "measurement unavailable" branch and collect a REJECT for what is really one
+    # shared infra problem -- so bail out of the round instead, same reasoning as the caller's own
+    # baseline bail-out.
+    if main.get("guard38_failed") or not main.get("guard38"):
+        return {"ok": False, "reason": "main run produced no qwen3.8 16k guard baseline",
+                "log": (r.stdout or "")[-1500:]}
+    if main.get("guard36_failed") or not main.get("guard36"):
+        return {"ok": False, "reason": "main run produced no qwen3.6 16k guard baseline",
+                "log": (r.stdout or "")[-1500:]}
     main["ok"] = True
     return main
 
@@ -1146,6 +1227,25 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         label = "REJECT"
         passed = False
 
+    # Qwen3.8 (ModelOpt) no-regression guard @16k -- decode AND prefill. Hard REJECT: a DSpark PR
+    # that speeds up speculative decode while regressing the AR long-context path is regressing
+    # what actually ships, and nothing else in this bot measures that any more.
+    q38_ok, q38_problems = check_q38_guard(pr, main)
+    if not q38_ok:
+        q38_reason = "qwen3.8 16k no-regression guard failed: " + "; ".join(q38_problems[:6])
+        reason = f"{q38_reason} | {reason}"
+        label = "REJECT"
+        passed = False
+
+    # Qwen3.6 no-regression guard @16k -- same discipline, different architecture. DSpark work
+    # lands in qwen35.cpp / qwen35_prefill.cpp / the shared kernels, all of which Qwen3.6 uses.
+    q36_ok, q36_problems = check_q36_guard(pr, main)
+    if not q36_ok:
+        q36_reason = "qwen3.6 16k no-regression guard failed: " + "; ".join(q36_problems[:6])
+        reason = f"{q36_reason} | {reason}"
+        label = "REJECT"
+        passed = False
+
     res = {
         "ok": True,
         "label": label,
@@ -1170,6 +1270,14 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         # net loss against ordinary AR decode; this is the number the work is trying to move.
         "dspark_vs_ar": round(pr["dspark_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
         "lossless": lossless_ok,
+        "q38_guard_ok": q38_ok,
+        "q38_guard_problems": q38_problems,
+        "q38_guard": pr.get("guard38"),
+        "q38_guard_main": main.get("guard38"),
+        "q36_guard_ok": q36_ok,
+        "q36_guard_problems": q36_problems,
+        "q36_guard": pr.get("guard36"),
+        "q36_guard_main": main.get("guard36"),
         "scored_dimension": best["dim"],
         "speedup_vs_main": round(pr["dspark_tps"] / main["dspark_tps"], 3) if main.get("dspark_tps") else 0,
         "pr_top1": pr_top1,
@@ -1243,6 +1351,17 @@ def format_comment(commit: str, res: dict) -> str:
     else:
         ls_row = ("| losslessness gate | ❌ **FAILED** — DSpark diverged from the AR reference — "
                   "**verdict forced to REJECT regardless of speed** |\n")
+    def _guard_row(name, ok_key, prob_key, ctxs_key):
+        if res.get(ok_key):
+            vals = (res.get(ctxs_key) or {}).get(16384) or {}
+            detail = (f" — decode {vals['decode']:.1f} tok/s · prefill {vals['prefill']:.0f} pp"
+                      if vals.get("decode") and vals.get("prefill") else "")
+            return f"| {name} guard @16k | ✅ no regression (decode+prefill){detail} |\n"
+        problems = "; ".join((res.get(prob_key) or [])[:4])
+        return (f"| {name} guard @16k | ❌ **FAILED** — {problems} — "
+                "**verdict forced to REJECT regardless of speed** |\n")
+    q38_row = _guard_row("qwen3.8 (ModelOpt)", "q38_guard_ok", "q38_guard_problems", "q38_guard")
+    q36_row = _guard_row("qwen3.6", "q36_guard_ok", "q36_guard_problems", "q36_guard")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -1269,6 +1388,8 @@ def format_comment(commit: str, res: dict) -> str:
         f"{acc_row}"
         f"{main_acc_note}"
         f"{ls_row}"
+        f"{q38_row}"
+        f"{q36_row}"
         f"| PPL PR / main | {res.get('pr_ppl') or '?'} / {res.get('main_ppl') or '?'} |\n"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
@@ -1486,7 +1607,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
           f"lossless={res.get('lossless')} "
           f"tau={res.get('pr_mean_accept', 0):.3f} "
-          f"dspark_vs_ar={res.get('dspark_vs_ar', 0):.3f}x")
+          f"dspark_vs_ar={res.get('dspark_vs_ar', 0):.3f}x "
+          f"q38_guard_ok={res.get('q38_guard_ok')} q36_guard_ok={res.get('q36_guard_ok')}")
     if dry_run:
         print(body[:500])
         return
