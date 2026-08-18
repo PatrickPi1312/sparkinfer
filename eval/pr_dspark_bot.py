@@ -781,8 +781,10 @@ from tokenizers import Tokenizer
 want = int(sys.argv[3])
 ids = Tokenizer.from_file(sys.argv[1]).encode(open(sys.argv[2]).read()).ids
 if len(ids) < want:
-    sys.stderr.write("PROMPT_TOO_SHORT have=%d want=%d\n" % (len(ids), want))
-    raise SystemExit(3)
+    # SystemExit(str) prints to stderr and exits non-zero. Deliberately no backslash escapes
+    # anywhere in this heredoc: it is nested inside the bot's own f-string, which consumes them
+    # and emits a real newline mid-string, breaking the remote Python.
+    raise SystemExit("PROMPT_TOO_SHORT have=%d want=%d" % (len(ids), want))
 print(" ".join(str(i) for i in ids[:want]))
 PYDS
 DS_NIDS=$(wc -w < "$DSPARK_IDS")
