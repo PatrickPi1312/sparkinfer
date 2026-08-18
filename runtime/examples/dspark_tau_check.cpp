@@ -328,6 +328,15 @@ int main(int argc, char** argv) {
     // half. Each rep resets the draft and re-runs the whole speculative generation, so a rep that
     // disagrees with the first localises a rare divergence to the draft/verify path rather than to
     // the reference.
+    // Hoisted out of the probe block below so the VERDICT can see them. Before 2026-08-18 this
+    // probe only printed: METRIC LOSSLESS compared AR against the FIRST speculative run and
+    // nothing else, so a divergence that only shows up on some runs was reported in the log and
+    // then scored as a pass. That is the exact shape of the bug this harness exists to catch --
+    // the target/draft overlap defect diverged on 5-7 of 40 repeats, so a single-shot check finds
+    // it about 15% of the time. Measured directly: with OVERLAP=1 deliberately in an auto-tuner's
+    // search space, 10 of 11 trials that enabled it were scored LOSSLESS.
+    int spec_rep_failures = 0;
+    int spec_reps_run = 0;
     if (const char* sreps_env = getenv("SPARKINFER_DSPARK_SPEC_REPS")) {
         const int sreps = atoi(sreps_env);
         int smismatch = 0, vs_ar_mismatch = 0;
@@ -361,6 +370,10 @@ int main(int argc, char** argv) {
         }
         printf("SPEC-REPS %d reps, %d differ-from-first, %d not-lossless-vs-AR\n",
                sreps, smismatch, vs_ar_mismatch);
+        // Both count. differ-from-first catches a rep that drifted or produced nothing;
+        // not-lossless-vs-AR is the guarantee itself. Either is a failure of the run as a whole.
+        spec_reps_run = sreps > 1 ? sreps : 0;
+        spec_rep_failures = smismatch + vs_ar_mismatch;
     }
 
     // An empty AR reference must FAIL, not pass vacuously: min(0, k) == 0 makes "matched 0/0"
@@ -393,7 +406,18 @@ int main(int argc, char** argv) {
     }
     printf("DSPARK tau=%.3f  steps=%d  tokens=%zu  decode_s=%.3f\n",
            stats.mean_accept, stats.steps, spec.size(), stats.decode_s);
-    printf("DSPARK lossless=%s  matched %zu/%zu\n", same == n ? "YES" : "NO", same, n);
+    // The verdict is ALL reps, not just the first. Losslessness is a property of the path, not of
+    // one lucky run, and the defects this catches are probabilistic by nature: a race between the
+    // draft and verify row 0 diverged on 5-7 of 40 repeats, which a single run misses ~85% of the
+    // time. With SPEC_REPS unset this is exactly the old behaviour (spec_rep_failures stays 0), so
+    // an unset harness is no weaker than before -- it is simply not any stronger.
+    const bool lossless = (same == n) && spec_rep_failures == 0;
+    printf("DSPARK lossless=%s  matched %zu/%zu", lossless ? "YES" : "NO", same, n);
+    if (spec_reps_run > 0)
+        printf("  (+%d repeats, %d failed)", spec_reps_run - 1, spec_rep_failures);
+    else
+        printf("  (single run -- set SPARKINFER_DSPARK_SPEC_REPS=N to test reproducibility)");
+    printf("\n");
     printf("DSPARK ceiling: block_size=%d (MTP's ceiling is 2)\n", dc.block_size);
 
     const double spec_tps = stats.decode_s > 0 ? (double)spec.size() / stats.decode_s : 0.0;
@@ -409,6 +433,9 @@ int main(int argc, char** argv) {
     printf("METRIC AR_TPS %.4f\n", ar_tps);
     printf("METRIC DSPARK_TPS %.4f\n", spec_tps);
     printf("METRIC MEAN_ACCEPT %.4f\n", stats.mean_accept);
-    printf("METRIC LOSSLESS %d\n", same == n ? 1 : 0);
+    printf("METRIC LOSSLESS %d\n", lossless ? 1 : 0);
+    // How much evidence is behind that 1, so a consumer can tell "verified across N runs" from
+    // "one run got lucky". 1 means single-shot, which only catches deterministic breakage.
+    printf("METRIC LOSSLESS_RUNS %d\n", spec_reps_run > 0 ? spec_reps_run : 1);
     return 0;
 }

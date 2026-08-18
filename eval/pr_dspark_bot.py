@@ -191,6 +191,10 @@ DRAFT_DIR = os.environ.get("DSPARK_DRAFT_DIR", "/root/workspace/dspark")
 # Prompt length for the scored context. dspark_tau_check takes explicit token ids, so this is the
 # real ctx: the bot tokenizes bench/scripts/bench_prompt.txt and truncates to this many ids.
 DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "128"))
+# Repeats of the speculative generation per round. Every one must match AR for LOSSLESS to be 1.
+# 5 is the cost/detection trade: a 15%-per-run defect (the measured rate of the overlap race) is
+# caught ~56% of the time at 5 reps versus 15% at 1, for ~10s of extra GPU per ref.
+DSPARK_SPEC_REPS = int(os.environ.get("DSPARK_SPEC_REPS", "5"))
 BENCH_TOKENS = int(os.environ.get("MODELOPT_BENCH_TOKENS", "128"))
 ACC_TOPK = int(os.environ.get("MODELOPT_ACC_TOPK", "128"))
 # Batched-prefill parity floor: the fraction of the continuation that batched prefill must still
@@ -619,6 +623,7 @@ def _remote_script(ref: str, role: str = "pr") -> str:
     parity_bar = PARITY_BAR
     draft_dir = shlex.quote(DRAFT_DIR)
     ctx = DSPARK_CTX
+    spec_reps = DSPARK_SPEC_REPS
     eval_text = shlex.quote(EVAL_TEXT)
     dump_self = shlex.quote(SCORE_DUMP_MAIN if role == "main" else SCORE_DUMP_PR)
     dump_main = shlex.quote(SCORE_DUMP_MAIN)
@@ -731,7 +736,19 @@ echo "DSPARK_PROMPT_IDS $(wc -w < "$DSPARK_IDS")"
 
 wait_gpu_clear
 DS_OUT=/tmp/dspark_run.txt
-timeout 2400 build/runtime/dspark_tau_check "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" $(cat "$DSPARK_IDS") \
+# SPEC_REPS: repeat the whole speculative generation and require EVERY repeat to match AR, not just
+# the first. Losslessness is a property of the path, not of one lucky run, and the defects that
+# matter here are probabilistic: the target/draft overlap race diverged on 5-7 of 40 repeats, so a
+# single-shot gate finds it roughly 15% of the time and scores it a pass the other 85%.
+#
+# Measured, not hypothetical (2026-08-18): with OVERLAP=1 deliberately placed in an auto-tuner's
+# search space as a positive control, 10 of the 11 trials that enabled it were scored LOSSLESS by
+# the single-run gate. At 5 reps a 15%-per-run defect is caught ~56% of the round, and a PR has to
+# survive it every hour rather than once.
+#
+# Cost is 4 extra speculative generations, ~2.5s each on this checkpoint -- trivial beside the two
+# 16k guards below, and it buys the one gate this bot cannot afford to have be decorative.
+SPARKINFER_DSPARK_SPEC_REPS={spec_reps} timeout 2400 build/runtime/dspark_tau_check "$MODEL_DIR" "$DRAFT_DIR" "$NTOK" $(cat "$DSPARK_IDS") \
   > "$DS_OUT" 2>&1 || {{ echo "DSPARK_RUN_FAILED -- tail of $DS_OUT:" >&2; tail -40 "$DS_OUT" >&2; }}
 grep -E '^(DSPARK|AR|draft:) ' "$DS_OUT" || true
 
@@ -747,6 +764,7 @@ echo "RESULT_DSPARK_TPS $(_ds_metric DSPARK_TPS)"
 echo "RESULT_AR_TPS $(_ds_metric AR_TPS)"
 echo "RESULT_MEAN_ACCEPT $(_ds_metric MEAN_ACCEPT)"
 echo "RESULT_LOSSLESS $(_ds_metric LOSSLESS)"
+echo "RESULT_LOSSLESS_RUNS $(_ds_metric LOSSLESS_RUNS)"
 
 # --- teacher-forced score dump (differential accuracy gate, module docstring pt. 2) ---
 # llama.cpp cannot read a compressed-tensors directory, so there is no same-weights external
@@ -873,6 +891,11 @@ def _parse_remote(stdout: str) -> dict:
                 out["mean_accept"] = float(line.split()[1])
             except ValueError:
                 pass
+        elif line.startswith("RESULT_LOSSLESS_RUNS "):
+            try:
+                out["lossless_runs"] = int(float(line.split()[1]))
+            except ValueError:
+                out["lossless_runs"] = 0
         elif line.startswith("RESULT_LOSSLESS "):
             # Fail-closed: anything that is not exactly 1 -- including a value the harness never
             # printed, which the remote _ds_metric defaults to 0 -- means "not proven lossless".
@@ -1219,8 +1242,18 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     # block made 5-7 of 40 repeats of the SAME generation emit different tokens, and it hid for a
     # long time because it perturbed accept GROUPING, which is invisible until the adaptive gate
     # turns it into a different verify path. Speed alone never saw it.
-    lossless_ok = pr.get("lossless") is True
-    if not lossless_ok:
+    # The verdict AND the evidence behind it. A build whose dspark_tau_check predates the repeat
+    # verdict emits LOSSLESS_RUNS=0 (metric absent) or 1 (single run), and would otherwise hand back
+    # a confident-looking pass earned by one roll of the dice. Requiring the configured rep count
+    # means a stale binary fails closed instead of silently downgrading the gate.
+    runs = pr.get("lossless_runs", 0)
+    lossless_ok = pr.get("lossless") is True and runs >= DSPARK_SPEC_REPS
+    if pr.get("lossless") is True and runs < DSPARK_SPEC_REPS:
+        reason = (f"losslessness verified over only {runs} run(s), need {DSPARK_SPEC_REPS} "
+                  f"(stale dspark_tau_check?) | {reason}")
+        label = "REJECT"
+        passed = False
+    elif not lossless_ok:
         ls_reason = ("losslessness gate failed: DSpark output does not match the AR reference "
                      "token-for-token" + ("" if "lossless" in pr else " (not measured)"))
         reason = f"{ls_reason} | {reason}"
@@ -1270,6 +1303,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         # net loss against ordinary AR decode; this is the number the work is trying to move.
         "dspark_vs_ar": round(pr["dspark_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
         "lossless": lossless_ok,
+        "lossless_runs": runs,
         "q38_guard_ok": q38_ok,
         "q38_guard_problems": q38_problems,
         "q38_guard": pr.get("guard38"),
@@ -1347,7 +1381,8 @@ def format_comment(commit: str, res: dict) -> str:
     # separate absolute bar for it to miss.
     main_acc_note = ""
     if res.get("lossless"):
-        ls_row = ("| losslessness gate | ✅ DSpark output matches the AR reference token-for-token |\n")
+        ls_row = ("| losslessness gate | ✅ DSpark matches the AR reference token-for-token, "
+                  f"verified across **{res.get('lossless_runs', 1)}** independent runs |\n")
     else:
         ls_row = ("| losslessness gate | ❌ **FAILED** — DSpark diverged from the AR reference — "
                   "**verdict forced to REJECT regardless of speed** |\n")
