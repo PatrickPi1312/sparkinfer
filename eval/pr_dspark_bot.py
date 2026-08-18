@@ -396,7 +396,7 @@ def qwen38_evaluated_commits(repo, num):
     for c in json.loads(r.stdout or "{}").get("comments", []):
         body = c.get("body") or ""
         m = MARKER_RE.search(body)
-        if not m or "sparkinfer modelopt auto-eval" not in body:
+        if not m or "sparkinfer DSpark auto-eval" not in body:
             continue
         meta_raw = m.group(2)
         try:
@@ -1204,8 +1204,8 @@ def format_comment(commit: str, res: dict) -> str:
         "delta_pct": res.get("delta_pct"),
         "pr_decode_tps": res.get("pr_decode_tps"),
         "main_decode_tps": res.get("main_decode_tps"),
-        "pr_prefill_pp": res.get("pr_prefill_pp"),
-        "main_prefill_pp": res.get("main_prefill_pp"),
+        "pr_ar_tps": res.get("pr_ar_tps"),
+        "main_ar_tps": res.get("main_ar_tps"),
         "pr_ar_tps": res.get("pr_ar_tps"),
         "main_ar_tps": res.get("main_ar_tps"),
         "pr_dspark_tps": res.get("pr_dspark_tps"),
@@ -1218,12 +1218,12 @@ def format_comment(commit: str, res: dict) -> str:
         "lossless": res.get("lossless"),
     }
     marker = (
-        f"<!-- sparkinfer-modelopt-eval:{EVAL_SCHEMA_VERSION}:{commit} "
+        f"<!-- sparkinfer-dspark-eval:{EVAL_SCHEMA_VERSION}:{commit} "
         f"{json.dumps(meta, separators=(',', ':'))} -->"
     )
     if not res.get("ok"):
         return (
-            f"{marker}\n## sparkinfer modelopt auto-eval — error\n\n"
+            f"{marker}\n## sparkinfer DSpark auto-eval — error\n\n"
             f"**reason:** `{res.get('reason')}`\n\n"
             f"<details><summary>log tail</summary>\n\n```\n{(res.get('log') or '')[:1800]}\n```\n</details>\n"
         )
@@ -1325,6 +1325,82 @@ def auto_merge_ok_qwen38(repo, num):
 # the published Qwen3.8 tables are AR serving speed, and DSpark is not yet faster than AR.
 
 
+def try_auto_merge_qwen38(repo, num):
+    ok, reason = auto_merge_ok_qwen38(repo, num)
+    if not ok:
+        print(f">> dspark auto-merge SKIP #{num}: {reason}")
+        return False
+    r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash"])
+    if r.returncode != 0 and os.environ.get("SPARKINFER_AUTOMERGE_ADMIN", "1") == "1":
+        err = ((r.stderr or "") + (r.stdout or "")).lower()
+        if "not mergeable" in err or "branch policy" in err or "required" in err or "prohibited" in err:
+            print(">> dspark auto-merge: branch policy blocked — retrying with --admin")
+            r = arb.gh(["pr", "merge", str(num), "-R", repo, "--squash", "--admin"])
+    if r.returncode == 0:
+        print(f">> DSPARK AUTO-MERGED #{num} (qwen38-merge-first)")
+        arb.gh(["pr", "comment", str(num), "-R", repo, "--body",
+                "<!-- sparkinfer-dspark-automerge -->\n"
+                "Auto-merged as the round's `qwen38-merge-first` winner — verified same-box "
+                "128-token decode speedup over `main`, accuracy-gated vs llama.cpp."])
+        return True
+    print(f">> dspark auto-merge BLOCKED #{num}: {(r.stderr or r.stdout or '')[:200]}")
+    return False
+
+
+def reconcile_qwen38_merge_labels(repo, dry_run=False):
+    scores = _load_scores()
+    open_prs = json.loads(arb.gh([
+        "pr", "list", "-R", repo, "--state", "open",
+        "--json", "number,labels", "--limit", "80",
+    ]).stdout or "[]")
+    open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
+
+    merged = json.loads(arb.gh([
+        "pr", "list", "-R", repo, "--state", "merged", "--label", MODELOPT_MERGE_FIRST,
+        "--json", "number", "--limit", "10",
+    ]).stdout or "[]")
+    for m in merged:
+        if not dry_run:
+            arb.remove_label(repo, m["number"], MODELOPT_MERGE_FIRST)
+
+    scored = []
+    for num, labs in open_labels.items():
+        if MODELOPT_NEEDS_REBASE in labs:
+            continue
+        tiers = {l.split(":", 1)[1] for l in labs if l.startswith(EVAL_PREFIX)}
+        tier = next((t for t in tiers if t in SPEEDUP_LABELS), None)
+        if not tier:
+            continue
+        entry = scores.get(str(num)) or {}
+        if entry.get("label") not in SPEEDUP_LABELS:
+            if tier not in SPEEDUP_LABELS:
+                continue
+            entry = {"label": tier, "delta_pct": entry.get("delta_pct") or 0}
+        scored.append((num, float(entry.get("delta_pct") or 0), entry.get("label") or tier))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    if not scored:
+        print(">> dspark round: no verified speedup PRs")
+        return
+    winner = scored[0][0]
+    print(f">> dspark round: merge-first #{winner}; rebase {[n for n,_,_ in scored[1:]] or 'none'}")
+    if dry_run:
+        return
+    arb.add_label(repo, winner, MODELOPT_MERGE_FIRST)
+    arb.remove_label(repo, winner, MODELOPT_NEEDS_REBASE)
+    for num, _, _ in scored[1:]:
+        arb.add_label(repo, num, MODELOPT_NEEDS_REBASE)
+        arb.remove_label(repo, num, MODELOPT_MERGE_FIRST)
+    if AUTO_MERGE and try_auto_merge_qwen38(repo, winner):
+        # README refresh deliberately NOT wired for this bot (2026-08-18). pr_modelopt_bot.py
+        # refreshes the published Qwen3.8 table on every auto-merge, but that table is AR
+        # decode/prefill on the ModelOpt checkpoint, and DSpark's own number is currently BELOW
+        # plain AR decode (0.571x at main b59f6d5) -- auto-publishing it would put a
+        # speculative-decode figure into a table that reads as this model's serving speed.
+        # Wire it up once DSpark crosses AR and there is a number worth publishing.
+        pass
+
+
 def upload_qwen38_eval_log(repo, num, title, oid, res):
     """Commit the eval result (+ Polaris receipt/attestation) to sparkinfer-log, mirroring
     pr_dflash_bot.py's upload_dflash_eval_log with a qwen38-prefixed run id."""
@@ -1342,7 +1418,7 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
             "label": res.get("label"), "pass": res.get("pass"), "reason": res.get("reason"),
             "delta_pct": res.get("delta_pct"),
             "pr_decode_tps": res.get("pr_decode_tps"), "main_decode_tps": res.get("main_decode_tps"),
-            "pr_prefill_pp": res.get("pr_prefill_pp"), "main_prefill_pp": res.get("main_prefill_pp"),
+            "pr_ar_tps": res.get("pr_ar_tps"), "main_ar_tps": res.get("main_ar_tps"),
             "prefill_delta_pct": res.get("prefill_delta_pct"),
             "pr_ar_tps": res.get("pr_ar_tps"),
             "main_ar_tps": res.get("main_ar_tps"),
@@ -1402,9 +1478,9 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
     label = res.get("label") if res.get("ok") else "REJECT"
     if not res.get("ok"):
         label = "REJECT"
-    print(f"PR #{num}: eval-modelopt:{label}  "
-          f"decode PR={res.get('pr_decode_tps')} main={res.get('main_decode_tps')}  "
-          f"prefill PR={res.get('pr_prefill_pp')} main={res.get('main_prefill_pp')}  "
+    print(f"PR #{num}: eval-dspark:{label}  "
+          f"dspark PR={res.get('pr_dspark_tps')} main={res.get('main_dspark_tps')}  "
+          f"ar PR={res.get('pr_ar_tps')} main={res.get('main_ar_tps')}  "
           f"from={res.get('scored_dimension')}  "
           f"top1={res.get('pr_top1')} kl={res.get('pr_kl')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
@@ -1463,7 +1539,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             # scored; the rest ride along from the same sweep.
             "pr_dspark_tps": res.get("pr_dspark_tps"),
             "pr_mean_accept": res.get("pr_mean_accept"),
-            "pr_prefill_pp": res.get("pr_prefill_pp"),
+            "pr_ar_tps": res.get("pr_ar_tps"),
             "dspark_vs_ar": res.get("dspark_vs_ar"),
             "pr_ar_tps": res.get("pr_ar_tps"),
             "pr_top1": res.get("pr_top1"),
@@ -1502,7 +1578,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                 fail_clause = "(regression)"
             close_body = (
                 "<!-- sparkinfer-qwen38-auto-close -->\n"
-                f"## Closed: sparkinfer modelopt auto-eval — `eval-modelopt:{label}`\n\n"
+                f"## Closed: sparkinfer DSpark auto-eval — `eval-dspark:{label}`\n\n"
                 f"This PR's Qwen3.8-27B prefill@16k speed measured **{res.get('delta_pct')}%** "
                 f"vs main, {fail_clause} "
                 "— closing automatically. This bot evaluates every eligible PR in the repo "
@@ -1513,7 +1589,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             )
             arb.gh(["pr", "comment", str(num), "-R", repo, "--body", close_body])
             arb.gh(["pr", "close", str(num), "-R", repo])
-            print(f">> auto-closed PR #{num} (eval-modelopt:{label})")
+            print(f">> auto-closed PR #{num} (eval-dspark:{label})")
 
 
 def main():
@@ -1530,7 +1606,7 @@ def main():
 
     only = {int(x) for x in args.only_prs.split(",") if x.strip().isdigit()}
 
-    print(f">> modelopt eval transport: "
+    print(f">> dspark eval transport: "
           f"{'ssh' if ssh_box_enabled() else f'vast.ai (instance {arb.current_instance(args.instance) or args.instance})'}")
     print(f">> AUTOMERGE={int(AUTO_MERGE)}")
 
@@ -1597,7 +1673,7 @@ def main():
 
     if not pending:
         reconcile_qwen38_merge_labels(args.repo, dry_run=args.dry_run)
-        print("done — no modelopt PRs to evaluate.")
+        print("done — no dspark PRs to evaluate.")
         return
 
     if args.dry_run:
@@ -1629,7 +1705,7 @@ def main():
         # pending PR for what is really one shared infra problem.
         print(f">> main baseline measurement failed: {main_result.get('reason')} — skipping round")
         reconcile_qwen38_merge_labels(args.repo, dry_run=False)
-        print("done — modelopt round skipped (main baseline unusable).")
+        print("done — dspark round skipped (main baseline unusable).")
         return
     # main has no top1/kl of its own: it IS the accuracy reference, and its score dump was just
     # written to SCORE_DUMP_MAIN for each PR in this round to diff against.
