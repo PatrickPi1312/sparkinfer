@@ -108,11 +108,11 @@ FP4 tensor cores, and the checkpoint the automated eval scores every PR against:
 
 | context | decode | prefill |
 |---:|---:|---:|
-| 128 | **95.6** tok/s | **6,965** tok/s |
-| 4k | **93.5** tok/s | **13,841** tok/s |
-| 16k | **90.1** tok/s | **13,352** tok/s |
+| 128 | **95.7** tok/s | **6,942** tok/s |
+| 4k | **93.6** tok/s | **14,364** tok/s |
+| 16k | **90.2** tok/s | **13,794** tok/s |
 
-<sub>Auto-refreshed by the ModelOpt eval bot at `2528769ed` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
+<sub>Auto-refreshed by the ModelOpt eval bot at `44e1c4505` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
 <!-- BENCH:qwen38-modelopt:end -->
 
 Same weights the model was released with, re-quantized for the hardware it runs on. Measured at
