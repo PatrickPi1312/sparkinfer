@@ -235,6 +235,27 @@ DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "4096"))
 # bearing exactly when tau rises, which is the entire point of the work it guards.
 DSPARK_SPEC_REPS = int(os.environ.get("DSPARK_SPEC_REPS", "3"))
 
+# Mean accept length (tau) no-regression floor. THE most important gate this bot has, because
+# without it the scored objective is satisfied by deleting the feature it scores.
+#
+# The failure is not hypothetical and it is not subtle. Maximising DSPARK_TPS while DSpark is a NET
+# LOSS against AR means the gradient points at "speculate less", and its optimum is "do not
+# speculate at all" -- at which point DSpark IS autoregressive decode and the metric reads a win.
+# It happened twice: #868 took tau 1.255 -> 1.185 at ctx=128, and #869 idled the draft entirely
+# there (tau -> 1.000, decode 47 -> 86 tok/s, all of it the cost of speculation going away). Moving
+# the scored context to 4k did NOT fix it -- #876 then proposed exactly the same thing at 4k, its
+# own table showing tau 1.0847 -> 1.0000 for +9.6%, and it would have passed every other gate
+# including losslessness, which a non-speculating decoder satisfies trivially.
+#
+# So: a PR may not buy throughput with acceptance. Wins must come from cheaper speculation at
+# equal-or-better tau, which is the only direction that can ever carry DSpark past AR.
+#
+# The tolerance is looser than REGRESS_TOL (0.98): tau is a ratio of accepted tokens to steps over
+# a 128-token generation, so it moves in coarser increments than a throughput number and a
+# genuinely neutral change can jitter it. 0.95 blocks the "turn it off" direction -- which shows up
+# as tau collapsing toward 1.0, a 7%+ move from here -- without rejecting noise.
+DSPARK_TAU_TOL = float(os.environ.get("DSPARK_TAU_TOL", "0.95"))
+
 # Files that define WHAT IS MEASURED rather than what runs. A PR touching any of these is not
 # evaluated at all -- it is not a question of whether the change is good.
 #
@@ -1197,6 +1218,10 @@ def measure_main_baseline(host, port):
     # If MAIN is not lossless the whole round is meaningless: every PR would be compared against a
     # baseline that is already emitting unverified tokens, and "faster than a broken reference" is
     # not a result. Stop the round rather than scoring against it.
+    if not main.get("mean_accept"):
+        return {"ok": False, "reason": "main run missing/zero mean accept (tau) — the tau floor "
+                                       "cannot be applied without a reference",
+                "log": (r.stdout or "")[-1500:]}
     if not main.get("lossless"):
         return {"ok": False, "reason": "main run is NOT lossless — DSpark diverged from AR on main, "
                                        "so there is no valid baseline to score against",
@@ -1231,6 +1256,9 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
                 "log": (r.stdout or "")[-1500:]}
     if not pr.get("ar_tps"):
         return {"ok": False, "reason": "PR run missing/zero AR decode@4k tok/s",
+                "log": (r.stdout or "")[-1500:]}
+    if not pr.get("mean_accept"):
+        return {"ok": False, "reason": "PR run missing/zero mean accept (tau)",
                 "log": (r.stdout or "")[-1500:]}
     if "top1" not in pr or "kl" not in pr:
         # Either the score dump failed, or main's dump was missing so the comparator never ran
@@ -1324,6 +1352,19 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     # a confident-looking pass earned by one roll of the dice. Requiring the configured rep count
     # means a stale binary fails closed instead of silently downgrading the gate.
     runs = pr.get("lossless_runs", 0)
+    # TAU FLOOR. Deliberately placed before the losslessness gate, because a PR that removes
+    # speculation passes losslessness trivially -- with no draft, DSpark IS AR and the two token
+    # sequences cannot differ -- so losslessness offers no protection here at all.
+    pr_tau, main_tau = pr.get("mean_accept", 0.0), main.get("mean_accept", 0.0)
+    tau_ok = bool(main_tau) and pr_tau >= main_tau * DSPARK_TAU_TOL
+    if not tau_ok:
+        tau_reason = (f"mean accept regression: tau {pr_tau:.4f} < {100 * DSPARK_TAU_TOL:.0f}% of "
+                      f"main {main_tau:.4f} — throughput bought by speculating less is not a "
+                      f"speedup, it is the feature being removed")
+        reason = f"{tau_reason} | {reason}"
+        label = "REJECT"
+        passed = False
+
     lossless_ok = pr.get("lossless") is True and runs >= DSPARK_SPEC_REPS
     if pr.get("lossless") is True and runs < DSPARK_SPEC_REPS:
         reason = (f"losslessness verified over only {runs} run(s), need {DSPARK_SPEC_REPS} "
@@ -1381,6 +1422,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "dspark_vs_ar": round(pr["dspark_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
         "lossless": lossless_ok,
         "lossless_runs": runs,
+        "tau_ok": tau_ok,
         "q38_guard_ok": q38_ok,
         "q38_guard_problems": q38_problems,
         "q38_guard": pr.get("guard38"),
@@ -1463,6 +1505,13 @@ def format_comment(commit: str, res: dict) -> str:
     else:
         ls_row = ("| losslessness gate | ❌ **FAILED** — DSpark diverged from the AR reference — "
                   "**verdict forced to REJECT regardless of speed** |\n")
+    if res.get("tau_ok"):
+        tau_row = (f"| mean accept τ floor | ✅ {res.get('pr_mean_accept', 0):.4f} vs main "
+                   f"{res.get('main_mean_accept', 0):.4f} (bar ≥{100 * DSPARK_TAU_TOL:.0f}%) |\n")
+    else:
+        tau_row = (f"| mean accept τ floor | ❌ **FAILED** — {res.get('pr_mean_accept', 0):.4f} vs main "
+                   f"{res.get('main_mean_accept', 0):.4f} — throughput gained by speculating less is "
+                   "the feature being removed, not a speedup — **verdict forced to REJECT** |\n")
     def _guard_row(name, ok_key, prob_key, ctxs_key):
         if res.get(ok_key):
             vals = (res.get(ctxs_key) or {}).get(16384) or {}
@@ -1500,6 +1549,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{acc_row}"
         f"{main_acc_note}"
         f"{ls_row}"
+        f"{tau_row}"
         f"{q38_row}"
         f"{q36_row}"
         f"| PPL PR / main | {res.get('pr_ppl') or '?'} / {res.get('main_ppl') or '?'} |\n"
@@ -1730,7 +1780,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
           f"from={res.get('scored_dimension')}  "
           f"top1={res.get('pr_top1')} kl={res.get('pr_kl')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
-          f"lossless={res.get('lossless')} "
+          f"lossless={res.get('lossless')} tau_ok={res.get('tau_ok')} "
           f"tau={res.get('pr_mean_accept', 0):.3f} "
           f"dspark_vs_ar={res.get('dspark_vs_ar', 0):.3f}x "
           f"q38_guard_ok={res.get('q38_guard_ok')} q36_guard_ok={res.get('q36_guard_ok')}")
