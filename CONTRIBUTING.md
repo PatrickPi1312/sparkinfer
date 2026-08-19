@@ -19,8 +19,11 @@ source of the incentive loop is clear: SPARKINFER is built through **SN74 on Git
   submission format.
 - **Correctness first.** A faster kernel that changes the model's output is worth zero.
   Every change is gated against a frozen reference (see *Accuracy gate* below).
-- **General, not overfit.** Optimizations must hold across the basket — **Qwen3-MoE and
-  Gemma 4** — and across shapes. A win on one model/shape but not the other is overfitting.
+- **General, not overfit.** Optimizations must hold across the basket and across shapes; a win
+  on one model but a regression on another is overfitting, and the guards will catch it. The
+  live basket is **Qwen3.8-27B** (dense, the scored target) and **Qwen3.6-35B-A3B** (MoE, a
+  no-regression guard). They share `qwen35.cpp`, `qwen35_prefill.cpp` and the kernels, so a
+  change aimed at one routinely lands in the other's path.
 - **Blackwell only, by design.** Targets `sm_120` (RTX 5090, RTX PRO 6000) and `sm_121`
   (RTX Spark / Jetson Thor). CUDA 12.8+ (13 works). Not `sm_100`.
 
@@ -45,6 +48,13 @@ bench/scripts/accuracy.sh --download
 (`accuracy.sh` also compares against llama.cpp; the implementation bar there is ≥ 90%
 top-1, currently met at ~96–99%.) If `compute-sanitizer` is available, your kernels
 must be clean (0 errors).
+
+**Speculative-decode work is held to a stricter bar.** While the DSpark scope is active, the eval
+bot additionally requires **exact token equality** against the same build with the draft disabled —
+not distributional agreement. If you're touching the draft or the verify path, check that locally
+(`runtime/examples/dspark_tau_check.cpp` reports `LOSSLESS`) before opening the PR, and check it
+over several repeats: a single lossless run is weak evidence, and the bot runs repeats for exactly
+that reason. See the gate table in *What gets evaluated, reviewed, or closed*.
 
 ## How rewards work (SN74 on Gittensor)
 
@@ -73,9 +83,16 @@ per-subsystem budget**. Tiers are bands of **% speedup over the frontier** — `
 Because they scale with the frontier, every tier stays reachable as decode speed grows.
 
 **Non-speedup PRs are welcome — but score 0.** Bug fixes, refactors, tests, benchmarks, docs,
-and tooling are appreciated and we'll review and merge good ones, but SN74 emits only for
-verified speedups, so they earn no reward. (The eval/scoring harness is maintainer-owned — see
-*Maintainer-owned paths* below.)
+and tooling are appreciated and we'll review good ones, but SN74 emits only for verified
+speedups, so they earn no reward. They are reviewed by hand, not by the eval bot — see
+*What gets evaluated, reviewed, or closed* below for how that lane works. (The eval/scoring
+harness is maintainer-owned — see *Maintainer-owned paths*.)
+
+**Speedups are scored against the active evaluation scope, which is narrower than "anything
+faster."** At any time the eval bot scores **one** dimension on one model pair. A genuine,
+correct speedup somewhere that dimension doesn't measure will score `none` — not because the
+work is bad, but because the harness isn't pointed at it. Check the scope below *before* you
+invest in an optimization.
 
 **Evaluation is opt-in and proof-gated.** The RTX 5090 eval runs only when **both** hold: you tick
 **`- [x] Tested on RTX 5090`** *and* fill the template's **decode tok/s** table with a real
@@ -90,6 +107,96 @@ passes the gate (box ticked + real before<after decode numbers).
 > ⚠️ Tick that box **only if you actually ran it on an RTX 5090** and pasted the benchmark log.
 > Checking it without testing is false attestation — it is treated as gaming and the account will
 > be **blocked** (added to the denylist), the same as sybil farming.
+
+## What gets evaluated, reviewed, or closed
+
+Three lanes. Which one your PR lands in depends on **what it changes**, not on how good it is —
+so read this before you start, and say in the PR description which lane you're aiming for.
+
+### The active evaluation scope
+
+The eval bot scores **one dimension at a time**, and it moves as the optimization target moves.
+The authoritative statement is the `SCOPE` block at the top of the bot itself
+([`eval/pr_dspark_bot.py`](eval/pr_dspark_bot.py)) — that file is the source of truth, this
+table is a summary and can lag it.
+
+| | Current (since 2026-08-18) |
+|---|---|
+| **Scored dimension** | DSpark speculative decode throughput @ **ctx=4096** (`dspark-decode@4k`) |
+| **Model pair** | target = Qwen3.8-27B ModelOpt NVFP4; draft = released DSpark checkpoint |
+| **Harness** | `runtime/examples/dspark_tau_check.cpp` — both legs in one process, one model load |
+| **Not measured at all** | ctx=128 (any length below `kEngageMinSeq`=1024), batched-prefill parity |
+
+Nothing at ctx=128 has coverage any more. That was deliberate: below `kEngageMinSeq` the batched
+verify never arms, so the token loop runs one target forward per *kept* token — exactly what AR
+runs — and the only way to move the metric was to speculate less. A metric whose optimum is
+"turn the feature off" measures the wrong thing.
+
+### Lane 1 — evaluated and scored
+
+Changes to `kernels/`, `runtime/`, or `moe/` that move the scored dimension, with the opt-in gate
+satisfied (box ticked + real decode numbers). These earn a tier and can auto-merge. To earn one,
+a PR must clear **every** gate below — the first failure stops that PR and the bot moves on, so
+a rejection comment names one gate, not all of them:
+
+| Gate | Bar | Why |
+|---|---|---|
+| **Losslessness** | exact token equality vs the same build with the draft disabled | A speculative decoder that is fast because it emits unverified tokens is wrong, not fast. Fail-closed: missing or unparseable reads as fail. |
+| **Differential accuracy** | PR vs `main` token distributions must agree | Catches a PR that changes what the *target* produces — which losslessness alone cannot, since DSpark would faithfully reproduce a broken AR. |
+| **AR no-regression** | ≥ 0.98× `main` | Stops a "speedup" bought by slowing the AR baseline the two legs share, or by trading away ordinary serving decode. |
+| **Acceptance (τ) floor** | ≥ 0.95× `main` | Stops buying throughput by accepting fewer tokens. |
+| **Long-context guards** | ≥ 0.98× `main`, decode **and** prefill @ ctx=16k, on Qwen3.8 **and** Qwen3.6 | DSpark work lands in `qwen35.cpp` / shared kernels, which Qwen3.6 also uses — the exact surface through which #775 regressed a model nobody was scoring at the time. |
+
+Tiers are bands of % speedup over the frontier (`XS` 2–3.5% … `XL` >18%; under 2% is noise →
+`none`). A `none` or a failed gate is **auto-closed** — reopen after a fix and it re-evaluates.
+
+### Lane 2 — manually reviewed, not scored
+
+Correctness fixes, refactors, tests, benchmarks, docs, tooling — **including work on code the
+current scope doesn't measure.** These score 0 by design (SN74 emits only for verified speedups),
+but scoring 0 is not the same as being unwanted, and being outside the eval scope is **not**
+grounds for closing a correctness fix. A bug is a bug whether or not the harness is currently
+pointed at it.
+
+**Getting into this lane without tripping the auto-close.** An unticked RTX 5090 box is only safe
+for a PR that touches neither `runtime/` nor the PR template's checkbox — a docs-only change
+outside `runtime/`, say, is left open. Anything touching `runtime/` with the box unticked is
+auto-closed, *whatever it is*, because runtime changes need the greenlight to enter the eval
+queue. So for a correctness fix in `runtime/`:
+
+- **open it as a draft** — drafts are exempt from the 5090 auto-close — and say in the description
+  that it's a correctness fix not seeking evaluation; or
+- **ask for the [`hold`](../../labels/hold) label**, which exempts it from both the 5090
+  auto-close and the stale-close, then mark it ready.
+
+Maintainers, members and collaborators are exempt automatically. If your fix gets auto-closed
+anyway, that's the gate misfiring on intent — reopen as a draft and say so; it will not count
+against you.
+
+> **This is a correction of past practice, not just a description of it.** When the scope
+> narrowed to DSpark, open PRs unrelated to DSpark were closed in bulk to clear the eval queue,
+> and at least one genuine fix — [#885](../../pull/885), a Muse Glimmer GEMV correctness fix —
+> was closed for scope rather than on its merits. That was a queue-management action applied too
+> broadly. Out-of-scope *optimizations* will still be closed (they cannot be scored, and an open
+> PR that cannot be scored is a promise the harness can't keep); out-of-scope *correctness fixes*
+> should not be, and if yours was, reopen it and say so.
+
+### Lane 3 — closed
+
+- **Opt-in gate not met.** Box unticked → auto-closed (same as the `rtx5090-required` CI check)
+  if the PR touches `runtime/` **or** carries the template checkbox unticked. A docs-only PR
+  outside `runtime/` with no checkbox is left open. Drafts, `hold`, and
+  maintainers/members/collaborators are exempt. Box ticked but the decode table empty or showing
+  no gain → `needs-benchmark`, held rather than closed; fill in real numbers and it greenlights
+  automatically.
+- **Stale.** No new commits for over a day while queued → auto-closed to keep the eval queue
+  clean. This is not a judgment on the work: push a commit or reopen and it's picked straight
+  back up on the next cycle. `hold` and the current round winner are exempt.
+- **Repeated `none`/REJECT.** A third consecutive unscored result auto-closes; `hold` and
+  `merge-first` are exempt.
+- **Out-of-scope optimizations**, per Lane 2 above.
+- **Maintainer-owned paths** (below) — cannot merge regardless of content.
+- **Gaming** — copycatting, sybil farming; see *Anti-gaming*.
 
 ### Anti-gaming (how submissions are kept honest)
 
@@ -115,10 +222,17 @@ score. These paths are protected:
 | Path | What |
 |---|---|
 | `eval/` | the PR-evaluation bot + GPU runner |
-| `bench/scripts/` | the on-box scoring harness (`evaluate.sh`, `label.py`, `accuracy*`, `_common.sh`, the eval prompt) |
+| `bench/scripts/` | the on-box scoring harness (`evaluate.sh`, `label.py`, `accuracy*`, `_common.sh`, the eval prompts) |
+| `runtime/examples/dspark_tau_check.cpp` | **the measuring instrument for the current scope** — lives under `runtime/`, but is harness, not contributor surface |
 | `.gittensor/` | intra-repo emission weights |
 | `sparkinfer-web` `public/dashboard/data.json` | the live frontier ledger (eval bot pushes here; in-repo `dashboard/` is legacy) |
 | `.github/` | CI, `CODEOWNERS`, and this guard |
+
+⚠️ **Two of these sit inside paths you're otherwise invited to edit.** `runtime/examples/dspark_tau_check.cpp`
+and the eval prompt corpora under `bench/scripts/` belong to the harness even though `runtime/` is
+a contributor path. A PR touching any harness path is **skipped, not closed** — the bot comments
+saying so and never spends GPU time on it, because a number produced by a modified instrument
+can't be accepted either way. Split the harness change out and the rest evaluates normally.
 
 **Enforcement.** A required **`sensitive-paths-guard`** check automatically fails any PR from a
 non-maintainer that touches these paths, and `CODEOWNERS` requires maintainer review — so such
