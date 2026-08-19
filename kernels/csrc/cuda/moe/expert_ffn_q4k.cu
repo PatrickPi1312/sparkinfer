@@ -837,6 +837,77 @@ __global__ void gate_up_mmvq2_qwen_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// M token rows against ONE set of gate/up rows, in a single pass over those weights.
+//
+// gate_up_mmvq2_qwen_kernel above is launched with a grid of num_tokens*TOPK*F blocks, so the
+// token index lives in blockIdx and each block fetches the gate/up super-blocks it needs on its
+// own. For a 256-expert MoE that is exactly right -- different tokens genuinely want different
+// experts, and there is nothing to share. For a DENSE ffn (n_experts == 1, which is how
+// Qwen3.8-27B runs through this kernel) every token wants expert 0, so the same weights were being
+// pulled from DRAM once per token. The FFN is the bulk of the model's weight traffic, and that is
+// what made the DFlash verify cost scale with the block width instead of staying flat: measured
+// 1.49 forwards at N=2, 2.62 at N=4, 4.81 at N=7, against a ~0.4 + 0.6*N fit -- 0.6 being very
+// nearly the FFN's share of the traffic.
+//
+// Here the token index moves into the kernel and kbx stays the OUTER loop, so each super-block is
+// fetched once and dotted against all M rows while it is still in L1. Per-row arithmetic is
+// untouched -- same kbx traversal, same si_vec_dot_q4_K, same 4-warp shared reduce, same ordered
+// warp reduce -- so every output is bit-identical to the one-token launch it replaces, which is
+// what the verify's losslessness gate needs. Weights are addressed per row via expert_ids rather
+// than assumed to be expert 0, so a top_k==1 MoE stays correct; it simply has nothing to reuse.
+template <int H, int F, int TOPK, int M>
+__global__ void gate_up_mmvq2_qwen_rows_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int pdl
+) {
+    constexpr int NW = 4, WS = 32;
+    const int f = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4;
+    const int kqs = 2 * (tid & 15);
+    constexpr int NB = H >> 8;
+    const si_block_q4_K* g_rows[M];
+    const si_block_q4_K* u_rows[M];
+    const si_block_q8_1* v_rows[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+        const int e = expert_ids[r * TOPK];
+        g_rows[r] = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
+        u_rows[r] = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
+        v_rows[r] = vy + (size_t)r * (H >> 5);
+    }
+    float tg[M], tu[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) { tg[r] = 0.f; tu[r] = 0.f; }
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            tg[r] += si_vec_dot_q4_K(g_rows[r] + kbx, v_rows[r] + (size_t)kbx * 8, kqs);
+            tu[r] += si_vec_dot_q4_K(u_rows[r] + kbx, v_rows[r] + (size_t)kbx * 8, kqs);
+        }
+    }
+    __shared__ float sg[M][NW - 1][WS], su[M][NW - 1][WS];
+    if (warp > 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) { sg[r][warp - 1][lane] = tg[r]; su[r][warp - 1][lane] = tu[r]; }
+    }
+    __syncthreads();
+    if (warp > 0) return;
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+#pragma unroll
+        for (int l = 0; l < NW - 1; l++) { tg[r] += sg[r][l][lane]; tu[r] += su[r][l][lane]; }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            tg[r] += __shfl_xor_sync(0xffffffff, tg[r], m);
+            tu[r] += __shfl_xor_sync(0xffffffff, tu[r], m);
+        }
+        if (lane == 0) h_scratch[(size_t)r * F + f] = q4kf_silu(tg[r]) * tu[r];
+    }
+    if (pdl) si_pdl_lc();
+}
+
 template <int H, int F, int TOPK>
 __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
@@ -1835,11 +1906,31 @@ void launch_moe_expert_ffn_q4k(
         // arm: F is already large enough that pack2 coarsens scheduling. Compile-time H/F
         // makes NB = H>>8 = 20 a known trip count; same dots in the same order as the
         // generic kernel, so the result is bit-identical.
-        else if (gu_spec && hidden == 5120 && ffn == 17408 && top_k == 1)
-            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
-                gate_up_mmvq2_qwen_kernel<5120, 17408, 1>,
-                q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+        else if (gu_spec && hidden == 5120 && ffn == 17408 && top_k == 1) {
+            // Multi-token callers (the DFlash verify scoring a block of candidates) take the
+            // row-batched kernel, which walks F once instead of num_tokens*F and so reads gate/up
+            // from DRAM once instead of once per token. Bit-identical per row; see the kernel.
+            // SPARKINFER_GU_ROWS=0 restores the per-token grid.
+            static int gu_rows = -1;
+            if (gu_rows < 0) { const char* e = getenv("SPARKINFER_GU_ROWS"); gu_rows = (e && e[0] == '0') ? 0 : 1; }
+#define SI_GU_ROWS(MM) launch_pdl_kernel(gu_pdl, dim3(ffn), dim3(4 * 32), 0, stream, \
+                gate_up_mmvq2_qwen_rows_kernel<5120, 17408, 1, MM>, \
+                q, reinterpret_cast<const unsigned char*>(gate_q), \
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl)
+            if (gu_rows && num_tokens >= 2 && num_tokens <= 8) {
+                switch (num_tokens) {
+                    case 2: SI_GU_ROWS(2); break;  case 3: SI_GU_ROWS(3); break;
+                    case 4: SI_GU_ROWS(4); break;  case 5: SI_GU_ROWS(5); break;
+                    case 6: SI_GU_ROWS(6); break;  case 7: SI_GU_ROWS(7); break;
+                    default: SI_GU_ROWS(8); break;
+                }
+            } else
+                launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                    gate_up_mmvq2_qwen_kernel<5120, 17408, 1>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+#undef SI_GU_ROWS
+        }
         else
             launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_kernel,
