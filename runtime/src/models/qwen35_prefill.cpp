@@ -2559,12 +2559,23 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // FP8 GDN GEMV"), which this verifier predates -- it only knew bf16/Q8_0/Q4_K/Q6_K, so a
         // Qwen3.8 verify died here after clearing the dense-FFN stage.
         //
-        // Row loop rather than a batched FP8 GEMM, deliberately: AR decode drives exactly this
-        // kernel at one row, so N one-row calls are bit-identical to N AR steps by construction.
-        // A batched variant would change the reduction order and put losslessness back at risk for
-        // a saving on the GDN projections, which are a small share of the layer. Correctness first;
-        // this can be widened later against a known-lossless baseline.
+        // Batched first, row loop as fallback. This was a bare row loop on the reasoning that AR
+        // decode drives launch_gemv_fp8 at one row, so N one-row calls are bit-identical to N AR
+        // steps by construction, and that any batched variant would reassociate the reduction and
+        // put losslessness at risk "for a saving on the GDN projections, which are a small share of
+        // the layer". The first half is sound; the second badly understated the cost. FP8 is not a
+        // small share here -- on this target it is attention q/k/v/o and the linear-attn
+        // projections across all 64 layers, the 248320x5120 lm_head, and layers 56-63's MLP -- and
+        // since decode is memory-bound and W does not depend on the row, the loop re-read several
+        // GB per extra row. That was the whole shape of the verify cost curve: 16.686 ms at N=1,
+        // 16.740 at N=2, then 29.323 at N=4 and 53.465 at N=7 against an 11.162 ms single-token
+        // forward, growing ~4 ms per row where a memory-bound decode should be nearly flat.
+        // launch_gemv_fp8_rows keeps the reduction order rather than trading it away: same 8-wide
+        // K-association, same per-j accumulation, same ordered split sum, and the same S-by-N
+        // choice, so each row is bit-identical to the one-row call it replaces. It declines the
+        // shapes it cannot serve that way, and those still take the loop below.
         if (type == kernels::SI_QTYPE_FP8) {
+            if (kernels::launch_gemv_fp8_rows(in, w, out, N, no, k, st)) return true;
             for (int r = 0; r < N; ++r)
                 kernels::launch_gemv_fp8(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
             return true;
@@ -2612,6 +2623,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (type == kernels::SI_QTYPE_FP8 || type == kernels::SI_QTYPE_NVFP4) {
             if (type == kernels::SI_QTYPE_NVFP4 &&
                 kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, ps)) return true;
+            if (type == kernels::SI_QTYPE_FP8 &&
+                kernels::launch_gemv_fp8_rows(in, w, out, N, no, k, ps)) return true;
             for (int r = 0; r < N; ++r) {
                 const bf16* xr = in + (size_t)r * k;
                 bf16* yr = out + (size_t)r * no;

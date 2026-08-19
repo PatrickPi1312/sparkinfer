@@ -489,6 +489,75 @@ template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat1
 template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 #endif
 
+// M activation rows against one FP8 weight matrix, in a single pass over W.
+//
+// The DFlash verify scores a block of N candidate tokens per step, and every FP8 projection it
+// drives used to run gemv_fp8_sk_kernel once PER ROW (qwen35_prefill.cpp's row loop). Decode is
+// memory-bound and the weights do not depend on the row, so that re-read the entire matrix N
+// times to do N times one row's arithmetic. On this target -- FP8 attention q/k/v/o and linear-attn
+// projections across all 64 layers, plus the 248320x5120 lm_head and layers 56-63's MLP -- that is
+// several GB per extra row, and it showed up as a verify cost that grew ~4 ms per row past N=2
+// (N=1 16.686 ms, N=2 16.740, N=4 29.323, N=7 53.465, against an 11.162 ms single-token forward)
+// where a memory-bound decode should have been nearly flat. Hoisting the row loop INSIDE the
+// kernel reads W once and reuses each dequantized element M times.
+//
+// Bit-identical to the per-row path, which the losslessness gate requires: same 8-wide uint4
+// K-association, same per-j (even * x, odd * y) accumulation order, same ordered split sum seeded
+// from split 0. Only the number of times W is fetched changes.
+template <typename OutT, int S, int M>
+__global__ void gemv_fp8_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                        const void* __restrict__ packed,
+                                        OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[M][RPB][S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) acc[r] = 0.f;
+    if (n < N) {
+        const float s = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(packed)[n]);
+        const __nv_fp8_e4m3* row = reinterpret_cast<const __nv_fp8_e4m3*>(
+            reinterpret_cast<const char*>(packed) + (size_t)N * 2) + (size_t)n * (size_t)K;
+        const int n8 = K >> 3;
+        for (int i = split * 32 + lane; i < n8; i += S * 32) {
+            const int base = i * 8;
+            // The one fetch-and-dequant every row then shares.
+            float wv[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) wv[j] = si_fp8_deq(row, base + j, s);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const uint4 xv = reinterpret_cast<const uint4*>(x + (size_t)r * K)[i];
+                const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 xf = __bfloat1622float2(xh[j]);
+                    acc[r] += wv[2 * j] * xf.x + wv[2 * j + 1] * xf.y;
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < M; ++r)
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[r] += __shfl_xor_sync(0xffffffff, acc[r], m);
+        if (lane == 0)
+#pragma unroll
+            for (int r = 0; r < M; ++r) s_part[r][row_local][split] = acc[r];
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float o = s_part[r][row_local][0];
+#pragma unroll
+            for (int t = 1; t < S; ++t) o += s_part[r][row_local][t];
+            gemv_write(y + (size_t)r * N + n, o);
+        }
+    }
+}
+
 template <typename OutT>
 __global__ void gemv_fp8_kernel(const __nv_bfloat16* __restrict__ x,
                                 const void* __restrict__ packed,
@@ -2335,6 +2404,42 @@ void launch_gemv_fp8(const void* x, const void* W, void* y, int N, int K, cudaSt
     }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_fp8_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+}
+
+// Batched counterpart of launch_gemv_fp8. Returns false when it cannot serve the request
+// bit-identically, in which case the caller keeps its per-row loop.
+//
+// The S selection below is a COPY of launch_gemv_fp8's, deliberately: S sets how the K range is
+// partitioned and therefore the order of the final split sum, so picking a different S for the
+// same matrix would give a different (still correct) rounding and break the exactness the verify
+// relies on. The non-split-K and N >= 16384 cases decline instead of falling back to
+// gemv_fp8_kernel, for the same reason -- that path associates K differently.
+bool launch_gemv_fp8_rows(const void* x, const void* W, void* y, int M, int N, int K,
+                          cudaStream_t stream) {
+    if (!x || !W || !y || N < 1 || K < 1 || (K & 7)) return false;
+    if (M < 2 || M > 8) return false;               // M == 1 is launch_gemv_fp8's own case
+    if (!gemv_bf16_splitk() || N >= 16384) return false;
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+#define SI_FP8_ROWS(S_, R_) do { \
+        constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
+        const dim3 grid((N + RPB - 1) / RPB); \
+        gemv_fp8_rows_sk_kernel<__nv_bfloat16, S, R><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+    } while (0)
+#define SI_FP8_ROWS_S(R_) do { \
+        if (N >= 8192)      SI_FP8_ROWS(2, R_); \
+        else if (N >= 4096) SI_FP8_ROWS(4, R_); \
+        else                SI_FP8_ROWS(8, R_); \
+    } while (0)
+    switch (M) {
+        case 2: SI_FP8_ROWS_S(2); break;  case 3: SI_FP8_ROWS_S(3); break;
+        case 4: SI_FP8_ROWS_S(4); break;  case 5: SI_FP8_ROWS_S(5); break;
+        case 6: SI_FP8_ROWS_S(6); break;  case 7: SI_FP8_ROWS_S(7); break;
+        default: SI_FP8_ROWS_S(8); break;
+    }
+#undef SI_FP8_ROWS_S
+#undef SI_FP8_ROWS
+    return true;
 }
 
 void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cudaStream_t stream) {

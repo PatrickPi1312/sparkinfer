@@ -70,6 +70,14 @@ void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N,
 void launch_gemv_fp8(const void* x, const void* W, void* y, int N, int K,
                      cudaStream_t stream = nullptr);
 
+// Row-batched FP8 GEMV: M activation rows [M,K] against one weight stream -> y [M,N].
+// Each row reproduces launch_gemv_fp8's own dot/reduction order exactly, so results are
+// bit-identical to M separate one-row calls; only the weight loads and their dequant are shared.
+// Returns false for widths/shapes it does not cover (including M == 1, which is launch_gemv_fp8's
+// own case), so callers keep their row loop as fallback.
+bool launch_gemv_fp8_rows(const void* x, const void* W, void* y, int M, int N, int K,
+                          cudaStream_t stream = nullptr);
+
 // Compressed-tensors NVFP4 on-read GEMV. W is the SI_QTYPE_NVFP4 payload
 // [256 B header with f32 global_scale | ue4m3 scale[N*(K/16)] | packed u8[N*(K/2)]].
 // Dequant matches launch_ct_dequant_nvfp4 then a bf16 GEMV: each weight is rounded
