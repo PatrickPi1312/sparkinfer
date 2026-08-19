@@ -777,6 +777,26 @@ git checkout -qf FETCH_HEAD
 HEAD=$(git rev-parse --short HEAD)
 echo "REMOTE_HEAD $HEAD"
 
+# PIN THE MEASURING INSTRUMENT TO origin/main, for every ref including main itself.
+#
+# The harness lives in the repo, so without this each ref is measured with ITS OWN copy of it --
+# and the moment the harness changes, every PR branched before that change is compared against a
+# baseline measured by a DIFFERENT instrument. That is not a subtle skew; on 2026-08-19 removing
+# the NSPLITS pin moved the baseline by ~72%, and #878 -- branched an hour earlier, so still
+# carrying the pinned harness -- measured 45.37 against main's 74.07 and was auto-closed for a
+# "-47.5% regression" that was entirely the two refs using different rulers. It was the best PR of
+# the day: it had closed the DSpark/AR gap with AR flat and tau held.
+#
+# Same reasoning as the eval/polaris sync below, and consistent with HARNESS_PATHS: a PR may not
+# change these files anyway, so taking them from main costs a contributor nothing and makes the
+# comparison mean what it claims.
+git fetch -q origin main
+git checkout -q origin/main -- runtime/examples/dspark_tau_check.cpp bench/scripts/bench_prompt_4k.txt 2>/dev/null || {{
+  echo "HARNESS_PIN_FAILED -- could not take the harness from origin/main" >&2
+  exit 1
+}}
+echo "HARNESS_PINNED $(git rev-parse --short origin/main) (dspark_tau_check.cpp + bench_prompt_4k.txt)"
+
 test -d "$MODEL_DIR" || {{ echo "FAIL missing NVFP4 checkpoint dir $MODEL_DIR"; exit 1; }}
 test -f "$MODEL_DIR/config.json" || {{ echo "FAIL $MODEL_DIR has no config.json"; exit 1; }}
 
