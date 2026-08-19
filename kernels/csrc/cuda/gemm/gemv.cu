@@ -2467,7 +2467,12 @@ bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N,
                             cudaStream_t stream) {
     if (!x || !W || !y || N < 1 || K < 1 || (K & 15)) return false;
     if (!gemv_bf16_splitk()) return false;          // the rows kernel exists in split-K form only
-    if (M != 2 && M != 4 && M != 6) return false;   // instantiated widths; caller loops otherwise
+    // Every width 2..8, not just the even ones. The odd widths used to fall through to the
+    // caller's row loop, which re-read the whole weight matrix once per row -- so a 7-wide verify
+    // block paid full per-row traffic on every NVFP4 projection while a 6-wide one did not. That
+    // showed up directly in the cost curve, where N=7 kept the steepest slope after the FFN was
+    // batched (4.23 forwards, against 2.29 at N=4).
+    if (M < 2 || M > 8) return false;
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
 #define SI_NVFP4_ROWS(S_, R_) do { \
@@ -2480,9 +2485,12 @@ bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N,
         else if (N >= 4096) SI_NVFP4_ROWS(4, R_); \
         else                SI_NVFP4_ROWS(8, R_); \
     } while (0)
-    if (M == 2)      SI_NVFP4_ROWS_S(2);
-    else if (M == 4) SI_NVFP4_ROWS_S(4);
-    else             SI_NVFP4_ROWS_S(6);
+    switch (M) {
+        case 2: SI_NVFP4_ROWS_S(2); break;  case 3: SI_NVFP4_ROWS_S(3); break;
+        case 4: SI_NVFP4_ROWS_S(4); break;  case 5: SI_NVFP4_ROWS_S(5); break;
+        case 6: SI_NVFP4_ROWS_S(6); break;  case 7: SI_NVFP4_ROWS_S(7); break;
+        default: SI_NVFP4_ROWS_S(8); break;
+    }
 #undef SI_NVFP4_ROWS_S
 #undef SI_NVFP4_ROWS
     return true;
