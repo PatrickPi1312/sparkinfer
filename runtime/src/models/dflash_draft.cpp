@@ -1446,6 +1446,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             put("target_hidden", target_hidden, (size_t)ctx_len * n_cap * H * sizeof(bf16), true);
             put("target_proj",   s.target_proj, (size_t)ctx_len * H * sizeof(bf16), true);
             put("xn_last",       s.xn,          (size_t)BW * H * sizeof(bf16), true);
+            // The block's token embeddings -- the draft borrows the TARGET's embed table, so this
+            // is the only way to get layer 0's input without re-deriving it from a 20 GB sharded
+            // NVFP4 checkpoint whose embedding may itself be quantized.
+            put("noise_embed",   s.noise,       (size_t)BW * H * sizeof(bf16), true);
             put("logits",        s.logits,      (size_t)BW * V_ * sizeof(float), true);
             put("noise_ids",     noise_ids,     (size_t)BW * sizeof(int), false);
             put("d_out",         s.d_out,       (size_t)BW * sizeof(int), true);
