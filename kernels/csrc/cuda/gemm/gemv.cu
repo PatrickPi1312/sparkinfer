@@ -585,6 +585,23 @@ __device__ __forceinline__ float si_nvfp4_group_dot(const unsigned char* packed8
     return acc;
 }
 
+// TWO OPTIMISATIONS TRIED HERE AND REJECTED. Both were bit-identical (LOSSLESS=1) and both were
+// measured on the batched verify at ctx=4096, RTX 5090. Recorded so nobody repeats them:
+//
+//   1. Hoisting the group DECODE out of the row loop -- kept below, worth ~0.5%. These kernels are
+//      not compute-bound on dequantisation past one row.
+//
+//   2. Staging the R activation rows in SHARED memory per block, tiled at 1024 elements, to kill
+//      the L1 re-reads. COST 30%: N=1 16.588 -> 21.636 ms, N=4 29.203 -> 40.088. The two
+//      __syncthreads() per tile serialise the split-K warps that otherwise run free, and the
+//      cooperative load adds a whole extra pass over x. Do not re-try without first removing the
+//      need to synchronise.
+//
+// The motivating ncu numbers, for whoever picks this up: 3.41 GB of L1 traffic against 29.5 MB of
+// DRAM (115x), memory pipe 88% of peak, SM 33%. That ratio looks like an L1 bottleneck and is not
+// one -- the pattern is L1-resident and served fast. The kernel is latency-bound on a dependent
+// chain, not throughput-bound on any single pipe, which is why both traffic-reduction fixes failed.
+//
 // MEASURED WORTH ~0.5%. Kept because it is bit-identical and strictly cheaper, but do not expect
 // it to matter: hoisting the decode moved the batched verify 16.686 -> 16.588 ms at N=1 and
 // 29.323 -> 29.203 at N=4 (ctx=4096, RTX 5090). The hypothesis it tests -- that on-the-fly
