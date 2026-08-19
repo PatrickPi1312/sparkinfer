@@ -1186,6 +1186,69 @@ __global__ void down_q4k_mmvq_splitk_kernel(
     }
 }
 
+// M token rows against one expert's down rows, in a single pass over those weights.
+//
+// Same change as gate_up_mmvq2_qwen_rows_kernel, applied to the FFN's third matrix. The per-token
+// kernel above puts the token in blockIdx.x, so a dense ffn (every token on expert 0) re-read the
+// whole down projection once per candidate row of the DFlash verify. Here the token loop is the
+// INNER one, so each super-block is fetched once and dotted against all M rows while still in L1.
+//
+// Per-row arithmetic is untouched -- same flattened (expert, vdr-position) traversal in the same
+// order, same si_vec_dot_q4_K, same warp reduce, same ordered split sum from 0.f -- so outputs are
+// bit-identical to M single-token launches, and the verify's losslessness gate is unaffected.
+// Weights are addressed through expert_ids per row, so a top_k==1 MoE stays correct.
+template <int S, int M>
+__global__ void down_q4k_mmvq_splitk_rows_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int pdl
+) {
+    if (pdl) si_pdl_sync();
+    constexpr int RPB = WPB / S;
+    __shared__ float s_part[M][RPB][S];
+    const int lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    const int nblk = F >> 8;
+    const int q8pb = F >> 5;
+    const int work = nblk * 16;              // vdr=2 positions per superblock
+    float acc[M];
+#pragma unroll
+    for (int t = 0; t < M; ++t) acc[t] = 0.f;
+    if (hh < H) {
+        const int total = top_k * work;
+        for (int wi = split * 32 + lane; wi < total; wi += S * 32) {
+            const int j = wi / work, r = wi % work;
+            const int kbx = r >> 4, kqs = (r & 15) << 1;
+#pragma unroll
+            for (int t = 0; t < M; ++t) {
+                const int ts = t * top_k + j, e = expert_ids[ts];
+                const float w = expert_weights[ts];
+                const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+                    down_q + ((size_t)e * H + hh) * nblk * 144);
+                const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+                acc[t] += w * si_vec_dot_q4_K(drow + kbx, h8 + (size_t)kbx * 8, kqs);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], m);
+            if (lane == 0) s_part[t][hh_local][split] = acc[t];
+        }
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+            float o = 0.f;
+#pragma unroll
+            for (int s = 0; s < S; s++) o += s_part[t][hh_local][s];
+            output[(size_t)t * H + hh] = __float2bfloat16(o);
+        }
+    }
+}
+
 // int8 dp4a MMVQ down (Q5_K). Mirrors the Q4_K down (one warp per output row, top_k experts folded,
 // vdr=2 positions per superblock strided across the warp) with the Q5_K block size (176 B) and the
 // 5-bit vec_dot above. This is the down projection quant that the UD Q4_K_M Qwen3.6 experts use, and
@@ -1568,6 +1631,37 @@ static inline bool launch_down_q6k_mmvq_splitk(
         default: return false;
     }
 }
+// Row-batched counterpart of launch_down_q4k_mmvq_splitk. Only the generic (non shape-specialized)
+// split-K kernel has a rows form, so this declines anything it does not cover and the caller falls
+// back to the per-token grid.
+static inline bool launch_down_q4k_mmvq_splitk_rows(
+    int S, int M, int pdl, dim3 grid, const unsigned char* down_q, const int* expert_ids,
+    const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
+    int H, int F, int top_k, cudaStream_t stream
+) {
+    if (M < 2 || M > 8) return false;
+    const dim3 block(WPB * 32);
+#define SI_DOWN_ROWS(S_, M_) do { \
+        launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_rows_kernel<S_, M_>, \
+            down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); \
+        return true; \
+    } while (0)
+#define SI_DOWN_ROWS_M(S_) do { \
+        switch (M) { \
+            case 2: SI_DOWN_ROWS(S_, 2); case 3: SI_DOWN_ROWS(S_, 3); \
+            case 4: SI_DOWN_ROWS(S_, 4); case 5: SI_DOWN_ROWS(S_, 5); \
+            case 6: SI_DOWN_ROWS(S_, 6); case 7: SI_DOWN_ROWS(S_, 7); \
+            default: SI_DOWN_ROWS(S_, 8); \
+        } \
+    } while (0)
+    if (S == 2)      SI_DOWN_ROWS_M(2);
+    else if (S == 4) SI_DOWN_ROWS_M(4);
+    else if (S == 8) SI_DOWN_ROWS_M(8);
+#undef SI_DOWN_ROWS_M
+#undef SI_DOWN_ROWS
+    return false;
+}
+
 static inline bool launch_down_q4k_mmvq_splitk(
     int S, int pdl, dim3 grid, const unsigned char* down_q, const int* expert_ids,
     const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
@@ -2002,6 +2096,18 @@ void launch_moe_expert_ffn_q4k(
         const int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         if (S > 1) {
             const int RPB = WPB / S;
+            // Multi-token callers walk hidden once instead of num_tokens*hidden, reading the down
+            // projection from DRAM once rather than once per token. Bit-identical per row; see
+            // down_q4k_mmvq_splitk_rows_kernel. SPARKINFER_DOWN_ROWS=0 restores the per-token grid.
+            static int down_rows = -1;
+            if (down_rows < 0) { const char* e = getenv("SPARKINFER_DOWN_ROWS"); down_rows = (e && e[0] == '0') ? 0 : 1; }
+            if (down_rows && num_tokens >= 2 && num_tokens <= 8 && top_k == 1) {
+                dim3 dnr(1, (hidden + RPB - 1) / RPB);
+                if (launch_down_q4k_mmvq_splitk_rows(S, num_tokens, pdl, dnr,
+                        reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                        reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
+                    return;
+            }
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
             if (launch_down_q4k_mmvq_splitk(S, pdl, dns,
                     reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
