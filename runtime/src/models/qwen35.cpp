@@ -30,6 +30,7 @@
 #include "sparkinfer/lmcache_staging.h"
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -3249,6 +3250,13 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // timed per call so their cost can be compared directly rather than inferred from end-to-end
     // throughput. Synchronises around each call -- a measurement mode, not a benchmark -- but both
     // paths pay the same perturbation, so the RATIO is meaningful.
+    // Profiler capture range (SPARKINFER_DSPARK_PROFILE=1 + nsys --capture-range=cudaProfilerApi).
+    // Without this a profile of this binary is ~99% prompt prefill: at ctx=4096 the token-loop
+    // prefill runs 4096 forwards per leg against a few dozen decode steps, so the decode -- the
+    // only part that exercises the verify -- is lost in the noise. Learned by profiling the whole
+    // process first and getting 524,160 FFN instances, which is 4096 x 64 layers x 2 legs.
+    const bool kProfile = getenv("SPARKINFER_DSPARK_PROFILE") != nullptr;
+    if (kProfile) cudaProfilerStart();
     const bool kTiming = getenv("SPARKINFER_DSPARK_TIMING") != nullptr;
     double t_fwd_ms = 0, t_batched_ms = 0, t_draft_ms = 0;
     long n_fwd = 0, n_batched = 0, n_draft = 0;
@@ -3486,6 +3494,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         stats->steps = steps;
         stats->mean_accept = steps > 0 ? accept_sum / steps : 0;
         stats->ttft_s = std::chrono::duration<double>(t1 - t0).count();
+        if (kProfile) cudaProfilerStop();
         if (kTiming) {
             const double fpc = n_fwd ? t_fwd_ms / n_fwd : 0.0;
             fprintf(stderr, "[timing] draft   %8.3f ms/call  n=%ld\n", n_draft ? t_draft_ms / n_draft : 0.0, n_draft);
