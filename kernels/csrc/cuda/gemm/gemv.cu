@@ -585,6 +585,70 @@ __device__ __forceinline__ float si_nvfp4_group_dot(const unsigned char* packed8
     return acc;
 }
 
+// MEASURED WORTH ~0.5%. Kept because it is bit-identical and strictly cheaper, but do not expect
+// it to matter: hoisting the decode moved the batched verify 16.686 -> 16.588 ms at N=1 and
+// 29.323 -> 29.203 at N=4 (ctx=4096, RTX 5090). The hypothesis it tests -- that on-the-fly
+// dequantisation makes these kernels compute-bound past one row -- is WRONG, and this comment
+// exists so nobody derives it again and spends an afternoon on it.
+//
+// What actually scales with R, from re-reading the loop: per group the kernel reads 8 bytes of
+// packed weight plus one scale byte, against R*16 bf16 ACTIVATIONS. The weights are shared across
+// rows; the activations are re-read by every block. At 4-bit weights the activation side is the
+// larger one, which is why "verifying N rows should cost one weight read" never materialised.
+//
+// Split of si_nvfp4_group_dot for MULTI-ROW use: decode one group's 16 weights ONCE, then dot
+// them against each row. The dot is per row; the decode is not, and separating them is the whole
+// point -- profiled at ctx=4096, gemv_nvfp4_rows_sk cost 1.82x a one-row call for TWO rows, where
+// weight-bandwidth-bound sharing should give ~1.05x. The rows kernel already hoisted the DRAM read
+// out of the row loop, but si_nvfp4_group_dot re-ran __ldg + 16 nibble decodes + 16 scale
+// multiplies per row on bytes that are identical across rows. At N=1 these kernels are
+// bandwidth-bound; past that the repeated decode makes them compute-bound, which is why rows
+// stopped amortising past N=2.
+//
+// BIT-IDENTICAL to si_nvfp4_group_dot, deliberately. (weight * s) depends only on the weight and
+// the scale, never on the row, so precomputing it changes nothing about the arithmetic: each term
+// is still (si_e2m1_x2(nibble) * s) * x, evaluated in the same order and accumulated in the same
+// order. This is NOT the transformation the header above warns against -- that one applied the
+// scale once to the finished dot product, which reassociates and measurably moved top1/KL. The
+// scale stays folded into every term here; it is merely folded once instead of R times.
+__device__ __forceinline__ void si_nvfp4_group_decode(const unsigned char* packed8,
+                                                      unsigned char scale, float inv_g,
+                                                      float* __restrict__ ws) {
+    const float s = si_ue4m3(scale) * inv_g * 0.5f;
+    const unsigned int p0 = __ldg(reinterpret_cast<const unsigned int*>(packed8));
+    const unsigned int p1 = __ldg(reinterpret_cast<const unsigned int*>(packed8 + 4));
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p0 >> (8 * i)) & 255u;
+        ws[2 * i]     = si_e2m1_x2(b & 15u) * s;
+        ws[2 * i + 1] = si_e2m1_x2(b >> 4) * s;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p1 >> (8 * i)) & 255u;
+        ws[8 + 2 * i]     = si_e2m1_x2(b & 15u) * s;
+        ws[8 + 2 * i + 1] = si_e2m1_x2(b >> 4) * s;
+    }
+}
+
+// Same term order and same accumulation order as si_nvfp4_group_dot, reading pre-scaled weights.
+__device__ __forceinline__ float si_nvfp4_group_dot_decoded(const float* __restrict__ ws,
+                                                            const __nv_bfloat16* x16) {
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x16);
+    float acc = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 xf = __bfloat1622float2(x2[i]);
+        acc += ws[2 * i] * xf.x + ws[2 * i + 1] * xf.y;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 xf = __bfloat1622float2(x2[i + 4]);
+        acc += ws[8 + 2 * i] * xf.x + ws[8 + 2 * i + 1] * xf.y;
+    }
+    return acc;
+}
+
 template <typename OutT, int S>
 __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                      const void* __restrict__ packed,
@@ -656,11 +720,12 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
         const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
         const int ng = K >> 4;
         for (int g = split * 32 + lane; g < ng; g += S * 32) {
-            const unsigned char sc = srow[g];
+            // Decode the group once, then dot it against every row. See si_nvfp4_group_decode.
+            float ws[16];
+            si_nvfp4_group_decode(prow + (size_t)g * 8, srow[g], inv_g, ws);
             #pragma unroll
             for (int r = 0; r < R; r++)
-                acc[r] += si_nvfp4_group_dot(prow + (size_t)g * 8, sc, inv_g,
-                                             x + (size_t)r * K + (size_t)g * 16);
+                acc[r] += si_nvfp4_group_dot_decoded(ws, x + (size_t)r * K + (size_t)g * 16);
         }
         #pragma unroll
         for (int r = 0; r < R; r++) {
