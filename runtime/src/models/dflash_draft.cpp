@@ -1387,6 +1387,50 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     cu(cudaMemcpyAsync(s.h_out, s.d_out,
                        (head_done ? kProposalDepth + 1 : B) * sizeof(int),
                        cudaMemcpyDeviceToHost, st), "argmax");
+
+    // NUMERICAL DIFFERENTIAL DUMP (SPARKINFER_DSPARK_DUMP=<dir>). Writes ONE block's worth of
+    // inputs and intermediates so a Python reference can recompute the same step from the same
+    // bytes and diff tensor by tensor. Dumps only the first call of a process -- one block is
+    // enough to localise a numerical divergence, and dumping every step would write gigabytes.
+    //
+    // Exists because every structural hypothesis has been eliminated (block construction, row
+    // indexing, context injection, injected-KV positions, NVFP4 scale convention, aux-layer
+    // capture point) while acceptance is still ~1.36 against a reported ~3.8. What is left can
+    // only be found by comparing numbers, not by reasoning about wiring.
+    if (const char* dump_dir = getenv("SPARKINFER_DSPARK_DUMP")) {
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            cudaStreamSynchronize(st);
+            auto put = [&](const char* nm, const void* dev, size_t bytes, bool from_device) {
+                std::vector<char> host(bytes);
+                if (from_device)
+                    cudaMemcpy(host.data(), dev, bytes, cudaMemcpyDeviceToHost);
+                else
+                    memcpy(host.data(), dev, bytes);
+                std::string path = std::string(dump_dir) + "/" + nm + ".bin";
+                FILE* f = fopen(path.c_str(), "wb");
+                if (f) { fwrite(host.data(), 1, bytes, f); fclose(f); }
+            };
+            const size_t V_ = (size_t)V;
+            put("target_hidden", target_hidden, (size_t)ctx_len * n_cap * H * sizeof(bf16), true);
+            put("target_proj",   s.target_proj, (size_t)ctx_len * H * sizeof(bf16), true);
+            put("xn_last",       s.xn,          (size_t)BW * H * sizeof(bf16), true);
+            put("logits",        s.logits,      (size_t)BW * V_ * sizeof(float), true);
+            put("noise_ids",     noise_ids,     (size_t)BW * sizeof(int), false);
+            put("d_out",         s.d_out,       (size_t)BW * sizeof(int), true);
+            std::string meta = std::string(dump_dir) + "/meta.txt";
+            if (FILE* f = fopen(meta.c_str(), "w")) {
+                fprintf(f, "ctx_len %d\npos0 %d\npast %d\nBW %d\ndepth %d\nH %d\nV %d\n"
+                           "n_cap %d\nmarkov_rank %d\nblock_size %d\nfc_skip %d\n",
+                        ctx_len, pos0, past, BW, kProposalDepth, H, V, n_cap, s.markov_rank,
+                        c.block_size, fc_skip);
+                fclose(f);
+            }
+            fprintf(stderr, "[dspark-dump] wrote one block to %s (ctx_len=%d BW=%d depth=%d)\n",
+                    dump_dir, ctx_len, BW, kProposalDepth);
+        }
+    }
     if (out_confidence && s.confidence_w)
         cu(cudaMemcpyAsync(s.h_confidence + 1, s.d_confidence + 1,
                            kProposalDepth * sizeof(float), cudaMemcpyDeviceToHost, st),
