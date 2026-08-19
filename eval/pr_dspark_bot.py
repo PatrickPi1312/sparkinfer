@@ -176,7 +176,12 @@ MODELOPT_MERGE_FIRST = "dspark-merge-first"
 MODELOPT_NEEDS_REBASE = "dspark-needs-rebase"
 # First schema for this bot. Same reasoning as the sibling bots' own bumps: a PR evaluated before
 # a scoring change existed must not keep a stale-scored label/score forever.
-EVAL_SCHEMA_VERSION = "v1-dspark-decode128"
+# v2 (2026-08-19): the NSPLITS=1 pin was removed from dspark_tau_check, so throughput is now
+# measured at the split count the engine selects rather than in a regime nothing serves. The
+# baseline moves by ~72% (dspark@4k 43.06 -> 74.05, ar@4k 47.39 -> 90.19) and every score taken
+# under v1 is incomparable -- bumping the schema forces re-evaluation instead of letting a stale
+# label sit next to a number that no longer means the same thing.
+EVAL_SCHEMA_VERSION = "v2-dspark-decode4k-adaptive-splits"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-dspark-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,

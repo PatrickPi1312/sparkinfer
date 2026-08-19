@@ -45,13 +45,33 @@ int main(int argc, char** argv) {
         printf("usage: %s <qwen38_dir> <dspark_dir> <max_new> <id0> [id1 ...]\n", argv[0]);
         return 2;
     }
-    // Flash-decode's split-K reduction is atomic and therefore order-dependent: default splits
-    // (adaptive, effectively ~32) gave 27-32/32 agreement across repeat runs of the SAME decode,
-    // vs 32/32 x3 with SPARKINFER_NSPLITS=1. A tau/lossless measurement needs the target's own
-    // AR decode to be deterministic, or a real divergence from the verify head becomes
-    // indistinguishable from ordinary split-K noise. `0` (don't overwrite) so an explicit env
-    // override still wins for anyone deliberately sweeping splits.
-    setenv("SPARKINFER_NSPLITS", "1", 0);
+    // NO SPARKINFER_NSPLITS PIN. There used to be one (=1), and removing it on 2026-08-19 is the
+    // single most consequential change this harness has had.
+    //
+    // Its justification was that "flash-decode's split-K reduction is atomic and therefore
+    // order-dependent", citing 27-32/32 agreement at adaptive splits versus 32/32 pinned. That was
+    // wrong, and the error was one of attribution. Read fa_combine_kernel: each warp folds a fixed
+    // strided subset of splits in ascending order, then warps are folded in ascending index, and
+    // there is not a single atomic in flash_decode_split.cu. The decode combine is a fixed-order
+    // reduction for a given n_splits. The nondeterminism that experiment measured was real but came
+    // from the TWO ATOMIC SPLIT-K PREFILL GEMMS pinned immediately below -- which were still live
+    // when it was run, and were only root-caused afterwards. Decode was blamed for prefill's flake.
+    //
+    // The cost of that mistake was not academic. Pinning n_splits to 1 leaves the flash-decode grid
+    // a fraction of the machine wide, and measured on this box at ctx=4096 it costs 35% of decode
+    // throughput: 93.40 tok/s at the split count the engine selects, 60.43 pinned. The eval scored
+    // every PR in that regime -- a configuration nothing serves -- and in one day merged three
+    // attention PRs that measured +11.8%, +18.6% and +11.7% against it (#872, #874, #877) while
+    // production decode at 4k went 93.69 -> 93.64. Three tiers awarded, nothing delivered. Two
+    // separate contributors (#871, #875) diagnosed the pin correctly before we did.
+    //
+    // So: splits are left adaptive, exactly as the server runs them, and throughput measured here
+    // is throughput that transfers. An explicit SPARKINFER_NSPLITS in the environment still wins
+    // for anyone deliberately sweeping, and setting it also disables adaptive selection -- so do
+    // not set it in the eval path.
+    //
+    // Determinism is verified rather than assumed: see the AR-REPS and SPEC-REPS probes below, and
+    // the losslessness verdict now requires every repeat to match, not just the first.
     // Same story, second and third instances (2026-08-17): TWO more atomic split-K prefill GEMMs,
     // found only after a multi-round dflash_generate run that looked individually correct at
     // every kernel level (LM head, GDN conv/scan/commit all independently verified bit-exact
