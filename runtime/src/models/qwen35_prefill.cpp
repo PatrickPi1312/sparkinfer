@@ -3084,13 +3084,34 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // most likely, see the #712 precedent noted at the flash_decode_split call below) is the
         // real source. Kept anyway: it is still a strictly more defensible position than trusting
         // an unverified "same order" claim, and costs nothing extra since N is small here.
-        const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
-        for (int r = 0; r < N; ++r) {
-            kernels::launch_mmvq_q4k_f32(
-                static_cast<const unsigned char*>(q81) + (size_t)r * q81_row_bytes,
-                s.w.lm_head, logits + (size_t)r * c.vocab, c.vocab, H, st);
+        // UPDATE (2026-08-20): the "costs nothing extra since N is small here" above is wrong, and
+        // it was the single largest remaining per-row cost in the verify. This head is
+        // 248320x5120 Q4_K, ~0.72 GB, and nsys clocks one row at 423 us -- 1.70 TB/s, squarely
+        // DRAM-bound -- so the loop re-read the whole head once per candidate row: 1.7 ms of a
+        // 21.6 ms verify at N=4, and 2.9 ms of 35.2 ms at N=7.
+        //
+        // launch_mmvq_rows_f32 covers exactly this case (qtype 12, K=5120) through
+        // si_mmvq_q4k_rows_exact_kernel -- the same kernel whose per-row dot/reduction order the
+        // note above already tested and found to leave the then-current divergence byte-for-byte
+        // unchanged, i.e. it reproduces the per-row AR order. It reads the head once for all N
+        // rows. The loop stays as the fallback for any shape it declines, and
+        // SPARKINFER_DFLASH_VERIFY_HEAD_ROWS=0 restores it outright.
+        static const bool head_rows_on = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_ROWS");
+            return !(e && e[0] == '0');
+        }();
+        head_ok = head_rows_on && N > 1 &&
+                  kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
+                                                N, c.vocab, H, st);
+        if (!head_ok) {
+            const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
+            for (int r = 0; r < N; ++r) {
+                kernels::launch_mmvq_q4k_f32(
+                    static_cast<const unsigned char*>(q81) + (size_t)r * q81_row_bytes,
+                    s.w.lm_head, logits + (size_t)r * c.vocab, c.vocab, H, st);
+            }
+            head_ok = true;
         }
-        head_ok = true;
     } else {
         head_ok = kernels::launch_mmvq_rows_f32(
             s.w.lm_head_type, q81, s.w.lm_head, logits, N, c.vocab, H, st);
