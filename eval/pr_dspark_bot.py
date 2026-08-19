@@ -693,7 +693,7 @@ def _ssh_run_resilient(host, port, script: str, label: str):
     return r
 
 
-def _remote_script(ref: str, role: str = "pr") -> str:
+def _remote_script(ref: str, role: str = "pr", main: dict | None = None) -> str:
     """Bash run on the eval box: checkout ref, build, DSpark speculative decode @ctx=4k against
     the NVFP4 target, and the teacher-forced score dump.
 
@@ -714,6 +714,19 @@ def _remote_script(ref: str, role: str = "pr") -> str:
     dump_self = shlex.quote(SCORE_DUMP_MAIN if role == "main" else SCORE_DUMP_PR)
     dump_main = shlex.quote(SCORE_DUMP_MAIN)
     is_pr = "1" if role == "pr" else "0"
+    # Reference values so a PR run can reject itself the moment a gate fails, instead of paying for
+    # the accuracy dump and both 16k guard sweeps to produce a verdict already decided. Zero for the
+    # main run, which has nothing to compare against and must always run every stage -- it IS the
+    # reference. Kept as plain numbers rather than re-deriving the thresholds in bash: the bash only
+    # ever compares, the policy stays in Python.
+    m = main or {}
+    ref_dspark = float(m.get("dspark_tps") or 0)
+    ref_ar = float(m.get("ar_tps") or 0)
+    ref_tau = float(m.get("mean_accept") or 0)
+    tau_tol = DSPARK_TAU_TOL
+    regress_tol = REGRESS_TOL
+    acc_top1 = ACC_TOP1_BAR
+    acc_kl = ACC_KL_BAR
     q38_guard_dir = shlex.quote(Q38_GUARD_MODEL_DIR)
     q36_dir = shlex.quote(Q36_GUARD_MODELS_DIR)
     q36_file = shlex.quote(Q36_GUARD_MODEL_FILE)
@@ -762,6 +775,11 @@ EVAL_TEXT={eval_text}
 DUMP_SELF={dump_self}
 DUMP_MAIN={dump_main}
 IS_PR={is_pr}
+REF_DSPARK={ref_dspark}
+REF_AR={ref_ar}
+REF_TAU={ref_tau}
+TAU_TOL={tau_tol}
+REGRESS_TOL={regress_tol}
 Q38_GUARD_MODEL_DIR={q38_guard_dir}
 Q36_GUARD_MODELS_DIR={q36_dir}
 Q36_GUARD_MODEL_FILE={q36_file}
@@ -889,6 +907,36 @@ echo "RESULT_MEAN_ACCEPT $(_ds_metric MEAN_ACCEPT)"
 echo "RESULT_LOSSLESS $(_ds_metric LOSSLESS)"
 echo "RESULT_LOSSLESS_RUNS $(_ds_metric LOSSLESS_RUNS)"
 
+# --- FAIL FAST -------------------------------------------------------------------------------
+# Every gate below is decidable from the stage that just ran, so a PR that fails one is already
+# REJECTed no matter what the remaining stages say. Running them anyway costs the accuracy dump
+# plus two 16k guard sweeps -- each its own multi-GB model load -- to produce a verdict that cannot
+# change. Skipped only for a PR: the main run has no reference and must measure every stage.
+#
+# The thresholds arrive as numbers from Python (REF_*/`*_TOL`); bash only compares, so there is one
+# definition of the policy and it is not this file.
+if [ "$IS_PR" = "1" ]; then
+  _fail_fast() {{ echo "EARLY_REJECT $1"; echo "EARLY_REJECT_STAGE dspark"; exit 0; }}
+  _lt() {{ python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)" "$1" "$2"; }}
+  DS=$(_ds_metric DSPARK_TPS); AR=$(_ds_metric AR_TPS)
+  TAU=$(_ds_metric MEAN_ACCEPT); LL=$(_ds_metric LOSSLESS); LLR=$(_ds_metric LOSSLESS_RUNS)
+  [ "${{LL%%.*}}" = "1" ] || _fail_fast "losslessness gate failed: DSpark output does not match the AR reference token-for-token"
+  _lt "$LLR" "{spec_reps}" && _fail_fast "losslessness verified over only ${{LLR%%.*}} run(s), need {spec_reps}"
+  if _lt "0" "$REF_TAU"; then
+    _lt "$TAU" "$(python3 -c "print($REF_TAU * $TAU_TOL)")" \
+      && _fail_fast "mean accept regression: tau $TAU < $(python3 -c "print(round($TAU_TOL*100))")% of main $REF_TAU -- throughput bought by speculating less is not a speedup"
+  fi
+  if _lt "0" "$REF_DSPARK"; then
+    _lt "$DS" "$(python3 -c "print($REF_DSPARK * $REGRESS_TOL)")" \
+      && _fail_fast "dspark-decode@4k regression: $DS < $(python3 -c "print(round($REGRESS_TOL*100))")% of main $REF_DSPARK"
+  fi
+  if _lt "0" "$REF_AR"; then
+    _lt "$AR" "$(python3 -c "print($REF_AR * $REGRESS_TOL)")" \
+      && _fail_fast "ar-decode@4k regression: $AR < $(python3 -c "print(round($REGRESS_TOL*100))")% of main $REF_AR"
+  fi
+fi
+# ---------------------------------------------------------------------------------------------
+
 # --- teacher-forced score dump (differential accuracy gate, module docstring pt. 2) ---
 # llama.cpp cannot read a compressed-tensors directory, so there is no same-weights external
 # reference available for this checkpoint. Instead score the SAME token stream on this build and
@@ -916,9 +964,27 @@ echo "ACCURACY_STAGE_DONE"
 
 if [ "$IS_PR" = "1" ]; then
   if [ -s "$DUMP_MAIN" ]; then
-    python3 bench/scripts/accuracy_compare_pair.py "$DUMP_SELF" "$DUMP_MAIN" || true
+    python3 bench/scripts/accuracy_compare_pair.py "$DUMP_SELF" "$DUMP_MAIN" 2>&1 | tee /tmp/acc_cmp.txt || true
   else
     echo "ACCURACY_NO_BASELINE" >&2
+  fi
+fi
+
+# Second fail-fast point: the accuracy gate is decided, and the two guard sweeps below are two
+# more model loads that cannot change a REJECT. accuracy_compare_pair.py prints "METRIC top1=..
+# kl=..", so grep it back out rather than re-deriving it.
+if [ "$IS_PR" = "1" ]; then
+  ACCLINE=$(grep -m1 "^METRIC .*top1=" /tmp/acc_cmp.txt 2>/dev/null || true)
+  if [ -n "$ACCLINE" ]; then
+    A_TOP1=$(printf '%s' "$ACCLINE" | tr ' ' '\n' | sed -n 's/^top1=//p' | head -1)
+    A_KL=$(printf '%s' "$ACCLINE" | tr ' ' '\n' | sed -n 's/^kl=//p' | head -1)
+    if [ -n "$A_TOP1" ] && [ -n "$A_KL" ]; then
+      if _lt "$A_TOP1" "{acc_top1}" || _lt "{acc_kl}" "$A_KL"; then
+        echo "EARLY_REJECT accuracy gate failed vs main: top1=$A_TOP1 (bar >={acc_top1}) kl=$A_KL (bar <={acc_kl})"
+        echo "EARLY_REJECT_STAGE accuracy"
+        exit 0
+      fi
+    fi
   fi
 fi
 
@@ -1026,6 +1092,10 @@ def _parse_remote(stdout: str) -> dict:
                 out["lossless"] = int(float(line.split()[1])) == 1
             except ValueError:
                 out["lossless"] = False
+        elif line.startswith("EARLY_REJECT_STAGE "):
+            out["early_reject_stage"] = line.split(None, 1)[1].strip()
+        elif line.startswith("EARLY_REJECT "):
+            out["early_reject"] = line.split(None, 1)[1].strip()
         elif line.startswith("DSPARK_RUN_FAILED"):
             out["dspark_run_failed"] = True
         elif line.startswith("RESULT_TOKEN_COUNT "):
@@ -1269,13 +1339,37 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     """Run the PR ref's speed+accuracy script on the same box and compare against `main`, an
     already-measured baseline shared across every PR in the round (see measure_main_baseline)."""
     print(f">> DSpark eval on box: PR ref={pr_ref}")
-    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr"), "PR run")
+    r = _ssh_run_resilient(host, port, _remote_script(pr_ref, role="pr", main=main), "PR run")
     if r.returncode != 0:
         tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-2000:]
         crash = _crash_reason(r.stdout, r.stderr)
         reason = "PR speed/accuracy run failed" + (f" — {crash}" if crash else " (no crash diagnostic captured, possible hard kill — retried once)")
         return {"ok": False, "reason": reason, "log": tail}
     pr = _parse_remote(r.stdout or "")
+    # Fail-fast short-circuit. The remote script stops at the first decided gate, so the later
+    # stages' metrics are ABSENT BY DESIGN -- without this they would trip the missing-metric checks
+    # below and be reported as an infra fault ("missing accuracy METRIC line") instead of the real
+    # verdict. Everything measured before the stop is still reported.
+    if pr.get("early_reject"):
+        stage = pr.get("early_reject_stage", "?")
+        print(f">> PR fail-fast at the {stage} stage: {pr['early_reject']}")
+        res = {
+            "ok": True, "label": "REJECT", "pass": False,
+            "reason": pr["early_reject"] + f" (stopped at the {stage} stage; later stages skipped)",
+            "delta_pct": 0.0, "early_reject": True, "early_reject_stage": stage,
+            "pr_dspark_tps": pr.get("dspark_tps", 0.0), "main_dspark_tps": main.get("dspark_tps", 0.0),
+            "pr_ar_tps": pr.get("ar_tps", 0.0), "main_ar_tps": main.get("ar_tps", 0.0),
+            "pr_decode_tps": pr.get("dspark_tps", 0.0), "main_decode_tps": main.get("dspark_tps", 0.0),
+            "pr_mean_accept": pr.get("mean_accept", 0.0), "main_mean_accept": main.get("mean_accept", 0.0),
+            "lossless": pr.get("lossless") is True, "lossless_runs": pr.get("lossless_runs", 0),
+            "tau_ok": False if stage == "dspark" else None,
+            "dspark_vs_ar": round(pr["dspark_tps"] / pr["ar_tps"], 3) if pr.get("ar_tps") else 0,
+            "scored_dimension": SCORING_DIM, "speedup_vs_main": 0,
+            "pr_top1": pr.get("top1"), "pr_kl": pr.get("kl"),
+            "accuracy_ok": stage != "accuracy",
+            "pr_head": pr.get("head"), "main_head": main.get("head"),
+        }
+        return res
     if not pr.get("dspark_tps"):
         return {"ok": False, "reason": "PR run missing/zero DSpark decode@4k tok/s",
                 "log": (r.stdout or "")[-1500:]}
