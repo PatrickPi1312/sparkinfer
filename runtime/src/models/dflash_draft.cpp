@@ -1181,8 +1181,20 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             const char* e = getenv("SPARKINFER_DFLASH_MIXED_CAUSAL");
             return (!e || e[0] != '0') ? 1 : 0;
         }();
-        const bool causal = mixed_causal && L < (int)c.sliding_layers.size() &&
-                            c.sliding_layers[L];
+        // FORCE_CAUSAL (SPARKINFER_DFLASH_FORCE_CAUSAL=1) makes every layer causal within the
+        // block. Default behaviour is unchanged: causal is normally on only for sliding layers,
+        // and this checkpoint declares all five as full_attention, so the block is attended
+        // BIDIRECTIONALLY -- row i sees rows j>i, which are mask tokens. Whether that matches how
+        // the draft was trained is untested, and it is the one intra-block property the ablations
+        // have not covered. With the Markov head off the draft predicts the SEED TOKEN back at row
+        // 1, which is the kind of copy behaviour a wrong block mask produces.
+        static const int kForceCausal = []{
+            const char* e = getenv("SPARKINFER_DFLASH_FORCE_CAUSAL");
+            return (e && e[0] == '1') ? 1 : 0;
+        }();
+        const bool causal = kForceCausal ||
+                            (mixed_causal && L < (int)c.sliding_layers.size() &&
+                             c.sliding_layers[L]);
         dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L], s.v_cache[L], s.attn,
                                         BW, kv_len, c.n_q_heads, c.n_kv_heads, d,
                                         q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st,
@@ -1243,6 +1255,24 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // the draft is eager-launched so each saved launch is also a saved gap.
         const bf16* next_norm = (L + 1 < run_layers) ? s.layers[L + 1].input_norm : s.final_norm;
         dflash_kernels::launch_add_rms(s.h, s.down, s.x, next_norm, s.xn, BW, H, c.rms_eps, st);
+        // Per-layer residual stream, for the differential (see the dump block below). s.x is the
+        // layer's output residual; comparing it layer by layer turns "the backbone diverges"
+        // into "layer N diverges", which is the difference between a search and a fix.
+        if (const char* dd = getenv("SPARKINFER_DSPARK_DUMP")) {
+            static int dumped_layers = 0;
+            if (dumped_layers <= L) {
+                dumped_layers = L + 1;
+                cudaStreamSynchronize(st);
+                std::vector<bf16> host((size_t)BW * H);
+                cudaMemcpy(host.data(), s.x, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost);
+                char path[512];
+                snprintf(path, sizeof(path), "%s/layer%d_x.bin", dd, L);
+                if (FILE* f = fopen(path, "wb")) {
+                    fwrite(host.data(), sizeof(bf16), host.size(), f);
+                    fclose(f);
+                }
+            }
+        }
     }
     if (run_layers <= 0)
         dflash_kernels::launch_rms(s.x, s.final_norm, s.xn, BW, H, c.rms_eps, st);
