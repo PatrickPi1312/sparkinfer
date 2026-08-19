@@ -1029,6 +1029,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             kernels::launch_gemv(th, s.fc, tp, H, n_cap * H, st);
         }
         dflash_kernels::launch_rms(tp, s.hidden_norm, tp, fc_rows, H, c.rms_eps, st);
+        // Ablation (SPARKINFER_DFLASH_ZERO_CTX=1): blank the projected target features after
+        // computing them. The draft then attends over an all-zero context while everything else --
+        // shapes, positions, RoPE, the block forward, the Markov chain -- is untouched. If tau is
+        // unchanged the draft is IGNORING the target context, which localises the acceptance gap to
+        // the fc/hidden_norm/KV-injection path rather than to the draft backbone or the head.
+        if (getenv("SPARKINFER_DFLASH_ZERO_CTX"))
+            cu(cudaMemsetAsync(tp, 0, (size_t)fc_rows * H * sizeof(bf16), st), "zero ctx");
     }
 
     // x = noise embedding
@@ -1302,44 +1309,65 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // prediction for position start+1 is redundant with the target's own verify-row-0 call, which
     // is strictly more reliable than any draft guess), so it only needs a plain argmax in the
     // !head_done path, where the batched LM-head GEMV computed it too and left it unscored.
-    // MARKOV HEAD, PRICED. It raises acceptance and costs more than the acceptance is worth
-    // below long context, so it is gated on the same sequence-length threshold the proposal-depth
-    // ladder uses rather than run unconditionally.
+    // MARKOV HEAD: ALWAYS ON. It was gated on sequence length (#868, threshold 12288) because it
+    // "raises acceptance and costs more than the acceptance is worth below long context". That was
+    // measured inside the regime the gate itself creates, and the conclusion was wrong.
     //
-    // What it costs: w2 is [vocab, rank] = 248320 x 256 bf16 = 127 MB, re-read once per proposal
-    // row -- 381 MB a step at depth 3 -- because row r's latent conditions on row r-1's own
-    // corrected argmax. That chain also replaces ONE batched argmax over the whole block with a
-    // sequential bias -> confidence -> argmax triple per row. Measured, the pair is 1.41 ms of a
-    // 16.3 ms step, well past the ~419 us the bias GEMVs alone account for.
+    // The head is not an optimisation layered on DSpark -- it IS DSpark. The algorithm is a
+    // semi-autoregressive block drafter: one forward emits the gamma-token block, and a lightweight
+    // sequential head conditions each position on the PREVIOUS drafted token. Without it the block
+    // forward alone cannot differentiate positions and the draft degenerates into repeating one
+    // high-frequency token. Measured at ctx=4096 with SPARKINFER_DSPARK_PROBE=1:
     //
-    // What it buys, measured on RTX 5090 against the released draft (accept -> tok/s):
-    //     ctx=128    1.2549 -> 76.93     off: 1.1852 -> 79.53   (+3.4% without it)
-    //     ctx=4096   1.1130 -> 32.16     off: 1.0579 -> 33.04   (+2.7% without it)
-    //     ctx=512    1.0000 -> 77.61     off: 1.0000 -> 77.63   (accept 1.0: DSpark inert here)
-    // Acceptance does fall, and it still loses: the extra 0.07 tokens a step do not pay for the
-    // step getting 1.41 ms longer.
+    //   off: draft=[13 13 13 13 13 13]   ("." six times)                      accept 0-1
+    //   on:  draft=[6337 421 369 524 279 1788]
+    //        target=[6337 421 369 524 177460]                                 accept 4
     //
-    // Deep context keeps it: that is where acceptance actually climbs and where the ladder above
-    // already switches strategy, and it is not measured here. Draft-only either way -- this shifts
-    // what is proposed, never what is emitted, which is why LOSSLESS is unaffected.
-    // SPARKINFER_DFLASH_MARKOV=1/0 pins it explicitly.
-    static const int kMarkovDeepMinSeq = []{
-        const char* e = getenv("SPARKINFER_DFLASH_DEEP_MIN_SEQ");
-        int v = e ? atoi(e) : 12288;
-        return v < 1 ? 1 : v;
-    }();
+    // Over a generation at ctx=4096, depth 6: tau 1.085 -> 1.600. That also explains why tau used
+    // to be INVARIANT to proposal depth (1.076 / 1.085 / 1.085 at depth 1 / 3 / 6) -- positions past
+    // the first were never going to be accepted, so drafting more of them changed nothing.
+    //
+    // The head genuinely costs ~1.41 ms of a 16.3 ms step: w2 is [vocab, rank] = 248320 x 256 bf16
+    // = 127 MB re-read per proposal row, and the chain serialises bias -> confidence -> argmax per
+    // row. That cost repays only through the BATCHED verify, where accepting k tokens costs ONE
+    // target forward instead of k. On the token loop it cannot repay at any tau, because that path
+    // runs one target forward per kept token exactly as AR does -- which is what the original
+    // measurement was really observing: it priced the head against a verify path structurally
+    // incapable of using acceptance.
+    //
+    // SPARKINFER_DFLASH_MARKOV=0 turns it off for A/B. Draft-only either way: this shifts what is
+    // proposed, never what is emitted, so LOSSLESS is unaffected.
     static const int markov_env = []{
         const char* e = getenv("SPARKINFER_DFLASH_MARKOV");
         return e ? (e[0] == '0' ? 0 : 1) : -1;
     }();
-    const bool markov_on = markov_env >= 0 ? (markov_env != 0)
-                                           : (past + BW >= kMarkovDeepMinSeq);
+    // Default ON at every context. SPARKINFER_DFLASH_DEEP_MIN_SEQ no longer gates this; it still
+    // selects the proposal-depth ladder in qwen35.cpp, which is a separate decision.
+    const bool markov_on = markov_env >= 0 ? (markov_env != 0) : true;
     if (markov_on && s.markov_w1 && s.markov_w2) {
+        // ROW SHIFT (SPARKINFER_DFLASH_ROW_SHIFT=1). Which block row backs proposal r?
+        //
+        // We read row r. SGLang reads row r-1: its run_markov_block iterates step_idx over ALL
+        // gamma rows of base_logits starting at row 0, with first_prev_tokens = the anchor
+        // (draft_block_ids[:,0], the bonus token) -- so its FIRST proposal comes from row 0, the
+        // row holding the real seed token, and its gamma-th from row gamma-1. Ours discards row 0
+        // as "redundant with the target's own verify-row-0 call" and starts at row 1, so every
+        // proposal is backed by the row one position later than the one that predicts it. The
+        // conditioning is aligned (r==1 uses the seed either way); only the logit row is off.
+        //
+        // That is consistent with the symptom: tau lands well above 1.0 because the Markov bias,
+        // conditioned correctly, partially compensates for the wrong base row -- but it is capped,
+        // and deeper drafting buys nothing because every position is displaced.
+        static const int kRowShift = []{
+            const char* e = getenv("SPARKINFER_DFLASH_ROW_SHIFT");
+            return (e && e[0] == '1') ? 1 : 0;
+        }();
         if (!head_done) kernels::launch_argmax(s.logits, s.d_out, 1, V, st);
         for (int r = 1; r <= kProposalDepth; r++) {
             const int* prev = (r == 1) ? s.d_ids : (s.d_out + (r - 1));
+            const size_t row = (size_t)(kRowShift ? r - 1 : r);
             dflash_kernels::launch_markov_bias_add(s.markov_w1, s.markov_w2, prev,
-                                                   s.logits + (size_t)r * V, V, s.markov_rank, st,
+                                                   s.logits + row * V, V, s.markov_rank, st,
                                                    s.confidence_w ? s.markov_latent : nullptr);
             // Confidence head (optional): reads THIS row's hidden state + the Markov latent the
             // bias call above just wrote, predicting how likely this row's (about to be computed)
@@ -1349,7 +1377,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                 dflash_kernels::launch_confidence_head(s.xn + (size_t)r * H, s.markov_latent,
                                                        s.confidence_w, s.confidence_bias, H,
                                                        s.markov_rank, s.d_confidence + r, st);
-            kernels::launch_argmax(s.logits + (size_t)r * V, s.d_out + r, 1, V, st);
+            kernels::launch_argmax(s.logits + row * V, s.d_out + r, 1, V, st);
         }
     } else {
         kernels::launch_argmax(s.logits + (head_done ? V : 0),

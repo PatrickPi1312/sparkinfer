@@ -3206,9 +3206,20 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // so a stream whose draft starts tracking re-arms exactly as it would have.
     // SPARKINFER_DFLASH_IDLE_DRAFT=0 restores main's unconditional draft.
     int disarmed_run = 0;
+    // Draft idling: DEFAULT OFF (2026-08-19). #869 added it on the reasoning that a draft block
+    // "can never save a target forward" on the token loop, so once the batched verify stays
+    // disarmed the block is pure overhead. The premise is true; the conclusion compounded a
+    // separate bug. Acceptance was crushed at the time because the Markov head was gated off below
+    // ctx=12288 (see dflash_draft.cpp), so the verify never armed, so the draft idled, so nothing
+    // was ever proposed -- tau went to exactly 1.000 at ctx=128 and DSpark became AR with extra
+    // steps. With the head restored (tau 1.085 -> 1.600 at 4k) the draft has something worth
+    // proposing again, and idling it forecloses the only path that can pay.
+    //
+    // SPARKINFER_DFLASH_IDLE_DRAFT=1 restores it. Turn it back on only with a measurement taken
+    // while the Markov head is enabled.
     static const int kIdleDraftOn = []{
         const char* e = getenv("SPARKINFER_DFLASH_IDLE_DRAFT");
-        return (e && e[0] == '0') ? 0 : 1;
+        return (e && e[0] == '1') ? 1 : 0;
     }();
     static const int kDraftProbeAfter = []{
         const char* e = getenv("SPARKINFER_DFLASH_IDLE_AFTER");
@@ -3406,6 +3417,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // a single lucky block, which at 512-ctx (tau 2.19, where batching is 31% SLOWER) cost 5.6%
         // before the EMA had enough evidence to back off. Ramping costs ~3 token-loop steps at
         // short context and keeps 512 on the token loop throughout.
+        // Draft-quality probe (SPARKINFER_DSPARK_PROBE=1). Prints what the draft PROPOSED against
+        // what the target produced, per step, now that accept/keep are final. tau being invariant
+        // to proposal depth says positions >=2 never land; this distinguishes plausible-but-wrong
+        // proposals (conditioning subtly off) from structurally wrong ones (repeated,
+        // mask-adjacent, out of vocab). Only posterior[0..accept] is known on the token loop --
+        // verification stops at the first mismatch -- so unknown slots print as -1.
+        if (getenv("SPARKINFER_DSPARK_PROBE")) {
+            fprintf(stderr, "[probe] step=%d start=%d seed=%d accept=%d draft=[", step_no, start,
+                    block[0], accept);
+            for (int i = 1; i <= kProposalDepth; i++) fprintf(stderr, "%d ", block[i]);
+            fprintf(stderr, "] target=[");
+            for (int i = 0; i <= kProposalDepth; i++)
+                fprintf(stderr, "%d ", (compact_verify || i <= accept) ? posterior[i] : -1);
+            fprintf(stderr, "]\n");
+        }
         keep_ema8 = keep_ema8 - (keep_ema8 >> 3) + keep;
         ++step_no;
         compact_score = keep == kProposalDepth + 1
