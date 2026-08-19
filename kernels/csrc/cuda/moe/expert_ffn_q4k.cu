@@ -484,6 +484,59 @@ __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
 }
 
+// si_vec_dot_q4_K split into its weight half and its activation half, so M rows sharing one weight
+// block decode it once instead of M times.
+//
+// Everything the row-batched FFN kernels re-derived per row lives in si_q4k_wdec: the two packed
+// nibble words, the 6-bit scale/min pair unpacked out of the super-block header, and the block's
+// d/dmin. Only the q8_1 activations, the four dp4a ops and the final combine actually depend on
+// which row is being scored. At M=7 the old form paid that unpack seven times over.
+//
+// si_vec_dot_q4_K_pre(si_q4k_decode_w(b, iqs), a, iqs) is the same expressions in the same order as
+// si_vec_dot_q4_K(b, a, iqs), so it is bit-identical -- only the point at which the weight half is
+// computed moves.
+struct si_q4k_wdec { int v0, v1; unsigned char sc[2], m[2]; float d, dmin; };
+
+__device__ __forceinline__ si_q4k_wdec si_q4k_decode_w(const si_block_q4_K* bq4, int iqs) {
+    si_q4k_wdec w;
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int* q4 = (const int*)(bq4->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    w.v0 = q4[0]; w.v1 = q4[4];
+    const unsigned short* scales = (const unsigned short*)bq4->scales;
+    unsigned short aux[2]; const int j = bq8_offset / 2;
+    if (j < 2) { aux[0] = scales[j] & 0x3f3f; aux[1] = scales[j + 2] & 0x3f3f; }
+    else { aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+           aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+    const unsigned char* s = (const unsigned char*)aux;
+    w.sc[0] = s[0]; w.sc[1] = s[1]; w.m[0] = s[2]; w.m[1] = s[3];
+    const float2 dm4f = __half22float2(bq4->dm);
+    w.d = dm4f.x; w.dmin = dm4f.y;
+    return w;
+}
+
+__device__ __forceinline__ float si_vec_dot_q4_K_pre(const si_q4k_wdec& w,
+                                                     const si_block_q8_1* bq8_1, int iqs) {
+    int u[4]; float d8[2];
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const si_block_q8_1* bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int* q8 = (const int*)bq8i->qs + ((iqs / 2) % 4);
+        u[2 * i] = q8[0]; u[2 * i + 1] = q8[4];
+    }
+    float sumf_d = 0.0f, sumf_m = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int v0i = (w.v0 >> (4 * i)) & 0x0F0F0F0F, v1i = (w.v1 >> (4 * i)) & 0x0F0F0F0F;
+        const int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i], 0));
+        const int dot2 = __dp4a(0x01010101, u[2 * i + 1], __dp4a(0x01010101, u[2 * i], 0));
+        sumf_d += d8[i] * (dot1 * w.sc[i]);
+        sumf_m += d8[i] * (dot2 * w.m[i]);
+    }
+    return w.d * sumf_d - w.dmin * sumf_m;
+}
+
 // Q5_K int8 dp4a vec-dot for the MoE down. Q5_K is Q4_K plus one high bit per quant (qh[32]), so
 // this reuses the faithful Q4_K vec_dot structure (same qs / scales / activation indexing, same
 // iqs = 2*L convention as si_vec_dot_q4_K) and only widens each 4-bit weight to 5 bits. The qh bit
@@ -867,24 +920,41 @@ __global__ void gate_up_mmvq2_qwen_rows_kernel(
     const int kbx0 = tid >> 4;
     const int kqs = 2 * (tid & 15);
     constexpr int NB = H >> 8;
-    const si_block_q4_K* g_rows[M];
-    const si_block_q4_K* u_rows[M];
-    const si_block_q8_1* v_rows[M];
-#pragma unroll
-    for (int r = 0; r < M; ++r) {
-        const int e = expert_ids[r * TOPK];
-        g_rows[r] = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
-        u_rows[r] = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
-        v_rows[r] = vy + (size_t)r * (H >> 5);
-    }
     float tg[M], tu[M];
 #pragma unroll
     for (int r = 0; r < M; ++r) { tg[r] = 0.f; tu[r] = 0.f; }
-    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+    // When every row wants the same expert -- always, for the dense ffn this path exists for -- the
+    // Q4_K weight half is decoded once per super-block and shared. Otherwise each row decodes its
+    // own, which is what a top_k==1 MoE with genuinely different experts needs; same results either
+    // way, since si_vec_dot_q4_K_pre(si_q4k_decode_w(b), a) == si_vec_dot_q4_K(b, a).
+    const int e0 = expert_ids[0];
+    bool uniform = true;
 #pragma unroll
-        for (int r = 0; r < M; ++r) {
-            tg[r] += si_vec_dot_q4_K(g_rows[r] + kbx, v_rows[r] + (size_t)kbx * 8, kqs);
-            tu[r] += si_vec_dot_q4_K(u_rows[r] + kbx, v_rows[r] + (size_t)kbx * 8, kqs);
+    for (int r = 1; r < M; ++r) uniform &= (expert_ids[r * TOPK] == e0);
+    if (uniform) {
+        const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e0 * F + f) * (H >> 8) * 144);
+        const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e0 * F + f) * (H >> 8) * 144);
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+            const si_q4k_wdec gw = si_q4k_decode_w(g_row + kbx, kqs);
+            const si_q4k_wdec uw = si_q4k_decode_w(u_row + kbx, kqs);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const si_block_q8_1* v = vy + (size_t)r * (H >> 5) + (size_t)kbx * 8;
+                tg[r] += si_vec_dot_q4_K_pre(gw, v, kqs);
+                tu[r] += si_vec_dot_q4_K_pre(uw, v, kqs);
+            }
+        }
+    } else {
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const int e = expert_ids[r * TOPK];
+                const si_block_q4_K* g = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
+                const si_block_q4_K* u = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
+                const si_block_q8_1* v = vy + (size_t)r * (H >> 5) + (size_t)kbx * 8;
+                tg[r] += si_vec_dot_q4_K(g + kbx, v, kqs);
+                tu[r] += si_vec_dot_q4_K(u + kbx, v, kqs);
+            }
         }
     }
     __shared__ float sg[M][NW - 1][WS], su[M][NW - 1][WS];
@@ -1217,17 +1287,36 @@ __global__ void down_q4k_mmvq_splitk_rows_kernel(
     for (int t = 0; t < M; ++t) acc[t] = 0.f;
     if (hh < H) {
         const int total = top_k * work;
+        // Same weight-decode sharing as the gate/up rows kernel: with every row on one expert
+        // (the dense ffn this is gated to), each down super-block is decoded once and dotted
+        // against all M rows. Non-uniform experts decode per row, as a top_k==1 MoE needs.
+        const int e0 = expert_ids[0];
+        bool uniform = true;
+#pragma unroll
+        for (int t = 1; t < M; ++t) uniform &= (expert_ids[t * top_k] == e0);
         for (int wi = split * 32 + lane; wi < total; wi += S * 32) {
             const int j = wi / work, r = wi % work;
             const int kbx = r >> 4, kqs = (r & 15) << 1;
-#pragma unroll
-            for (int t = 0; t < M; ++t) {
-                const int ts = t * top_k + j, e = expert_ids[ts];
-                const float w = expert_weights[ts];
+            if (uniform) {
                 const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
-                    down_q + ((size_t)e * H + hh) * nblk * 144);
-                const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
-                acc[t] += w * si_vec_dot_q4_K(drow + kbx, h8 + (size_t)kbx * 8, kqs);
+                    down_q + ((size_t)e0 * H + hh) * nblk * 144);
+                const si_q4k_wdec dw = si_q4k_decode_w(drow + kbx, kqs);
+#pragma unroll
+                for (int t = 0; t < M; ++t) {
+                    const int ts = t * top_k + j;
+                    acc[t] += expert_weights[ts] *
+                              si_vec_dot_q4_K_pre(dw, hq8 + (size_t)ts * q8pb + (size_t)kbx * 8, kqs);
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < M; ++t) {
+                    const int ts = t * top_k + j, e = expert_ids[ts];
+                    const float w = expert_weights[ts];
+                    const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+                        down_q + ((size_t)e * H + hh) * nblk * 144);
+                    const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+                    acc[t] += w * si_vec_dot_q4_K(drow + kbx, h8 + (size_t)kbx * 8, kqs);
+                }
             }
         }
 #pragma unroll
