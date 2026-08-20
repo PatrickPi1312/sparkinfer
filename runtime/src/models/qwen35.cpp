@@ -3150,9 +3150,28 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // than per step, because the verify graph dflash_warm_verify captures is sized from this and
     // a graph built for a row count the stream never uses costs more than the rows it saves --
     // measured, per-step narrowing under a 4-row warm graph recovers only 0.7% of the 9.4%.
+    //
+    // ...but the narrow band only ever applied because a 4-wide verify could not pay for itself,
+    // and that is no longer true. #878 measured depth 1 beating depth 3 by 9.4% when a 4-row
+    // batched verify cost 2.62 target forwards against a mean accept of 1.92 -- C > tau, so every
+    // extra proposal lost. Row-batching the FFN and the LM head, and decoding each Q4_K block once
+    // per block instead of once per row, took that to 1.85: C < tau, and the sign of the trade
+    // flips. Re-measured on the RTX 5090 at ctx=4096, same prompt, same build, LOSSLESS in both:
+    //
+    //     depth 1 (2-wide)   tau 1.3611   72.28 tok/s   0.798x AR      <- what #878 chose
+    //     depth 3 (4-wide)   tau 1.9231   90.57 tok/s   1.010x AR      <- and what now wins
+    //     depth 6 (7-wide)   tau 1.9231   53.81 tok/s   0.600x AR
+    //
+    // tau is IDENTICAL at 4-wide and 7-wide -- acceptance saturates at ~1.92 -- so 4 is the widest
+    // block that buys anything and 7 only buys cost. The band therefore narrows to what it was
+    // really describing: the range where the batched verify CANNOT arm at all. Below
+    // kEngageMinSeq the token loop runs one target forward per kept token, exactly what AR runs,
+    // so proposing more is pure draft overhead and depth 1 remains right. At or above it the
+    // batched pass arms and depth 3 is the operating point.
     const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
                              : ((n + max_new) >= kDeepMinSeq ? 7
-                                : (n >= kNarrowMinSeq ? 1 : 3));
+                                : (n >= kEngageMinSeq ? 3
+                                   : (n >= kNarrowMinSeq ? 1 : 3)));
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
