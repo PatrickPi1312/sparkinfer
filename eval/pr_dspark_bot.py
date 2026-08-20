@@ -1807,13 +1807,142 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
         arb.add_label(repo, num, MODELOPT_NEEDS_REBASE)
         arb.remove_label(repo, num, MODELOPT_MERGE_FIRST)
     if AUTO_MERGE and try_auto_merge_qwen38(repo, winner):
-        # README refresh deliberately NOT wired for this bot (2026-08-18). pr_modelopt_bot.py
-        # refreshes the published Qwen3.8 table on every auto-merge, but that table is AR
-        # decode/prefill on the ModelOpt checkpoint, and DSpark's own number is currently BELOW
-        # plain AR decode (0.571x at main b59f6d5) -- auto-publishing it would put a
-        # speculative-decode figure into a table that reads as this model's serving speed.
-        # Wire it up once DSpark crosses AR and there is a number worth publishing.
-        pass
+        # The README refresh was left unwired on 2026-08-18 with an explicit condition: DSpark ran
+        # at 0.571x plain AR decode, and publishing that into the ModelOpt table -- which is AR
+        # decode/prefill and reads as this model's serving speed -- would have misrepresented it.
+        # "Wire it up once DSpark crosses AR and there is a number worth publishing."
+        #
+        # It has. main measured 112.34 tok/s against 90.48 AR (1.242x, tau 1.662, lossless) on
+        # 2026-08-20. refresh_readme_dspark publishes it as its OWN section rather than into that
+        # table, for the reason the original note was really guarding: a speculative number and a
+        # serving number are not interchangeable.
+        entry = _load_scores().get(str(winner)) or {}
+        commit = entry.get("commit") or ""
+        if commit:
+            refresh_readme_dspark(entry, commit)
+        else:
+            print(">> DSpark README refresh: no stored commit for the merged PR — skipped",
+                  file=sys.stderr)
+
+
+README_DSPARK_MARK = ("<!-- BENCH:qwen38-dspark:start -->", "<!-- BENCH:qwen38-dspark:end -->")
+
+
+def refresh_readme_dspark(entry, commit, repo_root=None, push=True):
+    """Rewrite the README's DSpark section from a just-merged PR's own measurements.
+
+    Mirrors pr_modelopt_bot.refresh_readme_modelopt, with two deliberate differences.
+
+    SEPARATE SECTION, NOT THE MODELOPT TABLE. That table is AR decode/prefill and reads as this
+    model's serving speed. A speculative-decode figure folded into it would be misread as the
+    general number, because tau depends on how predictable the generated text is -- measured 1.12
+    on code against 1.41 on prose on the same build. So this publishes its own block, states the
+    context it was measured at, names the corpus, and prints the AR number beside it rather than
+    in place of it.
+
+    PUBLISHES THE RATIO EVEN IF IT IS BELOW 1.0. The refresh was originally left unwired because
+    DSpark ran at 0.571x AR and there was "no number worth publishing". Showing both columns and
+    the ratio makes a sub-1.0 result read correctly instead of looking like a claim, and a section
+    that silently disappears when the number regresses is worse than one that reports it.
+
+    Writes through a THROWAWAY WORKTREE of origin/main, never the bot's own checkout -- the cron
+    runs this bot from whatever branch that tree happens to be on, so committing in place could
+    push an unmerged branch to main.
+    """
+    need = ("pr_dspark_tps", "pr_ar_tps", "pr_mean_accept")
+    vals = {k: float(entry.get(k) or 0) for k in need}
+    if not all(v > 0 for v in vals.values()):
+        missing = [k for k in need if vals[k] <= 0]
+        print(f">> DSpark README refresh: skipped, measurement incomplete ({', '.join(missing)})",
+              file=sys.stderr)
+        return False
+    ratio = float(entry.get("dspark_vs_ar") or (vals["pr_dspark_tps"] / vals["pr_ar_tps"]))
+    ctx_label = f"{DSPARK_CTX // 1024}k" if DSPARK_CTX >= 1024 else str(DSPARK_CTX)
+
+    def _rewrite(path):
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError as e:
+            print(f">> DSpark README refresh: cannot read {path}: {e}", file=sys.stderr)
+            return False
+        start_m, end_m = README_DSPARK_MARK
+        i, j = text.find(start_m), text.find(end_m)
+        if i < 0 or j < 0 or j < i:
+            print(f">> DSpark README refresh: markers not found in {path} — leaving it alone",
+                  file=sys.stderr)
+            return False
+        body = [
+            start_m, "",
+            "| context | DSpark decode | AR decode | speedup | mean accepted (τ) |",
+            "|---:|---:|---:|---:|---:|",
+            f"| {ctx_label} | **{vals['pr_dspark_tps']:,.1f}** tok/s | "
+            f"{vals['pr_ar_tps']:,.1f} tok/s | **{ratio:.3f}×** | {vals['pr_mean_accept']:.3f} |",
+            "",
+            "<sub>**Lossless**: the eval regenerates the same prompt with the draft disabled and "
+            "requires the two token sequences to be byte-identical, so this is exact-token "
+            "equality with autoregressive decode, not distributional agreement. A run that is not "
+            "lossless is rejected regardless of speed.</sub>",
+            "",
+            f"<sub>Measured at ctx={DSPARK_CTX} on `bench/scripts/bench_prompt_4k.txt`. Speculative "
+            "throughput depends on how predictable the generated text is — the same build measures "
+            "a materially different τ on prose, code and repetitive text — so treat this as that "
+            "workload at that context, not a general serving figure. The AR column is the "
+            "autoregressive decode measured in the same process, same model load, same GPU "
+            f"state.</sub>",
+            "",
+            f"<sub>Auto-refreshed by the DSpark eval bot at `{commit[:9]}` — these are the numbers "
+            "that PR measured on the pinned RTX 5090, which after squash-merge are main's. "
+            "Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>",
+            end_m,
+        ]
+        new_text = text[:i] + "\n".join(body) + text[j + len(end_m):]
+        if new_text == text:
+            print(">> DSpark README refresh: numbers unchanged")
+            return False
+        open(path, "w", encoding="utf-8").write(new_text)
+        return True
+
+    if not push:
+        return _rewrite(os.path.join(repo_root or ROOT, "README.md"))
+
+    root = repo_root or ROOT
+    wt = os.path.join(tempfile.gettempdir(), f"si_readme_dspark_{os.getpid()}")
+    subprocess.run(["git", "-C", root, "worktree", "remove", "--force", wt],
+                   capture_output=True, text=True)
+    if subprocess.run(["git", "-C", root, "fetch", "-q", "origin", "main"],
+                      capture_output=True, text=True).returncode != 0:
+        print(">> DSpark README refresh: fetch origin/main failed", file=sys.stderr)
+        return False
+    mk = subprocess.run(["git", "-C", root, "worktree", "add", "--detach", wt, "origin/main"],
+                        capture_output=True, text=True)
+    if mk.returncode != 0:
+        print(f">> DSpark README refresh: worktree add failed: {(mk.stderr or '')[:200]}",
+              file=sys.stderr)
+        return False
+    try:
+        if not _rewrite(os.path.join(wt, "README.md")):
+            return False
+        msg = (f"docs: refresh Qwen3.8 DSpark table ({commit[:9]})\n\n"
+               f"Auto-generated by pr_dspark_bot after auto-merging {commit[:9]}. The numbers are "
+               f"that PR's own same-box measurements, which the squash-merge makes main's.")
+        for args in (["add", "README.md"], ["commit", "-m", msg]):
+            rc = subprocess.run(["git", "-C", wt] + args, capture_output=True, text=True)
+            if rc.returncode != 0:
+                print(f">> DSpark README refresh: git {args[0]} failed: {(rc.stderr or '')[:200]}",
+                      file=sys.stderr)
+                return False
+        rc = subprocess.run(["git", "-C", wt, "push", "origin", "HEAD:main"],
+                            capture_output=True, text=True)
+        if rc.returncode != 0:
+            print(f">> DSpark README refresh: push to main FAILED: {(rc.stderr or '')[:300]}",
+                  file=sys.stderr)
+            return False
+        print(f">> DSpark README refresh: table updated at {commit[:9]} and pushed to main")
+        return True
+    finally:
+        subprocess.run(["git", "-C", root, "worktree", "remove", "--force", wt],
+                       capture_output=True, text=True)
+        subprocess.run(["git", "-C", root, "worktree", "prune"], capture_output=True, text=True)
 
 
 def upload_qwen38_eval_log(repo, num, title, oid, res):

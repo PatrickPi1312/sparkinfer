@@ -146,6 +146,31 @@ Read that last column for what it is. llama.cpp cannot load NVFP4 compressed-ten
 llama.cpp's best GGUF result — not a same-weights benchmark. The same-weights comparison is the
 one at the top of this section, GGUF on both sides, prefill@128 loss included.
 
+#### DSpark speculative decode
+
+Every decode number above is autoregressive. Qwen3.8-27B also ships a **DSpark** draft, a
+five-layer semi-autoregressive block drafter that proposes a block of tokens per step and has the
+target verify them in one batched pass, so accepting *k* tokens costs one target forward instead of
+*k*:
+
+<!-- BENCH:qwen38-dspark:start -->
+
+| context | DSpark decode | AR decode | speedup | mean accepted (τ) |
+|---:|---:|---:|---:|---:|
+| 4k | **112.3** tok/s | 90.5 tok/s | **1.242×** | 1.662 |
+
+<sub>**Lossless**: the eval regenerates the same prompt with the draft disabled and requires the two token sequences to be byte-identical, so this is exact-token equality with autoregressive decode, not distributional agreement. A run that is not lossless is rejected regardless of speed.</sub>
+
+<sub>Measured at ctx=4096 on `bench/scripts/bench_prompt_4k.txt`. Speculative throughput depends on how predictable the generated text is — the same build measures a materially different τ on prose, code and repetitive text — so treat this as that workload at that context, not a general serving figure. The AR column is the autoregressive decode measured in the same process, same model load, same GPU state.</sub>
+
+<sub>Auto-refreshed by the DSpark eval bot at `30ddb8867` — these are the numbers that PR measured on the pinned RTX 5090, which after squash-merge are main's. Regenerated on every auto-merge, so the table cannot drift behind the code.</sub>
+<!-- BENCH:qwen38-dspark:end -->
+
+Speculation only pays when the verify costs less than what it replaces: `speedup ≈ τ / (verify cost
++ draft cost)`, both in target forwards. That is why τ alone is not the story — a block that
+accepts more tokens but costs more to verify is slower, and for most of this feature's life DSpark
+ran *below* plain AR decode for exactly that reason.
+
 Runtime footprint (excluding model weights):
 
 | runtime | size | vs sparkinfer |
