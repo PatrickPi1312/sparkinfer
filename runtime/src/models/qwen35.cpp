@@ -30,6 +30,7 @@
 #include "sparkinfer/lmcache_staging.h"
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -3206,9 +3207,20 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // so a stream whose draft starts tracking re-arms exactly as it would have.
     // SPARKINFER_DFLASH_IDLE_DRAFT=0 restores main's unconditional draft.
     int disarmed_run = 0;
+    // Draft idling: DEFAULT OFF (2026-08-19). #869 added it on the reasoning that a draft block
+    // "can never save a target forward" on the token loop, so once the batched verify stays
+    // disarmed the block is pure overhead. The premise is true; the conclusion compounded a
+    // separate bug. Acceptance was crushed at the time because the Markov head was gated off below
+    // ctx=12288 (see dflash_draft.cpp), so the verify never armed, so the draft idled, so nothing
+    // was ever proposed -- tau went to exactly 1.000 at ctx=128 and DSpark became AR with extra
+    // steps. With the head restored (tau 1.085 -> 1.600 at 4k) the draft has something worth
+    // proposing again, and idling it forecloses the only path that can pay.
+    //
+    // SPARKINFER_DFLASH_IDLE_DRAFT=1 restores it. Turn it back on only with a measurement taken
+    // while the Markov head is enabled.
     static const int kIdleDraftOn = []{
         const char* e = getenv("SPARKINFER_DFLASH_IDLE_DRAFT");
-        return (e && e[0] == '0') ? 0 : 1;
+        return (e && e[0] == '1') ? 1 : 0;
     }();
     static const int kDraftProbeAfter = []{
         const char* e = getenv("SPARKINFER_DFLASH_IDLE_AFTER");
@@ -3234,6 +3246,24 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // rather than running them, so this changes no state -- it just stops decode step 2 from
     // paying for graph construction.
     dflash_warm_verify(kProposalDepth + 1, start);
+    // Verify-path cost breakdown (SPARKINFER_DSPARK_TIMING=1). The two verify implementations are
+    // timed per call so their cost can be compared directly rather than inferred from end-to-end
+    // throughput. Synchronises around each call -- a measurement mode, not a benchmark -- but both
+    // paths pay the same perturbation, so the RATIO is meaningful.
+    // Profiler capture range (SPARKINFER_DSPARK_PROFILE=1 + nsys --capture-range=cudaProfilerApi).
+    // Without this a profile of this binary is ~99% prompt prefill: at ctx=4096 the token-loop
+    // prefill runs 4096 forwards per leg against a few dozen decode steps, so the decode -- the
+    // only part that exercises the verify -- is lost in the noise. Learned by profiling the whole
+    // process first and getting 524,160 FFN instances, which is 4096 x 64 layers x 2 legs.
+    const bool kProfile = getenv("SPARKINFER_DSPARK_PROFILE") != nullptr;
+    if (kProfile) cudaProfilerStart();
+    const bool kTiming = getenv("SPARKINFER_DSPARK_TIMING") != nullptr;
+    double t_fwd_ms = 0, t_batched_ms = 0, t_draft_ms = 0;
+    long n_fwd = 0, n_batched = 0, n_draft = 0;
+    auto ms_since = [&](std::chrono::steady_clock::time_point t0) {
+        cudaStreamSynchronize(s.stream);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
     auto t_decode0 = std::chrono::steady_clock::now();
     while ((int)out.size() < max_new) {
         // The context bound this used to carry (SPARKINFER_DFLASH_COMPACT_MAX_SEQ, default 384)
@@ -3330,12 +3360,16 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         if (!compact_verify) {
             set_dflash_capture_row(0);
             s.defer_decode_sync = overlap_on;
+            auto _tf = std::chrono::steady_clock::now();
             p0 = forward_token(block[0], start, true);
+            if (kTiming) { t_fwd_ms += ms_since(_tf); n_fwd++; }
             s.defer_decode_sync = false;
         }
+        auto _td = std::chrono::steady_clock::now();
         const bool draft_ok = draft_idle ? true : draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, kProposalDepth,
             draft_confidence.data());
+        if (kTiming && !draft_idle) { t_draft_ms += ms_since(_td); n_draft++; }
         if (getenv("SPARKINFER_DFLASH_CONFIDENCE_DEBUG")) {
             fprintf(stderr, "[confidence-debug] start=%d confidence=[", start);
             for (int i = 1; i <= kProposalDepth; i++) fprintf(stderr, "%.3f ", draft_confidence[i]);
@@ -3361,7 +3395,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         bool vfail = false;
         if (compact_verify) {
             const int vn = kProposalDepth + 1;
+            auto _tb = std::chrono::steady_clock::now();
             vfail = !batched_forward(block.data(), vn, start, false, posterior.data(), s.dflash_hidden);
+            if (kTiming) { t_batched_ms += ms_since(_tb); n_batched++; }
             if (!vfail) {
                 while (accept < kProposalDepth && block[accept + 1] == posterior[accept]) ++accept;
                 keep = accept + 1;
@@ -3388,7 +3424,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             for (int i = 1; i <= kProposalDepth; i++) {
                 if (i > 1 && confidence_gate_on && draft_confidence[i] < kConfidenceGate) break;
                 set_dflash_capture_row(i);
+                auto _tfi = std::chrono::steady_clock::now();
                 const int p = forward_token(block[i], start + i, true);
+                if (kTiming) { t_fwd_ms += ms_since(_tfi); n_fwd++; }
                 if (p < 0) { vfail = true; break; }
                 posterior[i] = p;
                 accept = i;
@@ -3406,6 +3444,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // a single lucky block, which at 512-ctx (tau 2.19, where batching is 31% SLOWER) cost 5.6%
         // before the EMA had enough evidence to back off. Ramping costs ~3 token-loop steps at
         // short context and keeps 512 on the token loop throughout.
+        // Draft-quality probe (SPARKINFER_DSPARK_PROBE=1). Prints what the draft PROPOSED against
+        // what the target produced, per step, now that accept/keep are final. tau being invariant
+        // to proposal depth says positions >=2 never land; this distinguishes plausible-but-wrong
+        // proposals (conditioning subtly off) from structurally wrong ones (repeated,
+        // mask-adjacent, out of vocab). Only posterior[0..accept] is known on the token loop --
+        // verification stops at the first mismatch -- so unknown slots print as -1.
+        if (getenv("SPARKINFER_DSPARK_PROBE")) {
+            fprintf(stderr, "[probe] step=%d start=%d seed=%d accept=%d draft=[", step_no, start,
+                    block[0], accept);
+            for (int i = 1; i <= kProposalDepth; i++) fprintf(stderr, "%d ", block[i]);
+            fprintf(stderr, "] target=[");
+            for (int i = 0; i <= kProposalDepth; i++)
+                fprintf(stderr, "%d ", (compact_verify || i <= accept) ? posterior[i] : -1);
+            fprintf(stderr, "]\n");
+        }
         keep_ema8 = keep_ema8 - (keep_ema8 >> 3) + keep;
         ++step_no;
         compact_score = keep == kProposalDepth + 1
@@ -3441,6 +3494,15 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         stats->steps = steps;
         stats->mean_accept = steps > 0 ? accept_sum / steps : 0;
         stats->ttft_s = std::chrono::duration<double>(t1 - t0).count();
+        if (kProfile) cudaProfilerStop();
+        if (kTiming) {
+            const double fpc = n_fwd ? t_fwd_ms / n_fwd : 0.0;
+            fprintf(stderr, "[timing] draft   %8.3f ms/call  n=%ld\n", n_draft ? t_draft_ms / n_draft : 0.0, n_draft);
+            fprintf(stderr, "[timing] fwd_tok %8.3f ms/call  n=%ld  (token-loop verify)\n", fpc, n_fwd);
+            fprintf(stderr, "[timing] batched %8.3f ms/call  n=%ld  = %.2f forwards\n",
+                    n_batched ? t_batched_ms / n_batched : 0.0, n_batched,
+                    (n_batched && fpc > 0) ? (t_batched_ms / n_batched) / fpc : 0.0);
+        }
         stats->decode_s = std::chrono::duration<double>(t_end - t_decode0).count();
     }
     close_session(sid);

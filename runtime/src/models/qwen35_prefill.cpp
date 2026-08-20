@@ -2559,12 +2559,23 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // FP8 GDN GEMV"), which this verifier predates -- it only knew bf16/Q8_0/Q4_K/Q6_K, so a
         // Qwen3.8 verify died here after clearing the dense-FFN stage.
         //
-        // Row loop rather than a batched FP8 GEMM, deliberately: AR decode drives exactly this
-        // kernel at one row, so N one-row calls are bit-identical to N AR steps by construction.
-        // A batched variant would change the reduction order and put losslessness back at risk for
-        // a saving on the GDN projections, which are a small share of the layer. Correctness first;
-        // this can be widened later against a known-lossless baseline.
+        // Batched first, row loop as fallback. This was a bare row loop on the reasoning that AR
+        // decode drives launch_gemv_fp8 at one row, so N one-row calls are bit-identical to N AR
+        // steps by construction, and that any batched variant would reassociate the reduction and
+        // put losslessness at risk "for a saving on the GDN projections, which are a small share of
+        // the layer". The first half is sound; the second badly understated the cost. FP8 is not a
+        // small share here -- on this target it is attention q/k/v/o and the linear-attn
+        // projections across all 64 layers, the 248320x5120 lm_head, and layers 56-63's MLP -- and
+        // since decode is memory-bound and W does not depend on the row, the loop re-read several
+        // GB per extra row. That was the whole shape of the verify cost curve: 16.686 ms at N=1,
+        // 16.740 at N=2, then 29.323 at N=4 and 53.465 at N=7 against an 11.162 ms single-token
+        // forward, growing ~4 ms per row where a memory-bound decode should be nearly flat.
+        // launch_gemv_fp8_rows keeps the reduction order rather than trading it away: same 8-wide
+        // K-association, same per-j accumulation, same ordered split sum, and the same S-by-N
+        // choice, so each row is bit-identical to the one-row call it replaces. It declines the
+        // shapes it cannot serve that way, and those still take the loop below.
         if (type == kernels::SI_QTYPE_FP8) {
+            if (kernels::launch_gemv_fp8_rows(in, w, out, N, no, k, st)) return true;
             for (int r = 0; r < N; ++r)
                 kernels::launch_gemv_fp8(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
             return true;
@@ -2578,6 +2589,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // N one-row calls are bit-identical to N AR steps, which is what keeps the speculative
         // path lossless by construction rather than by measurement.
         if (type == kernels::SI_QTYPE_NVFP4) {
+            // One weight stream for all N rows when a rows kernel covers this width. It reproduces
+            // the one-row kernel's dot and split-fold order per row, so the results are the same
+            // bits the loop below produces -- the loop stays as the fallback for widths it does
+            // not cover, and is what every other N still runs.
+            if (kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, st)) return true;
             for (int r = 0; r < N; ++r)
                 kernels::launch_gemv_nvfp4(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
             return true;
@@ -2605,6 +2621,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // Native FP8/NVFP4 touch no shared q81 scratch, so unlike the mmvq path below they are
         // safe on ANY stream and never need the fall-back to `st`.
         if (type == kernels::SI_QTYPE_FP8 || type == kernels::SI_QTYPE_NVFP4) {
+            if (type == kernels::SI_QTYPE_NVFP4 &&
+                kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, ps)) return true;
+            if (type == kernels::SI_QTYPE_FP8 &&
+                kernels::launch_gemv_fp8_rows(in, w, out, N, no, k, ps)) return true;
             for (int r = 0; r < N; ++r) {
                 const bf16* xr = in + (size_t)r * k;
                 bf16* yr = out + (size_t)r * no;
@@ -3064,13 +3084,34 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // most likely, see the #712 precedent noted at the flash_decode_split call below) is the
         // real source. Kept anyway: it is still a strictly more defensible position than trusting
         // an unverified "same order" claim, and costs nothing extra since N is small here.
-        const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
-        for (int r = 0; r < N; ++r) {
-            kernels::launch_mmvq_q4k_f32(
-                static_cast<const unsigned char*>(q81) + (size_t)r * q81_row_bytes,
-                s.w.lm_head, logits + (size_t)r * c.vocab, c.vocab, H, st);
+        // UPDATE (2026-08-20): the "costs nothing extra since N is small here" above is wrong, and
+        // it was the single largest remaining per-row cost in the verify. This head is
+        // 248320x5120 Q4_K, ~0.72 GB, and nsys clocks one row at 423 us -- 1.70 TB/s, squarely
+        // DRAM-bound -- so the loop re-read the whole head once per candidate row: 1.7 ms of a
+        // 21.6 ms verify at N=4, and 2.9 ms of 35.2 ms at N=7.
+        //
+        // launch_mmvq_rows_f32 covers exactly this case (qtype 12, K=5120) through
+        // si_mmvq_q4k_rows_exact_kernel -- the same kernel whose per-row dot/reduction order the
+        // note above already tested and found to leave the then-current divergence byte-for-byte
+        // unchanged, i.e. it reproduces the per-row AR order. It reads the head once for all N
+        // rows. The loop stays as the fallback for any shape it declines, and
+        // SPARKINFER_DFLASH_VERIFY_HEAD_ROWS=0 restores it outright.
+        static const bool head_rows_on = [] {
+            const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_ROWS");
+            return !(e && e[0] == '0');
+        }();
+        head_ok = head_rows_on && N > 1 &&
+                  kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
+                                                N, c.vocab, H, st);
+        if (!head_ok) {
+            const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
+            for (int r = 0; r < N; ++r) {
+                kernels::launch_mmvq_q4k_f32(
+                    static_cast<const unsigned char*>(q81) + (size_t)r * q81_row_bytes,
+                    s.w.lm_head, logits + (size_t)r * c.vocab, c.vocab, H, st);
+            }
+            head_ok = true;
         }
-        head_ok = true;
     } else {
         head_ok = kernels::launch_mmvq_rows_f32(
             s.w.lm_head_type, q81, s.w.lm_head, logits, N, c.vocab, H, st);

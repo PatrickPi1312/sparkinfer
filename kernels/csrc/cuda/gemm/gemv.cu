@@ -489,6 +489,75 @@ template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat1
 template __global__ void gemv_fp8_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 #endif
 
+// M activation rows against one FP8 weight matrix, in a single pass over W.
+//
+// The DFlash verify scores a block of N candidate tokens per step, and every FP8 projection it
+// drives used to run gemv_fp8_sk_kernel once PER ROW (qwen35_prefill.cpp's row loop). Decode is
+// memory-bound and the weights do not depend on the row, so that re-read the entire matrix N
+// times to do N times one row's arithmetic. On this target -- FP8 attention q/k/v/o and linear-attn
+// projections across all 64 layers, plus the 248320x5120 lm_head and layers 56-63's MLP -- that is
+// several GB per extra row, and it showed up as a verify cost that grew ~4 ms per row past N=2
+// (N=1 16.686 ms, N=2 16.740, N=4 29.323, N=7 53.465, against an 11.162 ms single-token forward)
+// where a memory-bound decode should have been nearly flat. Hoisting the row loop INSIDE the
+// kernel reads W once and reuses each dequantized element M times.
+//
+// Bit-identical to the per-row path, which the losslessness gate requires: same 8-wide uint4
+// K-association, same per-j (even * x, odd * y) accumulation order, same ordered split sum seeded
+// from split 0. Only the number of times W is fetched changes.
+template <typename OutT, int S, int M>
+__global__ void gemv_fp8_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                        const void* __restrict__ packed,
+                                        OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[M][RPB][S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) acc[r] = 0.f;
+    if (n < N) {
+        const float s = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(packed)[n]);
+        const __nv_fp8_e4m3* row = reinterpret_cast<const __nv_fp8_e4m3*>(
+            reinterpret_cast<const char*>(packed) + (size_t)N * 2) + (size_t)n * (size_t)K;
+        const int n8 = K >> 3;
+        for (int i = split * 32 + lane; i < n8; i += S * 32) {
+            const int base = i * 8;
+            // The one fetch-and-dequant every row then shares.
+            float wv[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) wv[j] = si_fp8_deq(row, base + j, s);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const uint4 xv = reinterpret_cast<const uint4*>(x + (size_t)r * K)[i];
+                const __nv_bfloat162* xh = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 xf = __bfloat1622float2(xh[j]);
+                    acc[r] += wv[2 * j] * xf.x + wv[2 * j + 1] * xf.y;
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < M; ++r)
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[r] += __shfl_xor_sync(0xffffffff, acc[r], m);
+        if (lane == 0)
+#pragma unroll
+            for (int r = 0; r < M; ++r) s_part[r][row_local][split] = acc[r];
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float o = s_part[r][row_local][0];
+#pragma unroll
+            for (int t = 1; t < S; ++t) o += s_part[r][row_local][t];
+            gemv_write(y + (size_t)r * N + n, o);
+        }
+    }
+}
+
 template <typename OutT>
 __global__ void gemv_fp8_kernel(const __nv_bfloat16* __restrict__ x,
                                 const void* __restrict__ packed,
@@ -585,6 +654,87 @@ __device__ __forceinline__ float si_nvfp4_group_dot(const unsigned char* packed8
     return acc;
 }
 
+// TWO OPTIMISATIONS TRIED HERE AND REJECTED. Both were bit-identical (LOSSLESS=1) and both were
+// measured on the batched verify at ctx=4096, RTX 5090. Recorded so nobody repeats them:
+//
+//   1. Hoisting the group DECODE out of the row loop -- kept below, worth ~0.5%. These kernels are
+//      not compute-bound on dequantisation past one row.
+//
+//   2. Staging the R activation rows in SHARED memory per block, tiled at 1024 elements, to kill
+//      the L1 re-reads. COST 30%: N=1 16.588 -> 21.636 ms, N=4 29.203 -> 40.088. The two
+//      __syncthreads() per tile serialise the split-K warps that otherwise run free, and the
+//      cooperative load adds a whole extra pass over x. Do not re-try without first removing the
+//      need to synchronise.
+//
+// The motivating ncu numbers, for whoever picks this up: 3.41 GB of L1 traffic against 29.5 MB of
+// DRAM (115x), memory pipe 88% of peak, SM 33%. That ratio looks like an L1 bottleneck and is not
+// one -- the pattern is L1-resident and served fast. The kernel is latency-bound on a dependent
+// chain, not throughput-bound on any single pipe, which is why both traffic-reduction fixes failed.
+//
+// MEASURED WORTH ~0.5%. Kept because it is bit-identical and strictly cheaper, but do not expect
+// it to matter: hoisting the decode moved the batched verify 16.686 -> 16.588 ms at N=1 and
+// 29.323 -> 29.203 at N=4 (ctx=4096, RTX 5090). The hypothesis it tests -- that on-the-fly
+// dequantisation makes these kernels compute-bound past one row -- is WRONG, and this comment
+// exists so nobody derives it again and spends an afternoon on it.
+//
+// What actually scales with R, from re-reading the loop: per group the kernel reads 8 bytes of
+// packed weight plus one scale byte, against R*16 bf16 ACTIVATIONS. The weights are shared across
+// rows; the activations are re-read by every block. At 4-bit weights the activation side is the
+// larger one, which is why "verifying N rows should cost one weight read" never materialised.
+//
+// Split of si_nvfp4_group_dot for MULTI-ROW use: decode one group's 16 weights ONCE, then dot
+// them against each row. The dot is per row; the decode is not, and separating them is the whole
+// point -- profiled at ctx=4096, gemv_nvfp4_rows_sk cost 1.82x a one-row call for TWO rows, where
+// weight-bandwidth-bound sharing should give ~1.05x. The rows kernel already hoisted the DRAM read
+// out of the row loop, but si_nvfp4_group_dot re-ran __ldg + 16 nibble decodes + 16 scale
+// multiplies per row on bytes that are identical across rows. At N=1 these kernels are
+// bandwidth-bound; past that the repeated decode makes them compute-bound, which is why rows
+// stopped amortising past N=2.
+//
+// BIT-IDENTICAL to si_nvfp4_group_dot, deliberately. (weight * s) depends only on the weight and
+// the scale, never on the row, so precomputing it changes nothing about the arithmetic: each term
+// is still (si_e2m1_x2(nibble) * s) * x, evaluated in the same order and accumulated in the same
+// order. This is NOT the transformation the header above warns against -- that one applied the
+// scale once to the finished dot product, which reassociates and measurably moved top1/KL. The
+// scale stays folded into every term here; it is merely folded once instead of R times.
+__device__ __forceinline__ void si_nvfp4_group_decode(const unsigned char* packed8,
+                                                      unsigned char scale, float inv_g,
+                                                      float* __restrict__ ws) {
+    const float s = si_ue4m3(scale) * inv_g * 0.5f;
+    const unsigned int p0 = __ldg(reinterpret_cast<const unsigned int*>(packed8));
+    const unsigned int p1 = __ldg(reinterpret_cast<const unsigned int*>(packed8 + 4));
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p0 >> (8 * i)) & 255u;
+        ws[2 * i]     = si_e2m1_x2(b & 15u) * s;
+        ws[2 * i + 1] = si_e2m1_x2(b >> 4) * s;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (p1 >> (8 * i)) & 255u;
+        ws[8 + 2 * i]     = si_e2m1_x2(b & 15u) * s;
+        ws[8 + 2 * i + 1] = si_e2m1_x2(b >> 4) * s;
+    }
+}
+
+// Same term order and same accumulation order as si_nvfp4_group_dot, reading pre-scaled weights.
+__device__ __forceinline__ float si_nvfp4_group_dot_decoded(const float* __restrict__ ws,
+                                                            const __nv_bfloat16* x16) {
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x16);
+    float acc = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 xf = __bfloat1622float2(x2[i]);
+        acc += ws[2 * i] * xf.x + ws[2 * i + 1] * xf.y;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 xf = __bfloat1622float2(x2[i + 4]);
+        acc += ws[8 + 2 * i] * xf.x + ws[8 + 2 * i + 1] * xf.y;
+    }
+    return acc;
+}
+
 template <typename OutT, int S>
 __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                      const void* __restrict__ packed,
@@ -620,6 +770,77 @@ __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
 template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 4>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+#endif
+
+// Row-batched form of gemv_nvfp4_sk_kernel: R activation rows against ONE weight stream.
+//
+// The speculative verify projects R rows through the same weight matrix. For every quantized type
+// that has a rows kernel (launch_mmvq_rows) it streams the weights once for all R; NVFP4 had no
+// such kernel, so the verify fell back to R separate one-row launches and re-read the whole
+// matrix R times. On the ModelOpt checkpoint every GDN and attention projection is NVFP4, so that
+// is the batched verify's dominant cost and a reason it stays more expensive per emitted token
+// than the token loop it is meant to replace.
+//
+// Bit-identical per row, by construction and for the same reason launch_mmvq_q4k_rows is: row r
+// walks exactly the group sequence the one-row kernel walks for it (same split, same lane, same
+// stride), accumulates into its own float, and folds its splits in the same ascending order. Only
+// the weight and scale loads are shared between rows -- the arithmetic per row is untouched, which
+// is what keeps the speculative path lossless by construction rather than by measurement.
+template <typename OutT, int S, int R>
+__global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                                          const void* __restrict__ packed,
+                                          OutT* __restrict__ y, int N, int K) {
+    constexpr int RPB = GEMV_WPB / S;
+    __shared__ float s_part[RPB][S][R];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_local = warp / S, split = warp % S;
+    const int n = blockIdx.x * RPB + row_local;
+    float acc[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.f;
+    if (n < N) {
+        const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
+        const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
+        const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+        const unsigned char* srow = sf + (size_t)n * (size_t)(K >> 4);
+        const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
+        const int ng = K >> 4;
+        for (int g = split * 32 + lane; g < ng; g += S * 32) {
+            // Decode the group once, then dot it against every row. See si_nvfp4_group_decode.
+            float ws[16];
+            si_nvfp4_group_decode(prow + (size_t)g * 8, srow[g], inv_g, ws);
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+                acc[r] += si_nvfp4_group_dot_decoded(ws, x + (size_t)r * K + (size_t)g * 16);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[r] += __shfl_xor_sync(0xffffffff, acc[r], m);
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < R; r++) s_part[row_local][split][r] = acc[r];
+        }
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            float o = s_part[row_local][0][r];
+            #pragma unroll
+            for (int t = 1; t < S; t++) o += s_part[row_local][t][r];
+            gemv_write(y + (size_t)r * N + n, o);
+        }
+    }
+}
+#ifndef _MSC_VER
+#define SI_NVFP4_ROWS_INST(S_, R_) \
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+SI_NVFP4_ROWS_INST(2, 2) SI_NVFP4_ROWS_INST(4, 2) SI_NVFP4_ROWS_INST(8, 2)
+SI_NVFP4_ROWS_INST(2, 4) SI_NVFP4_ROWS_INST(4, 4) SI_NVFP4_ROWS_INST(8, 4)
+SI_NVFP4_ROWS_INST(2, 6) SI_NVFP4_ROWS_INST(4, 6) SI_NVFP4_ROWS_INST(8, 6)
+#undef SI_NVFP4_ROWS_INST
 #endif
 
 template <typename OutT>
@@ -2185,6 +2406,42 @@ void launch_gemv_fp8(const void* x, const void* W, void* y, int N, int K, cudaSt
     gemv_fp8_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
 }
 
+// Batched counterpart of launch_gemv_fp8. Returns false when it cannot serve the request
+// bit-identically, in which case the caller keeps its per-row loop.
+//
+// The S selection below is a COPY of launch_gemv_fp8's, deliberately: S sets how the K range is
+// partitioned and therefore the order of the final split sum, so picking a different S for the
+// same matrix would give a different (still correct) rounding and break the exactness the verify
+// relies on. The non-split-K and N >= 16384 cases decline instead of falling back to
+// gemv_fp8_kernel, for the same reason -- that path associates K differently.
+bool launch_gemv_fp8_rows(const void* x, const void* W, void* y, int M, int N, int K,
+                          cudaStream_t stream) {
+    if (!x || !W || !y || N < 1 || K < 1 || (K & 7)) return false;
+    if (M < 2 || M > 8) return false;               // M == 1 is launch_gemv_fp8's own case
+    if (!gemv_bf16_splitk() || N >= 16384) return false;
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+#define SI_FP8_ROWS(S_, R_) do { \
+        constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
+        const dim3 grid((N + RPB - 1) / RPB); \
+        gemv_fp8_rows_sk_kernel<__nv_bfloat16, S, R><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+    } while (0)
+#define SI_FP8_ROWS_S(R_) do { \
+        if (N >= 8192)      SI_FP8_ROWS(2, R_); \
+        else if (N >= 4096) SI_FP8_ROWS(4, R_); \
+        else                SI_FP8_ROWS(8, R_); \
+    } while (0)
+    switch (M) {
+        case 2: SI_FP8_ROWS_S(2); break;  case 3: SI_FP8_ROWS_S(3); break;
+        case 4: SI_FP8_ROWS_S(4); break;  case 5: SI_FP8_ROWS_S(5); break;
+        case 6: SI_FP8_ROWS_S(6); break;  case 7: SI_FP8_ROWS_S(7); break;
+        default: SI_FP8_ROWS_S(8); break;
+    }
+#undef SI_FP8_ROWS_S
+#undef SI_FP8_ROWS
+    return true;
+}
+
 void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cudaStream_t stream) {
     if (!x || !W || !y || N < 1 || K < 1 || (K & 15)) return;
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
@@ -2204,6 +2461,39 @@ void launch_gemv_nvfp4(const void* x, const void* W, void* y, int N, int K, cuda
     }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_nvfp4_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K);
+}
+
+bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N, int K,
+                            cudaStream_t stream) {
+    if (!x || !W || !y || N < 1 || K < 1 || (K & 15)) return false;
+    if (!gemv_bf16_splitk()) return false;          // the rows kernel exists in split-K form only
+    // Every width 2..8, not just the even ones. The odd widths used to fall through to the
+    // caller's row loop, which re-read the whole weight matrix once per row -- so a 7-wide verify
+    // block paid full per-row traffic on every NVFP4 projection while a 6-wide one did not. That
+    // showed up directly in the cost curve, where N=7 kept the steepest slope after the FFN was
+    // batched (4.23 forwards, against 2.29 at N=4).
+    if (M < 2 || M > 8) return false;
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+    auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+#define SI_NVFP4_ROWS(S_, R_) do { \
+        constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
+        const dim3 grid((N + RPB - 1) / RPB); \
+        gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); \
+    } while (0)
+#define SI_NVFP4_ROWS_S(R_) do { \
+        if (N >= 8192)      SI_NVFP4_ROWS(2, R_); \
+        else if (N >= 4096) SI_NVFP4_ROWS(4, R_); \
+        else                SI_NVFP4_ROWS(8, R_); \
+    } while (0)
+    switch (M) {
+        case 2: SI_NVFP4_ROWS_S(2); break;  case 3: SI_NVFP4_ROWS_S(3); break;
+        case 4: SI_NVFP4_ROWS_S(4); break;  case 5: SI_NVFP4_ROWS_S(5); break;
+        case 6: SI_NVFP4_ROWS_S(6); break;  case 7: SI_NVFP4_ROWS_S(7); break;
+        default: SI_NVFP4_ROWS_S(8); break;
+    }
+#undef SI_NVFP4_ROWS_S
+#undef SI_NVFP4_ROWS
+    return true;
 }
 
 void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int K, cudaStream_t stream) {

@@ -484,6 +484,59 @@ __device__ __forceinline__ float si_vec_dot_q4_K(const si_block_q4_K* bq4, const
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
 }
 
+// si_vec_dot_q4_K split into its weight half and its activation half, so M rows sharing one weight
+// block decode it once instead of M times.
+//
+// Everything the row-batched FFN kernels re-derived per row lives in si_q4k_wdec: the two packed
+// nibble words, the 6-bit scale/min pair unpacked out of the super-block header, and the block's
+// d/dmin. Only the q8_1 activations, the four dp4a ops and the final combine actually depend on
+// which row is being scored. At M=7 the old form paid that unpack seven times over.
+//
+// si_vec_dot_q4_K_pre(si_q4k_decode_w(b, iqs), a, iqs) is the same expressions in the same order as
+// si_vec_dot_q4_K(b, a, iqs), so it is bit-identical -- only the point at which the weight half is
+// computed moves.
+struct si_q4k_wdec { int v0, v1; unsigned char sc[2], m[2]; float d, dmin; };
+
+__device__ __forceinline__ si_q4k_wdec si_q4k_decode_w(const si_block_q4_K* bq4, int iqs) {
+    si_q4k_wdec w;
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int* q4 = (const int*)(bq4->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    w.v0 = q4[0]; w.v1 = q4[4];
+    const unsigned short* scales = (const unsigned short*)bq4->scales;
+    unsigned short aux[2]; const int j = bq8_offset / 2;
+    if (j < 2) { aux[0] = scales[j] & 0x3f3f; aux[1] = scales[j + 2] & 0x3f3f; }
+    else { aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+           aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+    const unsigned char* s = (const unsigned char*)aux;
+    w.sc[0] = s[0]; w.sc[1] = s[1]; w.m[0] = s[2]; w.m[1] = s[3];
+    const float2 dm4f = __half22float2(bq4->dm);
+    w.d = dm4f.x; w.dmin = dm4f.y;
+    return w;
+}
+
+__device__ __forceinline__ float si_vec_dot_q4_K_pre(const si_q4k_wdec& w,
+                                                     const si_block_q8_1* bq8_1, int iqs) {
+    int u[4]; float d8[2];
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const si_block_q8_1* bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int* q8 = (const int*)bq8i->qs + ((iqs / 2) % 4);
+        u[2 * i] = q8[0]; u[2 * i + 1] = q8[4];
+    }
+    float sumf_d = 0.0f, sumf_m = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int v0i = (w.v0 >> (4 * i)) & 0x0F0F0F0F, v1i = (w.v1 >> (4 * i)) & 0x0F0F0F0F;
+        const int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i], 0));
+        const int dot2 = __dp4a(0x01010101, u[2 * i + 1], __dp4a(0x01010101, u[2 * i], 0));
+        sumf_d += d8[i] * (dot1 * w.sc[i]);
+        sumf_m += d8[i] * (dot2 * w.m[i]);
+    }
+    return w.d * sumf_d - w.dmin * sumf_m;
+}
+
 // Q5_K int8 dp4a vec-dot for the MoE down. Q5_K is Q4_K plus one high bit per quant (qh[32]), so
 // this reuses the faithful Q4_K vec_dot structure (same qs / scales / activation indexing, same
 // iqs = 2*L convention as si_vec_dot_q4_K) and only widens each 4-bit weight to 5 bits. The qh bit
@@ -837,6 +890,94 @@ __global__ void gate_up_mmvq2_qwen_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// M token rows against ONE set of gate/up rows, in a single pass over those weights.
+//
+// gate_up_mmvq2_qwen_kernel above is launched with a grid of num_tokens*TOPK*F blocks, so the
+// token index lives in blockIdx and each block fetches the gate/up super-blocks it needs on its
+// own. For a 256-expert MoE that is exactly right -- different tokens genuinely want different
+// experts, and there is nothing to share. For a DENSE ffn (n_experts == 1, which is how
+// Qwen3.8-27B runs through this kernel) every token wants expert 0, so the same weights were being
+// pulled from DRAM once per token. The FFN is the bulk of the model's weight traffic, and that is
+// what made the DFlash verify cost scale with the block width instead of staying flat: measured
+// 1.49 forwards at N=2, 2.62 at N=4, 4.81 at N=7, against a ~0.4 + 0.6*N fit -- 0.6 being very
+// nearly the FFN's share of the traffic.
+//
+// Here the token index moves into the kernel and kbx stays the OUTER loop, so each super-block is
+// fetched once and dotted against all M rows while it is still in L1. Per-row arithmetic is
+// untouched -- same kbx traversal, same si_vec_dot_q4_K, same 4-warp shared reduce, same ordered
+// warp reduce -- so every output is bit-identical to the one-token launch it replaces, which is
+// what the verify's losslessness gate needs. Weights are addressed per row via expert_ids rather
+// than assumed to be expert 0, so a top_k==1 MoE stays correct; it simply has nothing to reuse.
+template <int H, int F, int TOPK, int M>
+__global__ void gate_up_mmvq2_qwen_rows_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int pdl
+) {
+    constexpr int NW = 4, WS = 32;
+    const int f = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4;
+    const int kqs = 2 * (tid & 15);
+    constexpr int NB = H >> 8;
+    float tg[M], tu[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) { tg[r] = 0.f; tu[r] = 0.f; }
+    // When every row wants the same expert -- always, for the dense ffn this path exists for -- the
+    // Q4_K weight half is decoded once per super-block and shared. Otherwise each row decodes its
+    // own, which is what a top_k==1 MoE with genuinely different experts needs; same results either
+    // way, since si_vec_dot_q4_K_pre(si_q4k_decode_w(b), a) == si_vec_dot_q4_K(b, a).
+    const int e0 = expert_ids[0];
+    bool uniform = true;
+#pragma unroll
+    for (int r = 1; r < M; ++r) uniform &= (expert_ids[r * TOPK] == e0);
+    if (uniform) {
+        const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e0 * F + f) * (H >> 8) * 144);
+        const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e0 * F + f) * (H >> 8) * 144);
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+            const si_q4k_wdec gw = si_q4k_decode_w(g_row + kbx, kqs);
+            const si_q4k_wdec uw = si_q4k_decode_w(u_row + kbx, kqs);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const si_block_q8_1* v = vy + (size_t)r * (H >> 5) + (size_t)kbx * 8;
+                tg[r] += si_vec_dot_q4_K_pre(gw, v, kqs);
+                tu[r] += si_vec_dot_q4_K_pre(uw, v, kqs);
+            }
+        }
+    } else {
+        for (int kbx = kbx0; kbx < NB; kbx += 8) {
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const int e = expert_ids[r * TOPK];
+                const si_block_q4_K* g = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * (H >> 8) * 144);
+                const si_block_q4_K* u = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * (H >> 8) * 144);
+                const si_block_q8_1* v = vy + (size_t)r * (H >> 5) + (size_t)kbx * 8;
+                tg[r] += si_vec_dot_q4_K(g + kbx, v, kqs);
+                tu[r] += si_vec_dot_q4_K(u + kbx, v, kqs);
+            }
+        }
+    }
+    __shared__ float sg[M][NW - 1][WS], su[M][NW - 1][WS];
+    if (warp > 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) { sg[r][warp - 1][lane] = tg[r]; su[r][warp - 1][lane] = tu[r]; }
+    }
+    __syncthreads();
+    if (warp > 0) return;
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+#pragma unroll
+        for (int l = 0; l < NW - 1; l++) { tg[r] += sg[r][l][lane]; tu[r] += su[r][l][lane]; }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            tg[r] += __shfl_xor_sync(0xffffffff, tg[r], m);
+            tu[r] += __shfl_xor_sync(0xffffffff, tu[r], m);
+        }
+        if (lane == 0) h_scratch[(size_t)r * F + f] = q4kf_silu(tg[r]) * tu[r];
+    }
+    if (pdl) si_pdl_lc();
+}
+
 template <int H, int F, int TOPK>
 __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
@@ -1112,6 +1253,88 @@ __global__ void down_q4k_mmvq_splitk_kernel(
         #pragma unroll
         for (int s = 0; s < S; s++) o += s_part[hh_local][s];
         output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
+// M token rows against one expert's down rows, in a single pass over those weights.
+//
+// Same change as gate_up_mmvq2_qwen_rows_kernel, applied to the FFN's third matrix. The per-token
+// kernel above puts the token in blockIdx.x, so a dense ffn (every token on expert 0) re-read the
+// whole down projection once per candidate row of the DFlash verify. Here the token loop is the
+// INNER one, so each super-block is fetched once and dotted against all M rows while still in L1.
+//
+// Per-row arithmetic is untouched -- same flattened (expert, vdr-position) traversal in the same
+// order, same si_vec_dot_q4_K, same warp reduce, same ordered split sum from 0.f -- so outputs are
+// bit-identical to M single-token launches, and the verify's losslessness gate is unaffected.
+// Weights are addressed through expert_ids per row, so a top_k==1 MoE stays correct.
+template <int S, int M>
+__global__ void down_q4k_mmvq_splitk_rows_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int pdl
+) {
+    if (pdl) si_pdl_sync();
+    constexpr int RPB = WPB / S;
+    __shared__ float s_part[M][RPB][S];
+    const int lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    const int nblk = F >> 8;
+    const int q8pb = F >> 5;
+    const int work = nblk * 16;              // vdr=2 positions per superblock
+    float acc[M];
+#pragma unroll
+    for (int t = 0; t < M; ++t) acc[t] = 0.f;
+    if (hh < H) {
+        const int total = top_k * work;
+        // Same weight-decode sharing as the gate/up rows kernel: with every row on one expert
+        // (the dense ffn this is gated to), each down super-block is decoded once and dotted
+        // against all M rows. Non-uniform experts decode per row, as a top_k==1 MoE needs.
+        const int e0 = expert_ids[0];
+        bool uniform = true;
+#pragma unroll
+        for (int t = 1; t < M; ++t) uniform &= (expert_ids[t * top_k] == e0);
+        for (int wi = split * 32 + lane; wi < total; wi += S * 32) {
+            const int j = wi / work, r = wi % work;
+            const int kbx = r >> 4, kqs = (r & 15) << 1;
+            if (uniform) {
+                const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+                    down_q + ((size_t)e0 * H + hh) * nblk * 144);
+                const si_q4k_wdec dw = si_q4k_decode_w(drow + kbx, kqs);
+#pragma unroll
+                for (int t = 0; t < M; ++t) {
+                    const int ts = t * top_k + j;
+                    acc[t] += expert_weights[ts] *
+                              si_vec_dot_q4_K_pre(dw, hq8 + (size_t)ts * q8pb + (size_t)kbx * 8, kqs);
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < M; ++t) {
+                    const int ts = t * top_k + j, e = expert_ids[ts];
+                    const float w = expert_weights[ts];
+                    const si_block_q4_K* drow = reinterpret_cast<const si_block_q4_K*>(
+                        down_q + ((size_t)e * H + hh) * nblk * 144);
+                    const si_block_q8_1* h8 = hq8 + (size_t)ts * q8pb;
+                    acc[t] += w * si_vec_dot_q4_K(drow + kbx, h8 + (size_t)kbx * 8, kqs);
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], m);
+            if (lane == 0) s_part[t][hh_local][split] = acc[t];
+        }
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+            float o = 0.f;
+#pragma unroll
+            for (int s = 0; s < S; s++) o += s_part[t][hh_local][s];
+            output[(size_t)t * H + hh] = __float2bfloat16(o);
+        }
     }
 }
 
@@ -1497,6 +1720,37 @@ static inline bool launch_down_q6k_mmvq_splitk(
         default: return false;
     }
 }
+// Row-batched counterpart of launch_down_q4k_mmvq_splitk. Only the generic (non shape-specialized)
+// split-K kernel has a rows form, so this declines anything it does not cover and the caller falls
+// back to the per-token grid.
+static inline bool launch_down_q4k_mmvq_splitk_rows(
+    int S, int M, int pdl, dim3 grid, const unsigned char* down_q, const int* expert_ids,
+    const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
+    int H, int F, int top_k, cudaStream_t stream
+) {
+    if (M < 2 || M > 8) return false;
+    const dim3 block(WPB * 32);
+#define SI_DOWN_ROWS(S_, M_) do { \
+        launch_mmvq_down_kernel(pdl, grid, block, stream, down_q4k_mmvq_splitk_rows_kernel<S_, M_>, \
+            down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); \
+        return true; \
+    } while (0)
+#define SI_DOWN_ROWS_M(S_) do { \
+        switch (M) { \
+            case 2: SI_DOWN_ROWS(S_, 2); case 3: SI_DOWN_ROWS(S_, 3); \
+            case 4: SI_DOWN_ROWS(S_, 4); case 5: SI_DOWN_ROWS(S_, 5); \
+            case 6: SI_DOWN_ROWS(S_, 6); case 7: SI_DOWN_ROWS(S_, 7); \
+            default: SI_DOWN_ROWS(S_, 8); \
+        } \
+    } while (0)
+    if (S == 2)      SI_DOWN_ROWS_M(2);
+    else if (S == 4) SI_DOWN_ROWS_M(4);
+    else if (S == 8) SI_DOWN_ROWS_M(8);
+#undef SI_DOWN_ROWS_M
+#undef SI_DOWN_ROWS
+    return false;
+}
+
 static inline bool launch_down_q4k_mmvq_splitk(
     int S, int pdl, dim3 grid, const unsigned char* down_q, const int* expert_ids,
     const float* expert_weights, const si_block_q8_1* hq8, __nv_bfloat16* output,
@@ -1835,11 +2089,31 @@ void launch_moe_expert_ffn_q4k(
         // arm: F is already large enough that pack2 coarsens scheduling. Compile-time H/F
         // makes NB = H>>8 = 20 a known trip count; same dots in the same order as the
         // generic kernel, so the result is bit-identical.
-        else if (gu_spec && hidden == 5120 && ffn == 17408 && top_k == 1)
-            launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
-                gate_up_mmvq2_qwen_kernel<5120, 17408, 1>,
-                q, reinterpret_cast<const unsigned char*>(gate_q),
-                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+        else if (gu_spec && hidden == 5120 && ffn == 17408 && top_k == 1) {
+            // Multi-token callers (the DFlash verify scoring a block of candidates) take the
+            // row-batched kernel, which walks F once instead of num_tokens*F and so reads gate/up
+            // from DRAM once instead of once per token. Bit-identical per row; see the kernel.
+            // SPARKINFER_GU_ROWS=0 restores the per-token grid.
+            static int gu_rows = -1;
+            if (gu_rows < 0) { const char* e = getenv("SPARKINFER_GU_ROWS"); gu_rows = (e && e[0] == '0') ? 0 : 1; }
+#define SI_GU_ROWS(MM) launch_pdl_kernel(gu_pdl, dim3(ffn), dim3(4 * 32), 0, stream, \
+                gate_up_mmvq2_qwen_rows_kernel<5120, 17408, 1, MM>, \
+                q, reinterpret_cast<const unsigned char*>(gate_q), \
+                reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl)
+            if (gu_rows && num_tokens >= 2 && num_tokens <= 8) {
+                switch (num_tokens) {
+                    case 2: SI_GU_ROWS(2); break;  case 3: SI_GU_ROWS(3); break;
+                    case 4: SI_GU_ROWS(4); break;  case 5: SI_GU_ROWS(5); break;
+                    case 6: SI_GU_ROWS(6); break;  case 7: SI_GU_ROWS(7); break;
+                    default: SI_GU_ROWS(8); break;
+                }
+            } else
+                launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
+                    gate_up_mmvq2_qwen_kernel<5120, 17408, 1>,
+                    q, reinterpret_cast<const unsigned char*>(gate_q),
+                    reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+#undef SI_GU_ROWS
+        }
         else
             launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream,
                 gate_up_mmvq2_kernel,
@@ -1911,6 +2185,18 @@ void launch_moe_expert_ffn_q4k(
         const int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         if (S > 1) {
             const int RPB = WPB / S;
+            // Multi-token callers walk hidden once instead of num_tokens*hidden, reading the down
+            // projection from DRAM once rather than once per token. Bit-identical per row; see
+            // down_q4k_mmvq_splitk_rows_kernel. SPARKINFER_DOWN_ROWS=0 restores the per-token grid.
+            static int down_rows = -1;
+            if (down_rows < 0) { const char* e = getenv("SPARKINFER_DOWN_ROWS"); down_rows = (e && e[0] == '0') ? 0 : 1; }
+            if (down_rows && num_tokens >= 2 && num_tokens <= 8 && top_k == 1) {
+                dim3 dnr(1, (hidden + RPB - 1) / RPB);
+                if (launch_down_q4k_mmvq_splitk_rows(S, num_tokens, pdl, dnr,
+                        reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
+                        reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, stream))
+                    return;
+            }
             dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
             if (launch_down_q4k_mmvq_splitk(S, pdl, dns,
                     reinterpret_cast<const unsigned char*>(down_q), expert_ids, expert_weights, hq8,
