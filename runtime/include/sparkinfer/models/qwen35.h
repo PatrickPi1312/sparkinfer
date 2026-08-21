@@ -98,6 +98,25 @@ struct Qwen35LayerWeights {
     // Short-context-only copy; decode retains down_q, so long-context configurations leave this
     // null to preserve KV and batched-prefill scratch headroom on 32-GB cards.
     const void* down_fp4 = nullptr; const void* down_fp4_sf = nullptr;
+    // The checkpoint's OWN NVFP4 FFN payloads, in the single-blob layout launch_gemv_nvfp4 reads
+    // ([SI_NVFP4_HDR | ue4m3 group scales | packed e2m1]). Distinct from the *_fp4/_fp4_sf pair
+    // above, which is the split layout the batched-prefill GEMM wants.
+    //
+    // These exist because decode does NOT currently run the checkpoint's numerics. gate_q/up_q/
+    // down_q are built by dequantizing these payloads and REQUANTIZING to Q4_K, which measures
+    // 8.25% mean relative weight error against the NVFP4 source (corr 0.9968) -- NVFP4's 8
+    // magnitudes per 16-element group with an e4m3 scale and Q4_K's 16 levels per 32 with a 6-bit
+    // scale/min do not nest, so the conversion is pure loss on top of an already-lossy format.
+    // Measured cost of that conversion, same corpus, same build, only this flag changed:
+    //
+    //     Q4_K decode (default)   PPL 3.204
+    //     NVFP4 decode            PPL 3.010     6.1% better
+    //
+    // So it is a real quality regression, not a theoretical one. What it is NOT is the cause of
+    // the DSpark acceptance gap: tau measured 1.6552 on Q4_K against 1.6333 on NVFP4, i.e.
+    // unchanged, so the draft is not being held back by the target's requantized weights.
+    // Set by SPARKINFER_QWEN38_DECODE_NVFP4=1 so the decode FFN can read the checkpoint directly.
+    const void* gate_nv = nullptr; const void* up_nv = nullptr; const void* down_nv = nullptr;
     // Full-attention q/k/v projections as the checkpoint ships them (ModelOpt NVFP4). Unlike the
     // GDN pointers below these do NOT alias a payload decode already holds: decode reads the Q4_K
     // wq/wk/wv/wo built from the same bytes, because native NVFP4 GEMV is ~0.65x at m=1. So the
