@@ -21,9 +21,14 @@ namespace sparkinfer {
 // Continuous-batch serving engine: queues requests, assigns per-request seq_ids,
 // right-sizes KV allocation, and interleaves decode steps via the Scheduler.
 //
-// DFlash multi-token accept in step_job() is intentionally deferred until the
-// single-stream dflash_generate path proves SPEC_AGREE=100% and a tok/s win
-// (see bench/scripts/dflash_accuracy.sh). Do not wire speculative multi-accept here yet.
+// DFlash/DSpark multi-token accept in step_job() is still NOT wired, but read why carefully --
+// the original condition has since been met. This was deferred until the single-stream
+// dflash_generate path proved SPEC_AGREE=100% and a tok/s win (bench/scripts/dflash_accuracy.sh);
+// as of 2026-08-21 DSpark is byte-lossless against AR and measures 1.27x at ctx=4k, so that bar
+// is cleared and the remaining blocker is the continuous-batch integration itself, not the
+// speculation. Anyone picking this up owns the sampling guard: Qwen35Model::generate has no
+// check against a temperature-sampling caller (see its comment), and step_job serves arbitrary
+// per-request sampling params, so multi-accept here needs one.
 class ContinuousBatchEngine {
 public:
     struct Request {

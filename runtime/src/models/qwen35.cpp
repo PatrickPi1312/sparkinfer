@@ -2686,7 +2686,8 @@ void Qwen35Model::set_logit_bias(uint64_t seq_id, const std::vector<std::pair<in
 // step (qwen35_prefill.cpp's dflash_verify_short_run) requires exact greedy-argmax determinism
 // against the draft model's own greedy proposal (see its own comments), and there is currently no
 // guard here against calling this with a temperature-sampling caller. If DFlash is ever wired
-// into step_job() (see inference_engine.h's TODO) or a CLI flag adds temperature/seed to these
+// into step_job() (see the deferral note above ContinuousBatchEngine in inference_engine.h) or a
+// CLI flag adds temperature/seed to these
 // bench binaries, that future work must add its own guard here -- the HTTP-layer 400 in
 // sparkinfer_server.cpp only protects the path that actually goes through step_job today.
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov,
