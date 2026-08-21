@@ -138,11 +138,15 @@ BUCKETS = [(0.18, "XL"), (0.10, "L"), (0.06, "M"), (0.035, "S"), (SIG, "XS")]
 # over the whole prompt), so a real win in one is a real win, and averaging would let an untouched
 # dimension dilute it.
 #
-# decode@128 and prefill@128 stay MEASURED as no-regression FLOORS, as do these two: a PR that
-# buys long-context throughput by trading away short-context is still a hard REJECT. Floor and
-# scoring are separate lists precisely so the target can move without weakening the guard -- a PR
-# The one scored dimension: DSpark speculative decode throughput at ctx=128, as measured by
+# The one scored dimension: DSpark speculative decode throughput at ctx=4096, as measured by
 # runtime/examples/dspark_tau_check.cpp's METRIC DSPARK_TPS.
+#
+# This said ctx=128 until 2026-08-21, and the paragraph above it described decode@128 and
+# prefill@128 as no-regression floors. Both were inherited verbatim from pr_modelopt_bot.py and
+# neither survived the move to 4k: the module docstring's SCOPE section is explicit that "nothing
+# is measured at ctx=128 any more", and SCORING_DIMS below has read dspark-decode@4k since
+# 2026-08-18. The floors this bot actually runs are the AR floor, the tau floor, and the two 16k
+# long-context guards -- all documented in the docstring, none of them at 128.
 #
 # Single-dimension on purpose. The multi-dimension machinery below (best-tier-wins across a list,
 # every dimension also a floor) is kept intact so adding e.g. "dspark-decode@4k" later is a
