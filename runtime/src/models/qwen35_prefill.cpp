@@ -149,6 +149,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // instead of O(N) — at long context those full-width buffers dominate and OOM (~8 GB @128k). The
     // FFN is per-token independent, so chunking is numerically identical. Env override; default 32768.
     // (MoE doesn't use ffg/ffu — its grouped FFN has its own O(N*top_k) scratch, so chunking is moot.)
+    //
+    // 32768 is only the STARTING value. FC is a free-VRAM-derived quantity: the sizing loop below
+    // (#852, search kMinFfnChunk) halves it until the FC-scaled pair fits what cudaMemGetInfo
+    // reports, so at long context it commonly lands far lower -- 1024 has been observed at
+    // ctx=16384. Anything sized off FC must therefore be allocated AFTER that loop and must not
+    // assume FC == N; getting this wrong is how the native-FP4 ffn_down leg silently disabled
+    // itself, see the fp4_down_a comment further down.
     const int ffn_chunk = []{ const char* e = getenv("SPARKINFER_PREFILL_FFN_CHUNK"); int c = e ? atoi(e) : 32768; return c > 0 ? c : 32768; }();
     int FC = (N < ffn_chunk) ? N : ffn_chunk;
     bf16* lin_conv_state = static_cast<bf16*>(s.lin_conv_state);
