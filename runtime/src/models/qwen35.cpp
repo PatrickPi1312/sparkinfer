@@ -4843,8 +4843,11 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
         // SPARKINFER_QWEN38_PREFILL_NVFP4=0 drops the checkpoint-native NVFP4 copies once they
-        // have been consumed to build the Q4_K decode weights. They exist ONLY to make batched
-        // prefill faster -- decode always reads gate_q/up_q/down_q -- and they are not small: at
+        // have been consumed to build the Q4_K decode weights. In the default configuration they
+        // exist ONLY to make batched prefill faster -- decode reads gate_q/up_q/down_q unless
+        // kDecodeNvfp4 is set, in which case these payloads ARE the decode weights and this knob
+        // does not free them (see the exclusive branch at the w.gate_nv assignment below).
+        // They are not small: at
         // 4.5 bits per weight over a 64-layer, 17408-wide dense FFN that is ~9.6 GB held resident
         // purely for prefill throughput, on top of the Q4_K copy's own 9.6 GB.
         //
