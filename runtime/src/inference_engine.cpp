@@ -330,8 +330,12 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         const int chunk = prefill_chunk_tokens();
         // Qwen35Model::ingest_prompt_range() is the single funnel both this continuous-batch
         // path and cache_prefix()'s exclusive-session path dispatch prefill through: it picks
-        // batched GEMM prefill (Qwythos / Qwen3.6 hybrid, ~100x faster than the token loop, only
-        // eligible from position 0) vs. the token-loop fallback itself, and the batched path
+        // batched GEMM prefill (every hybrid this runtime serves -- Qwythos, Qwen3.6, Qwen3.8,
+        // Muse Glimmer; prefill_batched_run's guards are the authority, and it is only ever
+        // eligible from position 0) vs. the token-loop fallback itself. The batched path is
+        // worth one to two orders of magnitude over the token loop depending on model and
+        // context -- ~28x at ctx=16384 on Qwen3.8, more on Qwythos -- so treat any single ratio
+        // quoted in this tree as the shape it was measured at. The batched path
         // never chunks (no start_pos support in prefill_batched_run yet) regardless of the
         // chunk_limit passed here -- decode-first scheduling already advances waiting decodes
         // once before a full batched pass runs, so that never hurts ITPS under mixed load.
