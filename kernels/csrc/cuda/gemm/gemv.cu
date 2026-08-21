@@ -2592,11 +2592,11 @@ bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N,
     if (M < 2 || M > 8) return false;
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
-    // SPARKINFER_NVFP4_ROWS_NR=1 gives one output row per warp, i.e. main's kernel exactly, so both
+    // SPARKINFER_NVFP4_ROWS_NR=1 gives one output row per warp, i.e. the pre-#891 kernel exactly, so both
     // arms of an A/B come out of one binary.
     static const int nr = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
                               return (e && e[0] == '1') ? 1 : 2; }();
-    // SPARKINFER_NVFP4_ROWS_V4 selects the load width: 0 restores main's scalar loads, 1 widens
+    // SPARKINFER_NVFP4_ROWS_V4 selects the load width: 0 restores the pre-#899 scalar loads, 1 widens
     // only the activations, 2 (default) widens the weight pair as well. All three arms come out of
     // one binary the way the NR toggle beside it does.
     static const int xv4 = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_V4");

@@ -585,12 +585,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // 3.1 GB operand. Feeding the packed nibbles to the same SM120 block-scaled GEMM the FFN
     // already uses deletes the expansion instead of making it faster.
     //
-    // Confined to short prompts (SPARKINFER_Q38_GDN_NVFP4_MAXN, default 2048). Two reasons, and
-    // neither is the benchmark: the saving is a per-layer FIXED cost, so it is worth the most per
-    // token exactly where N is small; and the GDN recurrence amplifies activation-quant error with
-    // sequence length -- this file already drops GDN off int8 past bf16_minctx for that reason,
-    // and FP4 activations are coarser than int8. A fixed bound also keeps the scored shape off the
-    // cudaMemGetInfo-derived FC, so which arm runs at ctx=128 does not depend on free VRAM.
+    // This arm was originally confined to short prompts by SPARKINFER_Q38_GDN_NVFP4_MAXN, on two
+    // arguments: the saving is a per-layer FIXED cost, so it is worth the most per token exactly
+    // where N is small; and the GDN recurrence amplifies activation-quant error with sequence
+    // length -- this file already drops GDN off int8 past bf16_minctx for that reason, and FP4
+    // activations are coarser than int8. Measurement contradicted both and the bound was lifted;
+    // MAXN now defaults to effectively unlimited, and the note above gdn_fp4_maxn below records
+    // what was measured. The knob remains for A/B.
     // SPARKINFER_Q38_GDN_NVFP4_PREFILL=0 restores the dequant-to-int8 path (A/B in ONE binary);
     // bit 0 is the in-projections (qkv + z, which share one A quantize) and bit 1 is out_proj, so
     // 1/2 price them separately -- they sit on opposite sides of the GDN recurrence and do not
@@ -1741,7 +1742,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                 kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
             }
         } else {
-            // ---- expert-grouped 256-expert int8 MoE FFN (this PR): route -> bucket routed
+            // ---- expert-grouped 256-expert int8 MoE FFN: route -> bucket routed
             // (token, expert) pairs by expert -> per-expert int8 tensor-core GEMMs, so each expert's
             // weights are read ONCE per layer instead of once per routed token (the ~1.1 GB/token
             // MoE weight re-read that pinned the token loop). Router logits use the decode-reference

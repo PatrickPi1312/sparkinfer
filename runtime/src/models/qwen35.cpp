@@ -2897,8 +2897,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     const int B = dc.block_size;
     const int mask_id = dc.mask_token_id;
 
-    // The sequence length below which this path is byte-identical to main: the boundary between
-    // main's behaviour and the exact long-context batched verify.
+    // The sequence length below which this path keeps the original short-context behaviour: the
+    // boundary between that and the exact long-context batched verify added by #720.
     static const int kCompactMaxSeq = []{
         const char* e = getenv("SPARKINFER_DFLASH_COMPACT_MAX_SEQ");
         return e ? atoi(e) : 384;
@@ -3251,7 +3251,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // blocks, the block is pure overhead and is skipped, which degenerates the step to AR.
     // Probes keep it self-correcting: every kDraftProbePeriod steps one block is drafted anyway,
     // so a stream whose draft starts tracking re-arms exactly as it would have.
-    // SPARKINFER_DFLASH_IDLE_DRAFT=0 restores main's unconditional draft.
+    // SPARKINFER_DFLASH_IDLE_DRAFT=0 restores the unconditional draft (the pre-#878 behaviour).
     int disarmed_run = 0;
     // Draft idling: DEFAULT OFF (2026-08-19). #869 added it on the reasoning that a draft block
     // "can never save a target forward" on the token loop, so once the batched verify stays

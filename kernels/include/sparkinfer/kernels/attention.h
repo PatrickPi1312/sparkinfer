@@ -165,7 +165,8 @@ void launch_flash_decode_split(
     const void* k_scale = nullptr, const void* v_scale = nullptr, int int8_kv = 0,
     const void* attn_gate = nullptr,
     // Opt-in for the head_dim=128 gated combine. Defaults OFF so no existing caller can change
-    // behaviour: only Muse Glimmer, whose hd128 gated kernel this PR instantiates, passes 1.
+    // behaviour: only Muse Glimmer, which is the only model instantiating the hd128 gated
+    // kernel, passes 1.
     int gated_combine_hd128 = 0);
 
 // Flash decode for GLOBAL layers: full context, head_dim=512, GQA 8:1.
