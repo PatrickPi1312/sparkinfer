@@ -71,9 +71,13 @@ struct Qwen35LayerWeights {
     const void* ssm_norm = nullptr;       // [linear_head_dim]
     const void* ssm_out = nullptr;        // [value_dim, hidden]
 
-    // GGUF path: experts kept quantized in VRAM (gguf-native [E,out,in] layout).
-    // When gate_q != nullptr the model dequantizes these per-layer into scratch
-    // instead of using the bf16 gate/up/down above. *_qtype are ggml type ids.
+    // Experts kept quantized in VRAM (gguf-native [E,out,in] layout). Set by BOTH loaders: the
+    // GGUF path keeps the file's own blocks, and load_compressed_tensors builds them by
+    // requantizing the checkpoint's NVFP4 (see gate_nv below for what that costs).
+    // When gate_q != nullptr decode reads these INSTEAD of the bf16 gate/up/down above, and reads
+    // them in place: launch_moe_expert_ffn_q4k is a dp4a MMVQ that decodes each block in-register
+    // during the dot product. There is no per-layer dequant-to-scratch step -- the only
+    // launch_gguf_dequant calls on these tensors are at load time. *_qtype are ggml type ids.
     const void* gate_q = nullptr; const void* up_q = nullptr; const void* down_q = nullptr;
     int gate_qtype = 0, up_qtype = 0, down_qtype = 0;
     // Optional native gate/up copies retained for batched prefill when decode uses an
@@ -168,7 +172,8 @@ struct Qwen35Weights {
     std::vector<Qwen35LayerWeights> layers;
 };
 
-// Single-sequence (batch=1) greedy decoder for Qwen MoE. Owns scratch buffers and
+// Single-sequence (batch=1) greedy decoder for the Qwen family -- routed-MoE (Qwen3.6) and
+// dense-FFN (Qwen3.8, Qwen3.5) alike, plus Muse Glimmer. Owns scratch buffers and
 // drives embed -> N layers -> final norm -> LM head -> argmax per token.
 class Qwen35Model {
 public:
@@ -182,10 +187,11 @@ public:
     bool load_weights(const std::string& dir);
 
     // Load weights directly from a GGUF file (native). Dense tensors are
-    // dequantized to bf16; expert tensors are kept quantized in VRAM and
-    // dequantized per-layer at decode time (Q4_K_M-sized resident footprint).
+    // dequantized to bf16; expert tensors are kept quantized in VRAM and decoded on-read by the
+    // MMVQ decode kernel, never materialized (Q4_K_M-sized resident footprint).
     bool load_gguf(const std::string& path);
-    // HuggingFace "compressed-tensors" mixed FP8/NVFP4 checkpoint (e.g. unsloth/Qwen3.8-27B-NVFP4)
+    // HuggingFace "compressed-tensors" NVFP4 checkpoint -- both the uniform-NVFP4 ModelOpt build
+    // the eval scores and the mixed NVFP4-FFN/FP8-attention unsloth build it guards
     // -- see runtime/src/models/qwen35.cpp's own comment on the function for the exact scheme.
     bool load_compressed_tensors(const std::string& model_dir);
 
@@ -330,11 +336,16 @@ public:
 
     const Qwen35Config& config() const;
 
-    // Batched prompt prefill (Qwen3.5 dense-hybrid only): process all `n` prompt tokens in one
+    // Batched prompt prefill: process all `n` prompt tokens in one
     // pass, filling the paged KV cache and Gated-DeltaNet recurrent/conv state for positions
     // 0..n-1 so a subsequent decode is faithful to the forward_token loop. Returns the argmax at
     // the last prompt position (seed for the first decode step), or -1 if the batched path is
     // unsupported for this model/config. Implemented in qwen35_prefill.cpp.
+    //
+    // Written for the Qwen3.5 dense hybrid, but no longer restricted to it: the 256-expert MoE
+    // (Qwen3.6-35B-A3B) and the dense-FFN Qwen3.8-27B both take this path, as does Muse Glimmer.
+    // The eligibility checks at the top of prefill_batched_run (qwen35_prefill.cpp) are
+    // authoritative -- do not infer the supported set from here.
     int prefill_batched(const int* prompt_ids, int n);
 
     // Prefill prompt tokens [start, end) with the batched path when start==0 and eligible, else
