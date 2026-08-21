@@ -1,7 +1,9 @@
 // Flash-decoding (KV-split) attention for decode.
 //
 // The plain decode kernel parallelizes only over (seq, kv_head) — e.g. 4 blocks
-// for Qwen3-30B-A3B, leaving ~184 of 188 SMs idle. Flash-decoding instead splits
+// for Qwen3-30B-A3B, leaving all but 4 SMs idle (166 of 170 on the RTX 5090 this
+// tree targets; the figure here read "184 of 188" from whatever card it was first
+// written against, which is not one this repo builds for). Flash-decoding instead splits
 // the KV sequence into n_splits chunks and runs one block per (seq, q_head,
 // split): each computes a partial online-softmax (m, l, acc) over its chunk, then
 // a combine pass merges the partials with the standard log-sum-exp rescale. This
@@ -9,7 +11,10 @@
 // spread across many blocks). Grid is fixed (independent of seq_len, read in
 // kernel), so it stays CUDA-graph capturable.
 //
-// One warp per block; head_dim=128 (Qwen3). Portable CUDA — sm_89 .. sm_120/121.
+// One warp per block. HEAD_DIM-generic and instantiated for BOTH 128 (Qwen3 GQA) and 256
+// (Qwen3.6/Qwen3.8 full-attention layers, bf16 KV, GQA-8 shared-KV tile) -- see the head_dim == 256
+// dispatch in launch. head_dim=512 lives in flash_decode_global_hd512.cu, not here.
+// Portable CUDA — sm_89/90/100/120, the set CMAKE_CUDA_ARCHITECTURES builds; sm_121 is excluded.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
