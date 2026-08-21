@@ -3216,8 +3216,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     //
     // #890 replaced both with a single eighths-domain threshold, so BOTH env vars are gone --
     // SPARKINFER_DFLASH_ENGAGE_KEEP and _KEEP_LONG are no longer read anywhere and setting them
-    // does nothing. Use SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS. (They survived as unread
-    // `static const int`s until 2026-08-21, with these comments still describing them as live.)
+    // does nothing. Use SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS.
     //
     // kEngageMinSeq below remains the sequence-length floor, and is still load-bearing: the EMA
     // alone is not enough, because 512-ctx settles at tau 2.19 (below the threshold) but a

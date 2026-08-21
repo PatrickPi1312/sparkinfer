@@ -239,8 +239,6 @@ Q38_GUARD_MODEL_DIR = os.environ.get("Q38_GUARD_MODEL_DIR", "/root/workspace/mod
 # The guard sweeps the same three contexts the scored bench does, so a shared-path regression shows
 # up wherever it lives: ctx 0 covers the short-context floors, 4k/16k cover the scoring dimensions
 # and are where the shared prefill and KV paths cost the most.
-# Said "decode@128 is this bot's scoring dimension" until 2026-08-21 -- true when this file was
-# forked, stale since the 2026-08-17 scope change moved scoring to decode@16k + prefill@16k.
 Q38_GUARD_CTXS = [0, 4096, 16384]
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
