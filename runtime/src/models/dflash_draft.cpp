@@ -612,6 +612,12 @@ const float* DFlashDraftModel::last_logits() const { return p_->logits; }
 // themselves, they inherit transformers' Qwen3 classes, so that IS the authority here.
 //   inv_freq[i] = interp*(1-ramp_i) + extrap*ramp_i, ramp over the NTK-by-parts correction range
 //   att_scale   = 0.1*ln(factor) + 1
+// att_scale applies to BOTH q and k, not q alone. HF folds it into the cos/sin tables
+// (cos = emb.cos() * attention_scaling) and then uses those same tables for q_embed and k_embed,
+// so both are scaled. Reading it as an attention-logit scale and applying it only to q is the
+// natural misreading and is wrong -- it changes the logits by att_scale rather than att_scale^2
+// and silently degrades acceptance. Both launch_rms_heads_rope calls below pass it for exactly
+// this reason.
 static void compute_yarn_inv_freq(const DFlashDraftConfig& cfg, std::vector<float>& inv_freq,
                                   float& att_scale) {
     const int d = cfg.head_dim, half = d / 2;
