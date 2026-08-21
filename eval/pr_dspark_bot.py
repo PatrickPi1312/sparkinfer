@@ -293,9 +293,16 @@ HARNESS_PATHS = (
 )
 BENCH_TOKENS = int(os.environ.get("MODELOPT_BENCH_TOKENS", "128"))
 ACC_TOPK = int(os.environ.get("MODELOPT_ACC_TOPK", "128"))
-# Batched-prefill parity floor: the fraction of the continuation that batched prefill must still
-# generate identically to the token loop. Absolute, not PR-vs-main -- see the PREFILL_PARITY block
-# in the remote script for why a differential gate cannot catch this class of bug.
+# INACTIVE IN THIS BOT. Inherited from pr_modelopt_bot.py, where it IS a live floor: the fraction
+# of the continuation that batched prefill must still generate identically to the token loop,
+# absolute rather than PR-vs-main (that bot's remote script has the PREFILL_PARITY block; this one
+# does not). Here the whole gate is deliberately off -- see the module docstring -- because main
+# fails it at n=128 and enabling it would REJECT every PR.
+#
+# The scaffolding around it is dead in step with that: parity_bar is interpolated into the remote
+# script but nothing there reads $PARITY_BAR, and the PREFILL_PARITY_OK / PARITY worst= parse
+# branches below never fire because nothing emits those lines. Left in place so re-enabling is one
+# block, not a rewrite -- but do not read any of it as a gate that runs.
 PARITY_BAR = float(os.environ.get("MODELOPT_PARITY_BAR", "0.75"))
 # Score dumps for the differential accuracy gate. main's is written once per round by
 # measure_main_baseline(); each PR compares its own dump against it. Kept on the box (not shipped
@@ -1248,6 +1255,14 @@ def collect_polaris_attestation(host, port, res: dict, pr_ref: str):
         "pct_over_frontier": res.get("delta_pct"),
         "score_context": 128,
         "best_context_label": "128",
+        # MISLABELED, and deliberately left alone pending a decision -- do not copy this shape.
+        # pr_decode_tps is dspark_tps measured at DSPARK_CTX (4096), not at 128. The Polaris
+        # receipt schema has a ctx_4096_tps slot (see eval/polaris/receipt.py) which is where this
+        # belongs and which currently goes unfilled, so every receipt this bot signs attests a 4k
+        # number under the 128 key -- and SPARKINFER_EVAL_MODE below says qwen38-128 to match.
+        # Inherited verbatim from pr_modelopt_bot.py, where ctx_128_tps IS decode@128 and the label
+        # is correct. Moving it changes what gets cryptographically attested and breaks continuity
+        # of the receipt series, so it needs an explicit call rather than a drive-by rename.
         "ctx_128_tps": res.get("pr_decode_tps"),
         "top1": res.get("pr_top1"),
         "kl": res.get("pr_kl"),
