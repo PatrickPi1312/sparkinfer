@@ -1608,12 +1608,27 @@ def format_comment(commit: str, res: dict) -> str:
             f"<details><summary>log tail</summary>\n\n```\n{(res.get('log') or '')[:1800]}\n```\n</details>\n"
         )
     lab = res["label"]
+    # dict.get's default only fires for a MISSING key, not one present with a None value -- and
+    # fail-fast leaves exactly that. A PR rejected at the dspark stage (losslessness, AR floor,
+    # tau floor) never reaches the accuracy stage, so pr_top1/pr_kl are set to None rather than
+    # dropped, and `_num('pr_top1'):.3f` raised
+    #     TypeError: unsupported format string passed to NoneType.__format__
+    # which took down the whole round AFTER the GPU work was done: #897 was correctly rejected on
+    # losslessness and then lost its label and its comment to this traceback. Coerce explicitly.
+    def _num(key, default=0.0):
+        v = res.get(key)
+        return default if v is None else v
     if res.get("accuracy_ok"):
-        acc_row = (f"| accuracy gate | ✅ top1={res.get('pr_top1', 0):.3f} "
-                    f"(bar >={ACC_TOP1_BAR}) · KL={res.get('pr_kl', 0):.4f} (bar <={ACC_KL_BAR}) |\n")
+        acc_row = (f"| accuracy gate | ✅ top1={_num('pr_top1'):.3f} "
+                    f"(bar >={ACC_TOP1_BAR}) · KL={_num('pr_kl'):.4f} (bar <={ACC_KL_BAR}) |\n")
+    elif res.get("early_reject"):
+        # Not a failure of this gate -- it never ran. Saying "FAILED top1=0.000" here would be a
+        # false statement about a PR that was stopped earlier, for a different reason.
+        acc_row = ("| accuracy gate | ⏭️ not reached — rejected earlier at the "
+                   f"`{res.get('early_reject_stage', 'dspark')}` stage |\n")
     else:
-        acc_row = (f"| accuracy gate | ❌ **FAILED** — top1={res.get('pr_top1', 0):.3f} "
-                    f"(bar >={ACC_TOP1_BAR}) · KL={res.get('pr_kl', 0):.4f} (bar <={ACC_KL_BAR}) — "
+        acc_row = (f"| accuracy gate | ❌ **FAILED** — top1={_num('pr_top1'):.3f} "
+                    f"(bar >={ACC_TOP1_BAR}) · KL={_num('pr_kl'):.4f} (bar <={ACC_KL_BAR}) — "
                     "**verdict forced to REJECT regardless of speed** |\n")
     # No "main accuracy" row: this gate is differential, so main IS the reference -- there is no
     # separate absolute bar for it to miss.
@@ -1625,11 +1640,11 @@ def format_comment(commit: str, res: dict) -> str:
         ls_row = ("| losslessness gate | ❌ **FAILED** — DSpark diverged from the AR reference — "
                   "**verdict forced to REJECT regardless of speed** |\n")
     if res.get("tau_ok"):
-        tau_row = (f"| mean accept τ floor | ✅ {res.get('pr_mean_accept', 0):.4f} vs main "
-                   f"{res.get('main_mean_accept', 0):.4f} (bar ≥{100 * DSPARK_TAU_TOL:.0f}%) |\n")
+        tau_row = (f"| mean accept τ floor | ✅ {_num('pr_mean_accept'):.4f} vs main "
+                   f"{_num('main_mean_accept'):.4f} (bar ≥{100 * DSPARK_TAU_TOL:.0f}%) |\n")
     else:
-        tau_row = (f"| mean accept τ floor | ❌ **FAILED** — {res.get('pr_mean_accept', 0):.4f} vs main "
-                   f"{res.get('main_mean_accept', 0):.4f} — throughput gained by speculating less is "
+        tau_row = (f"| mean accept τ floor | ❌ **FAILED** — {_num('pr_mean_accept'):.4f} vs main "
+                   f"{_num('main_mean_accept'):.4f} — throughput gained by speculating less is "
                    "the feature being removed, not a speedup — **verdict forced to REJECT** |\n")
     def _guard_row(name, ok_key, prob_key, ctxs_key):
         if res.get(ok_key):
@@ -1657,14 +1672,14 @@ def format_comment(commit: str, res: dict) -> str:
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-dspark:{lab}` |\n"
         f"| scored at | **DSpark speculative decode @ ctx=4k** on the ModelOpt NVFP4 checkpoint |\n"
-        f"| **PR DSpark tok/s** | **{res.get('pr_dspark_tps', 0):.2f}** |\n"
-        f"| **main DSpark tok/s** | **{res.get('main_dspark_tps', 0):.2f}** |\n"
+        f"| **PR DSpark tok/s** | **{_num('pr_dspark_tps'):.2f}** |\n"
+        f"| **main DSpark tok/s** | **{_num('main_dspark_tps'):.2f}** |\n"
         f"| **speedup vs main** | **{res.get('speedup_vs_main', 0):.3f}×** ({res.get('decode_delta_pct', 0):+.1f}%) |\n"
-        f"| PR AR tok/s (floor) | {res.get('pr_ar_tps', 0):.2f} |\n"
-        f"| main AR tok/s (floor) | {res.get('main_ar_tps', 0):.2f} |\n"
+        f"| PR AR tok/s (floor) | {_num('pr_ar_tps'):.2f} |\n"
+        f"| main AR tok/s (floor) | {_num('main_ar_tps'):.2f} |\n"
         f"| AR vs main (floor) | {res.get('ar_delta_pct', 0):+.1f}% |\n"
         f"| **DSpark vs AR** | **{res.get('dspark_vs_ar', 0):.3f}×** — above 1.0 means speculation finally pays |\n"
-        f"| mean accept τ | {res.get('pr_mean_accept', 0):.3f} (main {res.get('main_mean_accept', 0):.3f}, ceiling 7) |\n"
+        f"| mean accept τ | {_num('pr_mean_accept'):.3f} (main {_num('main_mean_accept'):.3f}, ceiling 7) |\n"
         f"{acc_row}"
         f"{main_acc_note}"
         f"{ls_row}"
