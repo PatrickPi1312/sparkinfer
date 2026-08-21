@@ -3,15 +3,21 @@
 #
 #   0 * * * * /home/autotiny/Desktop/sparkinfer/eval/run_dspark_cron.sh >> /tmp/sparkinfer_dspark_bot.log 2>&1
 #
-#   Hourly, taking over the :00 slot run_modelopt_cron.sh held. DSpark decode@128 replaces
-#   ModelOpt long-context as the scored dimension (2026-08-18, explicit user decision), so the two
-#   are NOT meant to run together — both drive the one pinned GPU, and both want the same lock.
+#   Hourly, taking over the :00 slot run_modelopt_cron.sh held. DSpark decode replaces ModelOpt
+#   long-context as the scored dimension (2026-08-18, explicit user decision), so the two are NOT
+#   meant to run together — both drive the one pinned GPU, and both want the same lock.
+#
+#   The scored dimension is dspark-decode@4k (SCORING_DIMS in the bot). It was decode@128 for this
+#   bot's first day only; at ctx=128 speculation barely engages, so 4k is where the dimension
+#   actually measures what it is named after.
 #
 #   A round is cheaper than the ModelOpt bot's was, because it benches ONE context and skips the
-#   Qwen3.6/Qwen3.8 sweep guards and the prefill parity check (see the bot's module docstring for
-#   why none of those can move this dimension). Measured on the pinned RTX 5090 (2026-08-18), per
-#   ref: ~25s model load + ~1.5s AR + ~2.5s DSpark + ~6s score dump, plus build. So roughly 1 min
-#   per ref, i.e. a round is ~2 min with one PR.
+#   batched-prefill parity check (see the bot's module docstring for why that one cannot move this
+#   dimension). The Qwen3.6 and Qwen3.8 no-regression guards ARE run — check_q36_guard /
+#   check_q38_guard — and a round bails if either produces no MAIN baseline. Timings below were
+#   measured at ctx=128 on the pinned RTX 5090 (2026-08-18), before the move to 4k and before the
+#   guards were added, so treat them as a floor rather than a current estimate: ~25s model load +
+#   ~1.5s AR + ~2.5s DSpark + ~6s score dump, plus build.
 #
 #   If a round ever DOES overrun the interval (a large PR backlog), the flock below makes the
 #   overlapping tick exit 0 after 120s rather than piling up — the effect is a skipped tick, not a
@@ -23,7 +29,7 @@
 #   • Shares /tmp/sparkinfer_bot.lock with every other bot and the sparkinfer-web dashboard-sync
 #     crons — CRITICAL: this MUST be the SAME lock file, since all of them drive the ONE pinned GPU
 #     on the SAME box and would otherwise race for it if a cron tick overlaps.
-#   • GPU up → full DSpark decode@128 eval + differential-accuracy gate + losslessness gate;
+#   • GPU up → full DSpark decode@4k eval + differential-accuracy gate + losslessness gate;
 #     GPU down → --labels-only (no GPU, no ssh, pure label reconciliation).
 #   • Auto-merge stays OFF unless SPARKINFER_DSPARK_AUTOMERGE=1 is explicitly set. Deliberately NOT
 #     forced to 1 here and deliberately NOT inherited from SPARKINFER_MODELOPT_AUTOMERGE: this bot

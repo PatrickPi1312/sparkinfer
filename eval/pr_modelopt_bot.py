@@ -21,9 +21,12 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               that same model load. The rest of this docstring describes the machinery, which is
               unchanged.
 
-  1. Speed — decode @ ctx=128 on the NVFP4 checkpoint, PR vs a freshly-measured origin/main, same
-              box, same round, median of 5 reps. Same tier buckets as every other bot in this
-              directory (BUCKETS/SIG/REGRESS_TOL below — copied, not reinvented).
+  1. Speed — decode and prefill on the NVFP4 checkpoint at ctx 128/4k/16k, PR vs a freshly-
+              measured origin/main, same box, same round, median of 5 reps. Which of those earn a
+              tier and which are only floors is pt. 0's business, not this section's; everything
+              below describes how the numbers are produced, which is the same either way. Same
+              tier buckets as every other bot in this directory (BUCKETS/SIG/REGRESS_TOL below —
+              copied, not reinvented).
 
               The scored checkpoint is a compressed-tensors DIRECTORY, NOT a GGUF of the same
               model. qwen3_gguf_bench and qwen3_gguf_score grew directory support for exactly this
@@ -50,21 +53,19 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               prefill at ctx 128/4k/16k, against unsloth's 84.9/83.2/80.6 and 5031/9548/8727 --
               so quoting a Qwen3.8 number without naming its checkpoint is meaningless.
 
-              Prefill@128 is ALSO scored, from the same sweep and the same model load (no extra
-              GPU time -- prefill_pp was already computed alongside decode_tps and simply
-              discarded). Combination rule is pr_museglimmer_bot.py's, verbatim: either dimension
-              regressing is a hard REJECT, otherwise the better of the two tiers wins, so a pure
-              prefill win with flat decode still scores.
+              Prefill is measured at every context in the same sweep and the same model load (no
+              extra GPU time -- prefill_pp was already computed alongside decode_tps and simply
+              discarded). Combination rule is pr_museglimmer_bot.py's, verbatim: any dimension
+              regressing is a hard REJECT, otherwise the better of the SCORING_DIMS tiers wins, so
+              a pure prefill win with flat decode still scores.
 
-              Read the ABSOLUTE prefill number with care. Measured 2026-08-15 on the pinned box,
-              Qwen3.8-27B prefill@128 is ~86 pp -- roughly this model's DECODE speed (82.7 tok/s),
-              which is the signature of a token-at-a-time path rather than one batched GEMM pass.
-              llama.cpp ingests the same 128-token prompt at ~2651 t/s from a Q4_K_M GGUF of this
-              model. That gap is ~31x and is not explained by quantization. Scoring the dimension
-              does not fix it; it makes it visible and rewards whoever does.
-              What scoring it IS valid for regardless: it is a PR-vs-main comparison on the same
-              box and the same shape, so a PR that speeds up or regresses whatever path ctx=128
-              actually takes is measured correctly even while the absolute number is unflattering.
+              Historical note on the absolute prefill number, kept because it explains why this
+              dimension is watched so closely. Measured 2026-08-15, Qwen3.8-27B prefill@128 was
+              ~86 pp -- roughly this model's DECODE speed at the time (82.7 tok/s), the signature
+              of a token-at-a-time path rather than one batched GEMM pass, against llama.cpp's
+              ~2651 t/s on the same prompt from a Q4_K_M GGUF. Making that gap visible is what got
+              it fixed: the batched prefill path landed and prefill@128 is ~6.5k pp as of the
+              2026-08-17 figures above. Do not quote the ~86 pp number as current.
 
   2. Accuracy gate — DIFFERENTIAL, not absolute. llama.cpp cannot read a compressed-tensors
               directory, so the Muse Glimmer methodology (teacher-forced score vs a live
@@ -235,8 +236,11 @@ GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
 # Same shape as the inherited Qwen3.6 guard below, except the subject is a compressed-tensors
 # DIRECTORY rather than a GGUF, so there is no ensure_model/ensure_tokenizer download step.
 Q38_GUARD_MODEL_DIR = os.environ.get("Q38_GUARD_MODEL_DIR", "/root/workspace/models_qwen38")
-# decode@128 is this bot's scoring dimension, so ctx 0 carries the most weight; 4k/16k are included
-# because that is where the shared prefill and KV paths cost the most.
+# The guard sweeps the same three contexts the scored bench does, so a shared-path regression shows
+# up wherever it lives: ctx 0 covers the short-context floors, 4k/16k cover the scoring dimensions
+# and are where the shared prefill and KV paths cost the most.
+# Said "decode@128 is this bot's scoring dimension" until 2026-08-21 -- true when this file was
+# forked, stale since the 2026-08-17 scope change moved scoring to decode@16k + prefill@16k.
 Q38_GUARD_CTXS = [0, 4096, 16384]
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
@@ -711,7 +715,9 @@ test -x build/runtime/qwen3_gguf_bench
 test -x build/runtime/qwen3_gguf_score
 
 # --- decode @ ctx=128 on the NVFP4 checkpoint ---
-# The single scored dimension (module docstring pt. 1). Prefill is deliberately NOT scored here:
+# A no-regression FLOOR since the 2026-08-17 scope change, not a scored dimension (module
+# docstring pt. 0); SCORING_DIMS is decode@16k + prefill@16k. Prefill is deliberately NOT scored
+# at this context:
 # at ctx=128 this model's batched prefill path declines anyway (it needs int8 KV, which the bench
 # only turns on at ctx>=4096), so a prefill number at this context would measure the sequential
 # fallback and move for reasons unrelated to the prefill kernels a PR touches.
@@ -1197,14 +1203,15 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
           f"prefill@16k={pr['prefill16k_pp']:.2f} "
           f"top1={pr.get('top1', 0):.4f} kl={pr.get('kl', 99):.5f}")
 
-    # THREE scored dimensions on the NVFP4 checkpoint, all from the one model load (module
-    # docstring pt. 1). Same rule pr_museglimmer_bot.py uses for its two, generalised rather than
-    # grown into a longer if/elif chain -- with three dimensions the hand-written cascade needs
-    # 2^3 orderings to stay correct and silently mis-scores if one is missed:
+    # FOUR measured dimensions on the NVFP4 checkpoint, all from the one model load (module
+    # docstring pt. 0). Only the two in SCORING_DIMS can earn a tier; the other two are floors.
+    # Same rule pr_museglimmer_bot.py uses for its two, generalised rather than grown into a
+    # longer if/elif chain -- with four dimensions the hand-written cascade needs 2^4 orderings
+    # to stay correct and silently mis-scores if one is missed:
     #   * ANY dimension regressing is a hard REJECT, regardless of the others.
-    #   * Otherwise the BEST tier wins, so a PR that improves one axis with the others merely flat
-    #     still scores for the real work it did (a long-context prefill PR is not expected to move
-    #     decode@128, and vice versa).
+    #   * Otherwise the BEST tier among SCORING_DIMS wins, so a PR that improves one axis with
+    #     the others merely flat still scores for the real work it did (a long-context prefill PR
+    #     is not expected to move decode@16k, and vice versa).
     dims = [
         ("decode@16k",  pr["decode16k_tps"],   main["decode16k_tps"]),
         ("decode@128",  pr["decode128_tps"],   main["decode128_tps"]),
@@ -1217,10 +1224,11 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         scored.append({"dim": name, "label": lab, "delta": dlt, "passed": ok, "reason": why})
     by_dim = {s["dim"]: s for s in scored}
 
-    # ANY dimension regressing is still a hard REJECT. prefill@16k is NOT a scoring dimension --
-    # it cannot earn a tier -- but it remains a no-regression FLOOR, because without it a PR could
-    # trade long-context prefill away to buy 128-context throughput and still auto-merge at XL.
-    # It costs nothing to keep: all three come from the one sweep.
+    # ANY dimension regressing is still a hard REJECT, including the two that cannot earn a tier.
+    # decode@128 and prefill@128 are NOT scoring dimensions -- since the 2026-08-17 scope change
+    # they are no-regression FLOORS only -- but they stay measured, because without them a PR
+    # could trade short-context throughput away to buy long-context and still auto-merge at XL.
+    # It costs nothing to keep: all four come from the one sweep.
     regressed = [s for s in scored if s["label"] == "REJECT"]
     if regressed:
         worst = min(regressed, key=lambda s: s["delta"])
@@ -1855,16 +1863,17 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             elif res.get("prefill_regressed"):
                 fail_clause = "(prefill@128 regression)"
             elif label == "none":
-                fail_clause = "with no verified prefill@16k improvement (the only scored dimension)"
+                fail_clause = "with no verified decode@16k or prefill@16k improvement (the scored dimensions)"
             else:
                 fail_clause = "(regression)"
             close_body = (
                 "<!-- sparkinfer-qwen38-auto-close -->\n"
                 f"## Closed: sparkinfer modelopt auto-eval — `eval-modelopt:{label}`\n\n"
-                f"This PR's Qwen3.8-27B prefill@16k speed measured **{res.get('delta_pct')}%** "
+                f"This PR's Qwen3.8-27B `{res.get('scored_dimension', 'long-context')}` speed "
+                f"measured **{res.get('delta_pct')}%** "
                 f"vs main, {fail_clause} "
                 "— closing automatically. This bot evaluates every eligible PR in the repo "
-                "against Qwen3.8-27B's decode AND prefill@128 speed specifically, regardless of "
+                "against Qwen3.8-27B's long-context decode AND prefill speed specifically, regardless of "
                 "what the PR is actually about — a close here isn't a judgment on the PR's purpose, "
                 "just that it didn't move these particular metrics. Reopen (or open a fresh PR) if "
                 "you have a fix or a different approach."
