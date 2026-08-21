@@ -176,22 +176,27 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 `gh` authenticated and `VAST_INSTANCE` / `VAST_DEFAULT_INSTANCE` in `.env.eval`
 (`VAST_NO_AUTO_PROVISION=1`).
 
-## Qwen3.8-27B PR auto-evaluation bot (the scored path)
+## Qwen3.8-27B PR auto-evaluation bots
 
-> **Intended scope: scoring is Qwen3.8-27B-only.** `pr_qwen38_bot.py` (`eval/run_qwen38_cron.sh`,
-> `*/30`) is meant to be the only bot on cron, with the Muse Glimmer (`pr_museglimmer_bot.py`) and
-> DFlash (`pr_dflash_bot.py`) bots kept for reference and run by hand only. Only one bot may hold
-> the shared `/tmp/sparkinfer_bot.lock` at a time, and they all drive the same single pinned GPU.
+> **The scored path is `pr_dspark_bot.py`** (`eval/run_dspark_cron.sh`, hourly at `:00`), and as
+> of 2026-08-21 it is the ONLY bot on cron. It scores one dimension, `dspark-decode@4k`, on the
+> ModelOpt checkpoint (`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`), behind lossless + AR
+> floors and the Qwen3.6 / Qwen3.8 no-regression guards. See that file's module docstring — it is
+> the authority, not this README.
 >
-> **This is not automatic.** The crontab is host state, not repo state, so merging this does not
-> switch anything over. Until someone edits the eval host's crontab — drop
-> `0 * * * * eval/run_museglimmer_cron.sh`, add `*/30 * * * * eval/run_qwen38_cron.sh` — the Muse
-> Glimmer bot is still the one scoring PRs, and `pr_qwen38_bot.py` never runs. Check with
-> `crontab -l` on the eval host (the machine running the bot, **not** the GPU box it SSHes into).
-> A round costs ~80s per ref measured end-to-end (~3 min with one pending PR), so `*/30` is not a
-> bottleneck — see `run_qwen38_cron.sh`'s header for the stage-by-stage timings.
+> Every other bot here — `pr_qwen38_bot.py`, `pr_modelopt_bot.py`, `pr_museglimmer_bot.py`,
+> `pr_dflash_bot.py` — is kept for reference and run by hand only. The sections below describe
+> them as they were when they held the scored slot; each bot's own docstring is current, this
+> README is not.
+>
+> Only one bot may hold the shared `/tmp/sparkinfer_bot.lock` at a time, and they all drive the
+> same single pinned GPU, so two on cron would contend. The crontab is host state, not repo
+> state — check with `crontab -l` on the eval host (the machine running the bot, **not** the GPU
+> box it SSHes into) rather than trusting any schedule written down here.
 
-`pr_qwen38_bot.py` scores **same-box PR vs `origin/main`** on three axes, applies
+### `pr_qwen38_bot.py` (superseded, hand-run only)
+
+Scores **same-box PR vs `origin/main`** on three axes, applies
 `eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, mirrors it to `eval:*` (SN74 scoring reads `eval:*`),
 picks `qwen38-merge-first`, and can auto-merge (`SPARKINFER_QWEN38_AUTOMERGE=1`, off by default).
 
