@@ -1,10 +1,15 @@
-// Qwen MoE single-sequence greedy decoder.
+// Qwen single-sequence greedy decoder. Serves every Qwen-family checkpoint here (Qwen3.5-9B,
+// Qwen3.6-35B-A3B, Qwen3.8-27B) plus Muse Glimmer; layer counts and FFN shape come from
+// QwenConfig, so the shapes below are the pattern, not fixed numbers.
 //
-// Per token: embed -> [40x Qwen layer] -> final RMSNorm -> LM head -> argmax.
+// Per token: embed -> [c.n_layers x Qwen layer] -> final RMSNorm -> LM head -> argmax.
 // Qwen full-attention layer: RMSNorm -> Q/K/V -> per-head QK-norm -> RoPE ->
 //             KV append -> GQA flash decode -> O-proj -> residual -> RMSNorm ->
-//             routed top-8 MoE (+ shared expert) -> residual.
-// Qwen3.5/Qwen3.6 hybrid layers replace full attention with a single-token
+//             FFN -> residual.
+// The FFN is either routed top-k MoE (+ shared expert), or -- when c.dense_ffn is set, as it is
+// for Qwen3.8-27B and Qwen3.5-9B -- a single SwiGLU, still dispatched through the MoE kernels
+// with one expert.
+// Qwen3.5/Qwen3.6/Qwen3.8 hybrid layers replace full attention with a single-token
 // Gated DeltaNet recurrent update on the 3-of-4 linear-attention layers.
 // All steps run on one stream; only the sampled id is copied to the host, which
 // autoregressive greedy decoding fundamentally requires.
@@ -3192,35 +3197,30 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // 4k stream sitting at a perfectly profitable tau of 3.9 armed the batched path roughly 40% of
     // steps and banked +21% of the available +61%. Gating on a running mean of keep engages on the
     // condition that actually makes batching profitable, and still leaves 512 on the token loop.
-    // The sequence length below which this PR is byte-identical to main. #720 shipped this as a
-    // hard bound that kept the batched verify away from long context entirely (the #712 gap); it
-    // is now the boundary between "main's behaviour, unchanged" and "the new exact long-context
-    // path", so nothing already validated at short context moves.
-    // Compared against keep_ema8 in the SCALED domain (kEngageKeep * 8), not by shifting the EMA
-    // down first. Shifting floors it, which collapses the very gap the gate exists to resolve:
-    // 512-ctx sits at tau 2.19 (ema8 ~17.5) and 4k at tau 3.91 (ema8 ~31.3), and both floor to the
-    // same value. Scaled, the threshold lands cleanly between them at 24.
-    // Sequence-length floor for the batched path. The EMA alone is not enough: 512-ctx settles at
-    // tau 2.19 (ema8 ~17.5, below the threshold) but a transient run of full blocks early in the
-    // stream pushes it over, and alpha 1/8 then takes ~8 steps to decay -- measured at 2.8-4.3%
-    // lost to running the batched path where it is 31% SLOWER. A floor cannot be spoofed by a
-    // transient, and it costs 4k nothing because 4k clears it from the first step.
-    static const int kEngageKeep = []{
-        const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP");
-        int v = e ? atoi(e) : 3;
-        return v < 1 ? 1 : v;
-    }();
-    // The acceptance that makes batching pay is not a constant -- it falls as context grows. One
-    // batched pass replaces `keep` sequential target forwards, and each of those forwards re-reads
-    // the whole KV cache, so the token loop gets steadily more expensive with sequence length while
-    // the N-row pass barely moves. A threshold calibrated where the token loop is cheap therefore
-    // sits too high once the KV is long, and the batched path idles on steps where it was already
-    // the better choice. Measured at 4k (tau 3.91): 3 -> 529.2 tok/s, 2 -> 542.1.
-    static const int kEngageKeepLong = []{
-        const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP_LONG");
-        int v = e ? atoi(e) : 2;
-        return v < 1 ? 1 : v;
-    }();
+    // Superseded thresholds, kept only as the calibration history behind kEngageKeepEighths
+    // below. #720 first shipped a hard sequence-length bound that kept the batched verify away
+    // from long context entirely (the #712 gap). That became a whole-token EMA threshold
+    // (SPARKINFER_DFLASH_ENGAGE_KEEP, default 3), compared against keep_ema8 in the SCALED domain
+    // rather than by shifting the EMA down first -- shifting floors it, and 512-ctx (tau 2.19,
+    // ema8 ~17.5) and 4k (tau 3.91, ema8 ~31.3) floor to the same value, collapsing the very gap
+    // the gate exists to resolve. A long-context variant (SPARKINFER_DFLASH_ENGAGE_KEEP_LONG,
+    // default 2) followed, on the observation that the profitable acceptance FALLS as context
+    // grows: one batched pass replaces `keep` sequential forwards and each of those re-reads the
+    // whole KV, so the token loop gets steadily more expensive with sequence length while the
+    // N-row pass barely moves. Measured at 4k (tau 3.91): 3 -> 529.2 tok/s, 2 -> 542.1.
+    //
+    // #890 replaced both with a single eighths-domain threshold, so BOTH env vars are gone --
+    // SPARKINFER_DFLASH_ENGAGE_KEEP and _KEEP_LONG are no longer read anywhere and setting them
+    // does nothing. Use SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS. (They survived as unread
+    // `static const int`s until 2026-08-21, with these comments still describing them as live.)
+    //
+    // kEngageMinSeq below remains the sequence-length floor, and is still load-bearing: the EMA
+    // alone is not enough, because 512-ctx settles at tau 2.19 (below the threshold) but a
+    // transient run of full blocks early in the stream pushes it over, and alpha 1/8 then takes
+    // ~8 steps to decay -- measured at 2.8-4.3% lost to running the batched path where it is 31%
+    // SLOWER. A floor cannot be spoofed by a transient, and it costs 4k nothing because 4k clears
+    // it from the first step.
+
     // The engage threshold in EIGHTHS, which is the domain keep_ema8 already lives in, so it can
     // express the number the trade actually turns on instead of rounding it to a whole token.
     //
@@ -3234,9 +3234,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // 10/8 = 1.25, just above the measured 1.23, so the gate keeps a margin against the ratio
     // rather than sitting on it. It is self-limiting at short context, which is why this is not
     // simply "always batch": at ctx=512 acceptance is 1.0, keep_ema8 settles at 8, and 8 < 10
-    // leaves the stream on the token loop exactly as today -- which matters, because the batched
-    // pass is measured 31% SLOWER there. SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS=16 restores main's
-    // whole-token threshold, so both arms of an A/B come out of one binary.
+    // leaves the stream on the token loop exactly as before -- which matters, because the batched
+    // pass is measured 31% SLOWER there. Setting SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS=16
+    // reproduces the pre-#890 whole-token threshold (keep >= 2), so both arms of that A/B still
+    // come out of one binary.
     static const int kEngageKeepEighths = []{
         const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS");
         int v = e ? atoi(e) : 10;
@@ -3320,14 +3321,16 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // order the paths are bit-identical at every context, so the bound has nothing left to do
         // and the gate is now purely the acceptance test above -- engage where batching pays,
         // stay on the token loop where it does not, at any sequence length.
-        // Below kCompactMaxSeq this is byte-identical to main: same acceptance-run rule, same
-        // batched MoE. The change is purely additive above that bound, which main never reached.
+        // Below kCompactMaxSeq the acceptance-run rule and the batched MoE are unchanged from the
+        // pre-#720 path; everything the long-context work added applies only above that bound.
         const bool short_ctx = (start + B) <= kCompactMaxSeq;
         // keep_ema8 ramps from zero at alpha = 1/8, so it needs 8-10 steps to reach the engage
         // threshold even on a stream that clears it comfortably. Measured at 4k (tau 3.91, ema8
-        // settles at ~31 against a threshold of 24): the batched path ran on 20 of 33 steps, and
-        // the 13 it missed were the warmup, not a genuine low-acceptance stretch -- worth 6.3% of
-        // decode on a 128-token generation.
+        // settles at ~31) back when the threshold was 24 -- i.e. kEngageKeep 3 in the scaled
+        // domain, before #890 moved it to kEngageKeepEighths = 10: the batched path ran on 20 of
+        // 33 steps, and the 13 it missed were the warmup, not a genuine low-acceptance stretch --
+        // worth 6.3% of decode on a 128-token generation. The seeding below is what fixed it, and
+        // the lower threshold only widens the band it applies to.
         //
         // The ramp exists so a transient run of full blocks cannot arm the batched path at 512-ctx
         // (tau 2.19), where it is 31% slower. kEngageMinSeq already excludes that case outright, so

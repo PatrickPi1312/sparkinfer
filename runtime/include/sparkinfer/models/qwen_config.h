@@ -47,8 +47,10 @@ struct Qwen35Config {
     // architecture family, confirmed empirically against a real reference implementation.
     bool  gdn_qh_block = false;
 
-    // Qwythos / Qwen3.5-9B dense hybrid GGUFs use a single SwiGLU FFN per layer
-    // (ffn_gate/up/down) instead of routed experts.
+    // Dense hybrids use a single SwiGLU FFN per layer (ffn_gate/up/down) instead of routed
+    // experts: Qwythos / Qwen3.5-9B, and Qwen3.8-27B (the scored checkpoint). Note that the
+    // decode FFN still dispatches through the MoE kernels with n_experts==1/top_k==1, which is
+    // why several of those kernels carry a dense special-case -- see qwen35.cpp's FFN branch.
     bool  dense_ffn   = false;
 
     // Muse Glimmer: dense GQA transformer, no MoE/linear-attention layers. Per-layer

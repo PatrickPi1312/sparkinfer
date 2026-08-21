@@ -215,7 +215,13 @@ def suggest(trial) -> dict:
         "SPARKINFER_DFLASH_COMPACT_VERIFY": trial.suggest_categorical("compact_verify", [0, 1, 2]),
         "SPARKINFER_DFLASH_BLOCK_SCORE": trial.suggest_int("block_score", 1, 8),
         "SPARKINFER_DFLASH_COMPACT_MAX_SEQ": trial.suggest_int("compact_max_seq", 0, 2048, step=64),
-        "SPARKINFER_DFLASH_ENGAGE_KEEP": trial.suggest_int("engage_keep", 1, 8),
+        # The engage threshold in EIGHTHS. Was SPARKINFER_DFLASH_ENGAGE_KEEP (whole tokens, 1..8)
+        # until #890 replaced that knob; the old var is no longer read by the runtime at all, so
+        # every trial that "tuned" it after #890 was searching a dimension with no effect. Range
+        # 8..64 is the same 1..8 tokens expressed in eighths, plus the sub-token band (8..16) that
+        # is the whole point of the finer domain -- the shipped default is 10, i.e. 1.25 tokens,
+        # which the old whole-token knob could not express.
+        "SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS": trial.suggest_int("engage_keep_eighths", 8, 64),
         "SPARKINFER_DFLASH_SHARED_STREAM": trial.suggest_categorical("shared_stream", [0, 1]),
         "SPARKINFER_DFLASH_CTX_GEMM": trial.suggest_categorical("ctx_gemm", [0, 1]),
         "SPARKINFER_DFLASH_CTX_TRIM": trial.suggest_categorical("ctx_trim", [0, 1]),
