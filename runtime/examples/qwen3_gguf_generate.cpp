@@ -4,7 +4,7 @@
 // resident footprint is the Q4_K_M size, not the bf16 expansion.
 //
 // Usage: qwen3_gguf_generate <model.gguf|checkpoint_dir> <max_new> <id0> <id1> ...
-// (tokenize/detokenize with tools/run_qwen3.py)
+// (tokenize/detokenize with runtime/tools/run_qwen3.py)
 //
 // Accepts the same three checkpoint shapes as qwen3_gguf_bench/qwen3_gguf_score, via the shared
 // qwen_checkpoint.h dispatch. This one was missed when the other two grew directory support, which

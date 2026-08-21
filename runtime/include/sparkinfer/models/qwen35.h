@@ -177,7 +177,7 @@ public:
 
     void set_weights(const Qwen35Weights& w);
 
-    // Load weights from a sparkinfer weight directory (see tools/convert_qwen35.py).
+    // Load weights from a sparkinfer weight directory (see runtime/tools/convert_qwen35.py).
     // Returns false on failure. Allocates device buffers it owns.
     bool load_weights(const std::string& dir);
 

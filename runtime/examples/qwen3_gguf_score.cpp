@@ -63,8 +63,9 @@ int main(int argc, char** argv) {
     kvc.num_layers = cfg.n_layers; kvc.num_kv_heads = cfg.n_kv_heads; kvc.head_dim = cfg.head_dim; kvc.block_size = 16;
     // int8 KV default mirrors the SHIPPED config, so scoring reflects what actually runs:
     //   non-hybrid (Qwen3-MoE, hd128) always ships int8 KV -> default int8.
-    //   hybrid (Qwen3.6/Qwythos, hd256) ships int8 KV at ctx >= 4096 (bench.cpp:130,
-    //     server/model_engine.cpp:80) -> context-adaptive on fed length.
+    //   hybrid (Qwen3.6/Qwythos, hd256) ships int8 KV at ctx >= 4096
+    //     (qwen3_gguf_bench.cpp's kvc.int8_kv, server/src/model_engine.cpp's kv_config)
+    //     -> context-adaptive on fed length.
     // SPARKINFER_KV_INT8 forces it either way, which is how accuracy.sh drives its two passes:
     // the short prompt (< 4096) scores the hybrid bf16 path, the long probe forces int8 on.
     //

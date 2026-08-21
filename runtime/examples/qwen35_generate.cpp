@@ -1,6 +1,6 @@
 // Qwen3.5 greedy generation demo.
 //
-// Loads converted weights (see tools/convert_qwen35.py) and greedily generates
+// Loads converted weights (see runtime/tools/convert_qwen35.py) and greedily generates
 // from a prompt given as token IDs. Tokenization is left to the HF tokenizer
 // (run it in Python to get IDs and to decode the output IDs); this binary is the
 // pure on-device model runner.
