@@ -702,7 +702,20 @@ test -f "$MODEL_DIR/config.json" || {{ echo "FAIL $MODEL_DIR has no config.json"
 # Always reconfigure (cheap, idempotent) -- skipping it on an existing CMakeCache left stale
 # generated Makefiles pointing at a DIFFERENT PR branch's files once the checkout switched
 # underneath it (the sibling bots hit exactly this, #693/#694).
+#
+# Reconfiguring is NOT enough to fix a poisoned compiler, though: CMake caches
+# CMAKE_CUDA_COMPILER in CMakeCache.txt and keeps it on every subsequent configure no matter what
+# PATH says. On 2026-08-21 this box had an apt CUDA 11.5 at /usr/bin/nvcc; one configure run
+# without the PATH above cached it, and every round after that died with "nvcc fatal: Unsupported
+# gpu architecture 'compute_89'" -- 11.5 predates sm_89 -- while the PATH export sat right there
+# looking correct. Blow the cache away when it points anywhere but the toolkit we intend.
 mkdir -p build
+if [ -f build/CMakeCache.txt ] && ! grep -q '^CMAKE_CUDA_COMPILER:FILEPATH=/usr/local/cuda' build/CMakeCache.txt; then
+  echo "WARN: build/CMakeCache.txt has a non-/usr/local/cuda CUDA compiler -- wiping build dir" >&2
+  grep '^CMAKE_CUDA_COMPILER:FILEPATH=' build/CMakeCache.txt >&2 || true
+  rm -rf build && mkdir -p build
+fi
+export CUDACXX="${{CUDACXX:-/usr/local/cuda/bin/nvcc}}"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/mopt_cmake.log 2>&1
 cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_generate -j"$(nproc)" >/tmp/mopt_build.log 2>&1 || {{
   echo "BUILD_FAILED -- tail of /tmp/mopt_build.log:" >&2
