@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""TPE auto-tuner for DSpark speculative decode @ ctx=128.
+"""TPE auto-tuner for DSpark speculative decode.
+
+Defaults to ctx=128 (DSPARK_CTX), which is NOT what the eval bot scores -- pr_dspark_bot.py scores
+dspark-decode@4k. A ctx=128 sweep was run to exhaustion and returned +0.7%, so a fresh run should
+almost certainly set DSPARK_CTX=4096 to search the dimension that actually earns a tier.
 
 Searches the DFlash/DSpark runtime knobs for the configuration that maximises DSpark decode
 throughput, subject to a hard losslessness constraint. Modelled on p-e-w/heretic, which co-optimises
@@ -10,9 +14,10 @@ WHY THIS EXISTS
     Every DSpark win merged so far was a human running a grid by hand. PR #867 was worth 1.36x and
     the whole change was a proposal depth of 3 instead of 5 -- and the 5 it replaced was itself
     carefully hand-tuned, with a comment citing accept lengths of 5.33 / 5.95 / 6.43. Those are
-    Qwen3.6 DFlash numbers. Qwen3.8's tau is 1.25. The constant was optimal for a different model
-    and stayed wrong by 1.36x until somebody re-ran the grid. There are 243 SPARKINFER_* knobs read
-    via getenv in the hot paths; this searches twelve of them.
+    Qwen3.6 DFlash numbers. Qwen3.8's tau was 1.25 when this was written and is ~1.66 now, so
+    re-read any constant here before trusting it -- that is the entire point. The constant was
+    optimal for a different model and stayed wrong by 1.36x until somebody re-ran the grid. There
+    are ~280 SPARKINFER_* knobs read via getenv in the hot paths; this searches twelve of them.
 
     Crucially they are read at RUNTIME, so a trial is a process launch, not a rebuild. That is what
     makes this cheap: ~30s per trial, almost all of it the model load.
@@ -307,7 +312,7 @@ def main():
     )
     study.enqueue_trial({  # start from the shipping default, so TPE has one known-good anchor
         "proposals": 3, "block_width": 0, "compact_verify": 2, "block_score": 1,
-        "compact_max_seq": 384, "engage_keep": 3, "shared_stream": 1, "ctx_gemm": 1,
+        "compact_max_seq": 384, "engage_keep_eighths": 10, "shared_stream": 1, "ctx_gemm": 1,
         "ctx_trim": 1, "head_i4": 1, "overlap": 0, "confidence_gate_on": False,
     }, skip_if_exists=True)
     study.optimize(objective, n_trials=args.trials)

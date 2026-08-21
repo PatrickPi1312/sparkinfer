@@ -238,10 +238,16 @@ DSPARK_CTX = int(os.environ.get("DSPARK_CTX", "4096"))
 #
 # Detection honesty: the defect class this targets (the draft/verify overlap race) needs FULL-BLOCK
 # accepts to fire, because it corrupts accept GROUPING and only the adaptive gate turns that into a
-# different verify path. At the current tau of ~1.0-1.1 full blocks essentially never happen, so
-# the hazard could not be reproduced at 4k even with OVERLAP=1 forced and 3 reps. This gate is
-# therefore a strict improvement that is UNVERIFIED against a live instance -- and it becomes load
-# bearing exactly when tau rises, which is the entire point of the work it guards.
+# different verify path. When this was written (2026-08-18) tau sat at ~1.0-1.1, full blocks
+# essentially never happened, and the hazard could not be reproduced at 4k even with OVERLAP=1
+# forced and 3 reps -- so the gate was a strict improvement that was UNVERIFIED against a live
+# instance.
+#
+# That caveat is now OUT OF DATE in the direction that matters: tau has since risen to ~1.66
+# (#893/#894 and the verify-cost work), so full blocks are no longer vanishingly rare and this
+# gate is closer to load-bearing than it was. It is still unverified against a live instance --
+# nobody has reproduced the race here since tau moved. Re-running that reproduction at the current
+# tau is worth someone's time, and if it fires, 3 reps is the number to revisit first.
 DSPARK_SPEC_REPS = int(os.environ.get("DSPARK_SPEC_REPS", "3"))
 
 # Mean accept length (tau) no-regression floor. THE most important gate this bot has, because
