@@ -11,8 +11,12 @@
 // with one expert.
 // Qwen3.5/Qwen3.6/Qwen3.8 hybrid layers replace full attention with a single-token
 // Gated DeltaNet recurrent update on the 3-of-4 linear-attention layers.
-// All steps run on one stream; only the sampled id is copied to the host, which
-// autoregressive greedy decoding fundamentally requires.
+// Only the sampled id is copied to the host, which autoregressive greedy decoding fundamentally
+// requires. Decode is NOT single-stream: besides the main `stream` there are side streams for
+// concurrent K/V-side projections (stream_k/stream_v, forked around the GDN alpha/beta pair) and
+// an L2-prefetch stream (stream_pf). All of them fork from and rejoin the main stream via events,
+// so the ordering the math depends on is still a single chain -- but anything added here has to
+// respect those forks, and anything captured into the decode graph has to capture them too.
 
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/models/dflash_draft.h"
@@ -614,7 +618,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->logit_bias_default);
     cudaFree(p_->d_logit_bias_ids); cudaFree(p_->d_logit_bias_vals);
     cudaFreeHost(p_->h_logit_bias_ids); cudaFreeHost(p_->h_logit_bias_vals);
-    // main's packed decode scalars (d_tok/d_pos/d_seqlen/d_writepos alias into d_scalars — not freed separately)
+    // Packed decode scalars (d_tok/d_pos/d_seqlen/d_writepos alias into d_scalars — not freed separately)
     cudaFree(p_->d_scalars); cudaFree(p_->d_out_id);
     cudaFreeHost(p_->h_scalars); cudaFreeHost(p_->h_out_id);
     cudaFree(p_->d_sample_temp); cudaFree(p_->d_sample_seed); cudaFree(p_->d_sample_step);
@@ -1563,7 +1567,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             }
             dbg_bf16(s.attn, s.qdim, 31, L);   // tag 31: SDPA output, post sigmoid-gate
 
-            // ---- O projection (main's int8 mmvq path) ----
+            // ---- O projection (int8 mmvq path) ----
             if (pf_win & 1) pf_join();   // window 1 lands here: w.wo is read next
             if (s.gguf && s.use_pq && w.wo_type == 12) {
                 if (s.use_llama) {
