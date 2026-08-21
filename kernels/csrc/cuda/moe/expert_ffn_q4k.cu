@@ -13,7 +13,8 @@
 // Q4_K/Q6_K decoders are the byte-exact ones validated in dequant_gguf.cu.
 // Requires hidden and ffn to be multiples of 256 (Qwen3-30B-A3B: 2048, 768).
 //
-// Portable CUDA — sm_89 .. sm_120/sm_121.
+// Portable CUDA — sm_89/90/100/120, the set CMAKE_CUDA_ARCHITECTURES actually builds.
+// sm_121 is excluded (needs CUDA 12.9+); see CMakeLists.txt.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

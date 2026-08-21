@@ -4,7 +4,9 @@
 // tensors are dequantized once at load; expert stacks are kept quantized in VRAM
 // and dequantized per-layer into a reused scratch buffer.
 //
-// Portable CUDA — runs on sm_89 .. sm_120/sm_121 (RTX 5090 / PRO 6000 / Spark).
+// Portable CUDA — runs on the architectures this tree builds: sm_89/90/100/120 (Ada, Hopper,
+// datacenter Blackwell, consumer Blackwell: RTX 5090 / PRO 6000). sm_121 (RTX Spark, Jetson
+// Thor) is NOT built — it needs CUDA 12.9+, see the exclusion note in CMakeLists.txt.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

@@ -5,7 +5,10 @@
 // wasted ~16x of its threads on the empty batch dimension at decode time.
 //
 // Output is bf16 (projections) or fp32 (router / LM-head logits) via the OutT
-// template. Portable CUDA — sm_89 .. sm_120/sm_121.
+// template. Portable CUDA across the architectures this tree actually builds:
+// CMAKE_CUDA_ARCHITECTURES is "89;90;100;120" (Ada, Hopper, datacenter Blackwell,
+// consumer Blackwell). sm_121 is NOT built -- see kernels/CMakeLists.txt, which
+// excludes it as unsupported by the CUDA toolkit in use.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
