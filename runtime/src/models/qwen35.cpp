@@ -267,7 +267,8 @@ struct Qwen35Model::Impl {
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
     // GGUF fused-expert decode scratch (allocated by load_gguf)
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
-    // Decode-side NVFP4 FFN scratch (SPARKINFER_QWEN38_DECODE_NVFP4=1): gate and up outputs, and
+    // Decode-side NVFP4 FFN scratch (the default path; SPARKINFER_QWEN38_DECODE_NVFP4=0 opts out):
+    // gate and up outputs, and
     // the SwiGLU result that feeds down. bf16 [moe_ffn] each -- ~104 KB total at ffn=17408, so it
     // is allocated unconditionally rather than gated, keeping the decode path branch-free.
     bf16 *nv_gate = nullptr, *nv_up = nullptr, *nv_h = nullptr;
@@ -1716,7 +1717,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // garbage FFN output that still looked like a confident (but wrong) distribution
             // downstream, rather than crashing or NaN-ing. Force nullptr for muse_glimmer so
             // launch_moe_expert_ffn_q4k quantizes s.hn fresh instead of trusting the stale cache.
-            // Checkpoint-native decode FFN (SPARKINFER_QWEN38_DECODE_NVFP4=1). gate_q/up_q/down_q
+            // Checkpoint-native decode FFN -- the default since 2026-08-21
+            // (SPARKINFER_QWEN38_DECODE_NVFP4=0 opts out). gate_q/up_q/down_q
             // are a Q4_K REQUANTIZATION of the NVFP4 the checkpoint ships -- 8.25% mean relative
             // weight error, corr 0.9968 -- so this path exists to answer whether decoding the
             // actual checkpoint numerics changes anything measurable. It is dense-only (top_k==1,
@@ -4818,13 +4820,27 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         return true;
     };
 
-    // Run the DECODE FFN on the checkpoint's own NVFP4 weights instead of a Q4_K requantization
-    // of them. Off by default: it is an accuracy experiment with a real throughput risk, since
-    // the Q4_K path is dp4a int8 MMVQ and heavily tuned while launch_gemv_nvfp4 dequantizes to
-    // float. See the gate_nv/up_nv/down_nv comment in qwen35.h for what the conversion costs.
+    // Run the DECODE FFN on the checkpoint's own NVFP4 weights. ON BY DEFAULT since 2026-08-21:
+    // this engine targets Blackwell and the checkpoint ships NVFP4, so requantizing it to Q4_K to
+    // decode it throws away the format the hardware exists to run. SPARKINFER_QWEN38_DECODE_NVFP4=0
+    // restores the Q4_K requantization.
+    //
+    // It is not free, and the cost is larger than the weight error alone suggests. Measured on the
+    // pinned RTX 5090 at ctx=4096, reps=3, both arms back-to-back on the same build (see the
+    // gate_nv/up_nv/down_nv comment in qwen35.h):
+    //
+    //                     AR tok/s   DSpark tok/s   tau      lossless
+    //     Q4_K requant     90.23       114.39       1.6623     yes
+    //     NVFP4 native     82.23        95.07       1.5059     yes
+    //
+    // AR gives up 8.9% because the Q4_K path is dp4a int8 MMVQ and heavily tuned while
+    // launch_gemv_nvfp4 dequantizes to float. Speculative decode gives up 16.9%, not 8.9%, because
+    // the two effects compound: speedup ~= tau/(verify + draft), so a slower target forward AND a
+    // lower acceptance both push the same direction. Closing that is the dp4a/fusion work on
+    // launch_gemv_nvfp4 -- the accuracy is already where it should be, only the kernel is behind.
     static const bool kDecodeNvfp4 = [] {
         const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     auto keep_nvfp4 = [&](const std::string& prefix, int rows, int cols,
                           const void** fp4, const void** fp4_sf, float& fp4_alpha) -> const void* {
@@ -5157,7 +5173,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
                                            &w.up_fp4, &w.up_fp4_sf, w.up_fp4_alpha);
             const void* d_pay = keep_nvfp4(mb + "down_proj", H, c.moe_ffn,
                                            &w.down_fp4, &w.down_fp4_sf, w.down_fp4_alpha);
-            // SPARKINFER_QWEN38_DECODE_NVFP4=1 keeps the checkpoint's own payloads for DECODE, so
+            // The default path keeps the checkpoint's own payloads for DECODE, so
             // the FFN runs the numerics the checkpoint actually ships instead of a Q4_K
             // requantization of them (8.25% mean relative weight error -- see qwen35.h).
             //

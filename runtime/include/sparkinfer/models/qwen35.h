@@ -106,20 +106,25 @@ struct Qwen35LayerWeights {
     // ([SI_NVFP4_HDR | ue4m3 group scales | packed e2m1]). Distinct from the *_fp4/_fp4_sf pair
     // above, which is the split layout the batched-prefill GEMM wants.
     //
-    // These exist because decode does NOT currently run the checkpoint's numerics. gate_q/up_q/
-    // down_q are built by dequantizing these payloads and REQUANTIZING to Q4_K, which measures
-    // 8.25% mean relative weight error against the NVFP4 source (corr 0.9968) -- NVFP4's 8
-    // magnitudes per 16-element group with an e4m3 scale and Q4_K's 16 levels per 32 with a 6-bit
-    // scale/min do not nest, so the conversion is pure loss on top of an already-lossy format.
-    // Measured cost of that conversion, same corpus, same build, only this flag changed:
+    // These ARE the decode weights as of 2026-08-21 (SPARKINFER_QWEN38_DECODE_NVFP4 defaults on;
+    // =0 restores the old path). Historically decode ran gate_q/up_q/down_q instead, built by
+    // dequantizing these payloads and REQUANTIZING to Q4_K, which measures 8.25% mean relative
+    // weight error against the NVFP4 source (corr 0.9968) -- NVFP4's 8 magnitudes per 16-element
+    // group with an e4m3 scale and Q4_K's 16 levels per 32 with a 6-bit scale/min do not nest, so
+    // the conversion is pure loss on top of an already-lossy format. Quality cost of that
+    // conversion, same corpus, same build, only this flag changed:
     //
-    //     Q4_K decode (default)   PPL 3.204
-    //     NVFP4 decode            PPL 3.010     6.1% better
+    //     Q4_K decode   PPL 3.204
+    //     NVFP4 decode  PPL 3.010     6.1% better
     //
-    // So it is a real quality regression, not a theoretical one. What it is NOT is the cause of
-    // the DSpark acceptance gap: tau measured 1.6552 on Q4_K against 1.6333 on NVFP4, i.e.
-    // unchanged, so the draft is not being held back by the target's requantized weights.
-    // Set by SPARKINFER_QWEN38_DECODE_NVFP4=1 so the decode FFN can read the checkpoint directly.
+    // CORRECTION (2026-08-21). This comment used to claim tau was "unchanged" across the two --
+    // 1.6552 on Q4_K against 1.6333 on NVFP4 -- and concluded the requantized weights were not
+    // holding the draft back. A proper A/B at ctx=4096 with reps=3, both arms back-to-back on one
+    // build, says otherwise: tau 1.6623 on Q4_K against 1.5059 on NVFP4, a 9.4% drop. The earlier
+    // pair was not measured at this context and should not have been quoted as a null result.
+    // Acceptance DOES move with the target's numerics, and it moves against native NVFP4, which is
+    // the opposite of the intuitive direction -- worth understanding rather than assuming away.
+    // Both arms are byte-lossless vs AR over 3 repeats.
     const void* gate_nv = nullptr; const void* up_nv = nullptr; const void* down_nv = nullptr;
     // Full-attention q/k/v projections as the checkpoint ships them (ModelOpt NVFP4). Unlike the
     // GDN pointers below these do NOT alias a payload decode already holds: decode reads the Q4_K

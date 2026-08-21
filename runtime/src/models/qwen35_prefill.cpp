@@ -2889,9 +2889,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // constants AR uses (expert 0, weight 1.0) and run the identical expert kernel at N rows,
         // then skip straight past the MoE routing/shared machinery below.
         if (dense) {
+            // Same default and same env as the decode dispatch in qwen35.cpp -- ON unless
+            // SPARKINFER_QWEN38_DECODE_NVFP4=0. These two MUST stay in lockstep; see below.
             static const bool kDecodeNvfp4 = [] {
                 const char* e = getenv("SPARKINFER_QWEN38_DECODE_NVFP4");
-                return e && e[0] == '1';
+                return !(e && e[0] == '0');
             }();
             const bool native_ffn = kDecodeNvfp4 && w.gate_nv && w.up_nv && w.down_nv;
             const bool q4_ffn = w.gate_q && w.up_q && w.down_q;
@@ -2900,7 +2902,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 supported = false; break;
             }
             // Checkpoint-native NVFP4 FFN, matching the decode path's own branch
-            // (SPARKINFER_QWEN38_DECODE_NVFP4=1, see qwen35.cpp). BOTH sides have to switch
+            // (SPARKINFER_QWEN38_DECODE_NVFP4, see qwen35.cpp). BOTH sides have to switch
             // together: losslessness is defined as the speculative output matching the AR output
             // of the SAME build, so running NVFP4 in decode while the verify stays on Q4_K makes
             // the two disagree on weights that differ by ~8% and reports LOSSLESS=0 -- a path
