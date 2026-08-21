@@ -1,21 +1,27 @@
 // What acceptance length (tau) does the DSpark draft achieve against Qwen3.8-27B?
 //
-// This is the number that decides whether the remaining speculative-decoding work is worth doing.
-// DSpark's block_size is 7, so tau can in principle reach 7 -- against MTP's hard ceiling of 2
-// (mtp_num_hidden_layers=1). If DSpark lands tau ~4-5 it is clearly the better path; if it lands
-// ~2 then MTP is simpler for the same benefit.
+// Originally the number that decided whether the remaining speculative-decoding work was worth
+// doing. DSpark's block_size is 7, so tau can in principle reach 7 -- against MTP's hard ceiling
+// of 2 (mtp_num_hidden_layers=1). The framing then was "tau ~4-5 and DSpark clearly wins; ~2 and
+// MTP is simpler for the same benefit". Tau landed well below that band (~1.66 at ctx=4k) and
+// DSpark still won, because the payoff turned out to hinge on VERIFY COST rather than tau alone:
+// speedup ~= tau / (verify + draft), and #889 cut verify from 2.62 to 1.85 target forwards at
+// N=4. Do not read the old tau bands as a live decision rule.
 //
 // Tau was measured BEFORE the expensive part was built, deliberately: both speculative paths were
 // gated behind dflash_verify_short_run rejecting dense_ffn (its guards wanted !c.dense_ffn and
 // n_experts==256, written for Qwen3.6-35B-A3B's MoE), and Qwen3.8 is dense_ffn with n_experts==1.
 // That branch now exists, so this reports THROUGHPUT as well as tau and losslessness, and is the
-// harness the hourly DSpark decode@128 eval scores.
+// harness the hourly DSpark eval scores -- at ctx=4096 (dspark-decode@4k), not 128.
 //
 // Read the three together. Throughput conditional on lossless=YES is the only meaningful number --
-// a speculative decoder that emits unverified tokens is not fast, it is wrong -- and tau is the
-// lever that moves it: at tau 1.42 against a block_size of 7, DSpark spends a full draft forward
-// per step to save roughly a third of one target forward, which is why DSPARK_TPS currently lands
-// BELOW AR_TPS. Closing that gap is the optimisation this tool measures.
+// a speculative decoder that emits unverified tokens is not fast, it is wrong.
+//
+// This header used to end "which is why DSPARK_TPS currently lands BELOW AR_TPS". That has not
+// been true since the verify-cost work: at ctx=4096 DSpark measures ~1.27x AR, losslessly. Tau is
+// still the lever, but it is the numerator of tau/(verify+draft), and the denominator moved
+// further. Expect DSPARK_TPS above AR_TPS at 4k; below it at short context, where the batched
+// verify cannot arm and the draft is pure overhead.
 //
 // The env pins below are deliberately NOT production defaults; they exist to make AR and DSpark
 // comparable in one process. Both legs run under the same pins and the scored metric is relative
