@@ -845,6 +845,16 @@ test -f "$MODEL_DIR/config.json" || {{ echo "FAIL $MODEL_DIR has no config.json"
 # without the PATH above cached it, and every round after that died with "nvcc fatal: Unsupported
 # gpu architecture 'compute_89'" -- 11.5 predates sm_89 -- while the PATH export sat right there
 # looking correct. Blow the cache away when it points anywhere but the toolkit we intend.
+# Reclaim this box's own build litter before compiling. nvcc writes GB-scale intermediates to
+# /tmp for EVERY .cu x EVERY arch (sm_89/90/100/120), and nothing else removes them; profiling
+# runs leave .nsys-rep/.sqlite behind that are far larger. On 2026-08-22 the disk sat at 93% and
+# three consecutive cron rounds died -- two with "[FAIL] target load", one with a Qwen3.6 guard
+# that ran clean standalone -- while both manually-launched rounds that day passed, each having
+# been preceded by a hand cleanup. Safe here because the round holds the shared lock, so no other
+# build can be mid-flight.
+rm -rf /tmp/tmpxft_* /tmp/*.nsys-rep /tmp/*.sqlite 2>/dev/null || true
+echo "DISK_BEFORE_BUILD $(df -h / | awk 'NR==2{{print $4}}') free"
+
 mkdir -p build
 if [ -f build/CMakeCache.txt ] && ! grep -q '^CMAKE_CUDA_COMPILER:FILEPATH=/usr/local/cuda' build/CMakeCache.txt; then
   echo "WARN: build/CMakeCache.txt has a non-/usr/local/cuda CUDA compiler -- wiping build dir" >&2
