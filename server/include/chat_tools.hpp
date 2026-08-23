@@ -140,6 +140,31 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
 bool parse_legacy_completion_request(const std::string& body, std::string& prompt_out,
                                      bool& echo_out, std::string& err);
 
+// POST /v1/score (teacher-forced scoring) request fields. Split out of the handler so the
+// validation has a unit-test seam, exactly like parse_chat_request_json/parse_request_controls.
+//
+// Exactly one of messages/prompt, and exactly one of completion/completion_token_ids, must be
+// supplied; supplying both or neither of a pair is an error rather than a silent precedence rule,
+// because a verifier that thinks it pinned token ids and actually got its text re-tokenised would
+// compare the wrong thing and never know.
+struct ScoreRequest {
+    // True => the caller sent `messages` and the chat template must be applied to it. The messages
+    // themselves are not parsed here: the caller hands the SAME body to the chat tokenizer, which
+    // already owns that parse.
+    bool use_messages = false;
+    std::string prompt;                     // raw prompt text, when use_messages is false
+    bool completion_is_ids = false;         // true => completion_token_ids, false => completion text
+    std::string completion;                 // completion text, when completion_is_ids is false
+    std::vector<int> completion_token_ids;  // when completion_is_ids is true
+    int top_logprobs = 0;                   // 0-20
+};
+
+// vocab, when > 0, rejects any completion_token_ids entry outside [0, vocab). 0 skips that check
+// (the ids are still required to be non-negative integers), so a caller without a vocab handy can
+// still validate everything else.
+bool parse_score_request(const std::string& body, ScoreRequest& out, std::string& err,
+                         int vocab = 0);
+
 // Pure decision function for the DFlash+temperature-sampling incompatibility (kept separate from
 // getenv() so it's unit-testable without a process-wide env var): true => the request should be
 // rejected with 400. temperature<=0 is always accepted regardless of dflash_env_on.

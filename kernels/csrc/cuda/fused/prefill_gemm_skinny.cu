@@ -31,6 +31,7 @@
 // mma shape differ. Measured: 7.5 -> 3.54 ms.
 // ============================================================================
 #include "sparkinfer/kernels/prefill_gemm_skinny.h"
+#include "sparkinfer/kernels/deterministic.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -262,9 +263,13 @@ bool launch_prefill_gemm_skinny(const void* A, const void* W, void* C,
     // Split-K fills the 5090 at M=128 (4 row-tiles). #842 kept one wave of 4 CTAs
     // because shrinking BT made staging worse; splitting K keeps BT=32. Default ON.
     // SPARKINFER_PREFILL_SKINNY_SPLITK=0 restores #842's single-wave grid.
+    // Its split-K partials are accumulated with fp32 atomicAdd, so the reduction order -- and
+    // therefore the result, to a few ULP -- varies run to run. Deterministic mode turns it off by
+    // default (an explicit env setting still wins, for A/B). See kernels/deterministic.h.
     static const bool sk_on = [] {
         const char* e = getenv("SPARKINFER_PREFILL_SKINNY_SPLITK");
-        return !(e && e[0] == '0');
+        if (e) return e[0] != '0';
+        return !deterministic_mode();
     }();
     // Only worth it while the 128-wide tile is mostly padding; wider outputs keep the tiled GEMM,
     // which is tensor-core bound and already the right shape for them.

@@ -15,6 +15,11 @@ namespace kernels {
 
 namespace {
 
+// Fixed grid for the deterministic normalizer sum -- the shape IS part of the summation order, so
+// it must not vary with vocab, occupancy or anything else.
+constexpr int kDenomThreads = 256;
+constexpr int kDenomBlocks = 256;
+
 __global__ void vocab_iota_kernel(int* vocab_iota, int vocab) {
     for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < vocab; v += gridDim.x * blockDim.x)
         vocab_iota[v] = v;
@@ -162,14 +167,56 @@ void launch_vocab_iota_init(int* vocab_iota, int vocab, cudaStream_t stream) {
     vocab_iota_kernel<<<bx < 1 ? 1 : bx, 256, 0, stream>>>(vocab_iota, vocab);
 }
 
-void launch_topk_topp_mask(float* logits, int vocab,
-                           const int* vocab_iota, float* sorted_logits, int* sorted_idx,
-                           float* topk_exp, float* topk_cumsum,
-                           void* sort_temp, size_t sort_temp_bytes,
-                           void* scan_temp, size_t scan_temp_bytes,
-                           const int* top_k_i32, const float* top_p_f32,
-                           int* rank_by_id,
-                           cudaStream_t stream) {
+// Fixed-order full-vocab sum of the softmax numerators, for deterministic mode.
+//
+// The default path reads the normalizer off the END of the CUB inclusive scan that top_p already
+// needs (topk_cumsum[vocab-1]), which is free. But CUB's DeviceScan uses decoupled look-back: how
+// many predecessor tile aggregates a tile folds together before it finds an inclusive prefix
+// depends on how far along those predecessors happen to be, i.e. on TIMING. For a non-associative
+// operator like fp32 addition that makes the grouping -- and so the last-place bit of the total --
+// vary run to run. It is exactly one ULP, but it lands in logsumexp, which every reported logprob
+// at that position is measured against, so it is visible in every logprob and it is the last thing
+// standing between deterministic mode and bit-identical output.
+//
+// This is the same sum with the summation tree pinned: a fixed grid, each block folding a fixed
+// strided subset in ascending index, then block partials folded in ascending block index by a
+// single block. No atomics, no look-back, no timing dependence.
+__global__ void logprob_denom_partial_kernel(const float* __restrict__ vals, int n,
+                                             float* __restrict__ partials) {
+    __shared__ float sm[kDenomThreads];
+    float acc = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        acc += vals[i];
+    sm[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partials[blockIdx.x] = sm[0];
+}
+
+__global__ void logprob_denom_final_kernel(const float* __restrict__ partials, int n,
+                                           float* __restrict__ out) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    float acc = 0.f;
+    for (int i = 0; i < n; i++) acc += partials[i];
+    *out = acc;
+}
+
+void launch_logprob_denom_det(const float* topk_exp, int vocab, float* partials, float* out,
+                              cudaStream_t stream) {
+    logprob_denom_partial_kernel<<<kDenomBlocks, kDenomThreads, 0, stream>>>(topk_exp, vocab, partials);
+    logprob_denom_final_kernel<<<1, 1, 0, stream>>>(partials, kDenomBlocks, out);
+}
+
+void launch_logprob_distribution(const float* logits, int vocab,
+                                 const int* vocab_iota, float* sorted_logits, int* sorted_idx,
+                                 float* topk_exp, float* topk_cumsum,
+                                 void* sort_temp, size_t sort_temp_bytes,
+                                 void* scan_temp, size_t scan_temp_bytes,
+                                 int* rank_by_id,
+                                 cudaStream_t stream) {
     size_t sort_bytes = sort_temp_bytes;
     cub::DeviceRadixSort::SortPairsDescending<float, int>(
         sort_temp, sort_bytes, logits, sorted_logits, vocab_iota, sorted_idx, vocab, 0,
@@ -181,7 +228,23 @@ void launch_topk_topp_mask(float* logits, int vocab,
 
     size_t scan_bytes = scan_temp_bytes;
     cub::DeviceScan::InclusiveSum(scan_temp, scan_bytes, topk_exp, topk_cumsum, vocab, stream);
+}
 
+void launch_topk_topp_mask(float* logits, int vocab,
+                           const int* vocab_iota, float* sorted_logits, int* sorted_idx,
+                           float* topk_exp, float* topk_cumsum,
+                           void* sort_temp, size_t sort_temp_bytes,
+                           void* scan_temp, size_t scan_temp_bytes,
+                           const int* top_k_i32, const float* top_p_f32,
+                           int* rank_by_id,
+                           cudaStream_t stream) {
+    // Sort + exp/rank + cumsum, then mask. Split out so the prefill seed token can reuse the
+    // distribution half verbatim -- see launch_logprob_distribution's doc comment in fused.h.
+    launch_logprob_distribution(logits, vocab, vocab_iota, sorted_logits, sorted_idx, topk_exp,
+                                topk_cumsum, sort_temp, sort_temp_bytes, scan_temp,
+                                scan_temp_bytes, rank_by_id, stream);
+
+    const int bx = (vocab + 255) / 256 > 1024 ? 1024 : (vocab + 255) / 256;
     topk_topp_mask_kernel<<<bx < 1 ? 1 : bx, 256, 0, stream>>>(
         logits, sorted_idx, topk_cumsum, vocab, top_k_i32, top_p_f32);
 }

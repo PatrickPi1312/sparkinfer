@@ -11,6 +11,11 @@ export TOK_REPO="${TOK_REPO:-Qwen/Qwen3.6-35B-A3B}"
 export MODEL_NAME="${MODEL_NAME:-qwen3.6-35b-a3b}"
 # shellcheck source=../bench/scripts/_common.sh
 source "$ROOT/bench/scripts/_common.sh"
+# Verify against the digest of the model we are actually serving, not _common.sh's Qwen3-30B
+# default (an explicit MODEL_SHA256 in the environment still wins), and fail fast on a mismatch
+# instead of deleting 22 GB and re-downloading -- see resolve_model_sha256/verify_model.
+resolve_model_sha256
+export MODEL_SHA_POLICY="${MODEL_SHA_POLICY:-strict}"
 
 ARCH="$(detect_arch)"
 GGUF="${1:-$MODELS_DIR/$MODEL_FILE}"

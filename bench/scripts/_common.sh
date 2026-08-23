@@ -12,6 +12,11 @@ LLAMACPP_DIR="${LLAMACPP_DIR:-$ROOT/.llamacpp}"   # override to reuse an existin
 
 # C2 (reference quarantine): pin the baseline artifacts so a tampered persisted copy can't skew a
 # verdict. reference.lock carries MODEL_SHA256 + LLAMACPP_COMMIT; empty = warn-only until pinned.
+#
+# Captured BEFORE the lock is sourced: reference.lock gives MODEL_SHA256 a `:-` default, so after
+# sourcing it is always non-empty and an explicit caller pin becomes indistinguishable from the
+# default. resolve_model_sha256() below needs that distinction.
+_ENV_MODEL_SHA256="${MODEL_SHA256:-}"
 _HERE_COMMON="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$_HERE_COMMON/reference.lock" ] && source "$_HERE_COMMON/reference.lock"
 LLAMACPP_REPO="${LLAMACPP_REPO:-https://github.com/ggml-org/llama.cpp}"
@@ -92,15 +97,65 @@ ensure_model() {
   verify_model
 }
 
+# Point MODEL_SHA256 at the digest that belongs to the CURRENT $MODEL_FILE.
+#
+# reference.lock pins one sha per model, but MODEL_SHA256's own default is the Qwen3-30B guard
+# model's -- it is the default because _common.sh's own default MODEL_FILE is that model. Callers
+# that serve something else must therefore pin the matching digest, which every eval path does by
+# hand (evaluate_dual.sh, evaluate_triple.sh pass MODEL_SHA256="$QWEN36_MODEL_SHA256"). server/run.sh
+# did not, so serving Qwen3.6 verified 22 GB of correct weights against the 30B guard's digest,
+# deleted them, re-downloaded, and failed again -- an infinite re-fetch loop under a restarting
+# supervisor (reported by the Gittensor serving integration, 2026-08-23; the HF upload was never
+# stale). Resolving from MODEL_FILE makes that class of mismatch structurally impossible.
+#
+# An explicit MODEL_SHA256 in the ENVIRONMENT always wins: the caller pinning the digest it expects
+# is the whole point of the knob, and downstream consumers (the subnet passes its own pin) rely on
+# it. An unrecognised MODEL_FILE resolves to empty => warn-only, which is correct: verifying a file
+# against some other file's digest is exactly the bug this function exists to prevent.
+resolve_model_sha256() {
+  if [ -n "${_ENV_MODEL_SHA256:-}" ]; then
+    MODEL_SHA256="$_ENV_MODEL_SHA256"
+    return 0
+  fi
+  case "$MODEL_FILE" in
+    Qwen3.6-35B-A3B-UD-Q4_K_M.gguf)             MODEL_SHA256="${QWEN36_MODEL_SHA256:-}" ;;
+    Qwen3-30B-A3B-Q4_K_M.gguf)                  MODEL_SHA256="${MODEL_SHA256:-}" ;;
+    Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf)  MODEL_SHA256="${QWEN35_9B_Q4K_SHA256:-}" ;;
+    Qwythos-9B-Claude-Mythos-5-1M-Q8_0.gguf)    MODEL_SHA256="${QWEN35_9B_Q8_SHA256:-}" ;;
+    Qwythos-9B-Claude-Mythos-5-1M-BF16.gguf)    MODEL_SHA256="${QWEN35_9B_BF16_SHA256:-}" ;;
+    *)                                          MODEL_SHA256="" ;;
+  esac
+  export MODEL_SHA256
+}
+
 # C2: the persisted baseline weights must be pristine — a malicious root build could corrupt the GGUF
 # to depress llama's score and inflate its own relative gain. Verify against the pinned sha each eval.
+#
+# MODEL_SHA_POLICY selects what a mismatch means:
+#   refetch (default) — the eval's C2 quarantine: assume the PIN is truth and the local copy is
+#                       suspect, so delete and re-download once, then fail. Right for the eval,
+#                       where a tampered persisted baseline is the threat being defended against.
+#   strict            — assume the FILE is truth and report the mismatch. Right for serving: a
+#                       serving start has no adversary to quarantine against, and deleting 22 GB
+#                       on every start is destructive when it is the pin that is wrong. Under a
+#                       restarting supervisor, refetch turns a bad pin into an unbounded download
+#                       loop; strict fails once, loudly, with both digests.
 verify_model() {
-  local f="$MODELS_DIR/$MODEL_FILE" got
+  local f="$MODELS_DIR/$MODEL_FILE" got policy="${MODEL_SHA_POLICY:-refetch}"
   got="$(sha256_of "$f")"
   if [ -z "${MODEL_SHA256:-}" ]; then
     echo ">> model sha256 (not pinned, warn-only): $got" >&2; return 0
   fi
   if [ "$got" = "$MODEL_SHA256" ]; then echo ">> model sha256 OK" >&2; return 0; fi
+  if [ "$policy" = "strict" ]; then
+    echo ">> FATAL: model sha256 MISMATCH for $MODEL_FILE" >&2
+    echo ">>   got  ${got:-<file missing or unreadable>}" >&2
+    echo ">>   want $MODEL_SHA256" >&2
+    echo ">> Refusing to delete and re-download. Either the file is not the pinned build, or the" >&2
+    echo ">> pin is wrong for this file. Pass MODEL_SHA256=<digest> to pin the copy you intend to" >&2
+    echo ">> serve, or MODEL_SHA_POLICY=refetch to re-fetch a clean baseline." >&2
+    return 1
+  fi
   echo ">> WARN: model sha256 MISMATCH (got ${got:-none}, want $MODEL_SHA256) — re-fetching clean baseline" >&2
   rm -f "$f"; _download_model
   got="$(sha256_of "$f")"
@@ -128,12 +183,29 @@ ensure_tokenizer() {
   fi
   if [ "$need" = 0 ]; then return 0; fi
   echo ">> downloading tokenizer.json from $TOK_REPO (replacing mismatched/missing) ..." >&2
-  rm -f "$MODELS_DIR/tokenizer.json" "$marker"
-  HF_HUB_DISABLE_XET=1 hf download "$TOK_REPO" tokenizer.json --local-dir "$MODELS_DIR" >&2 || \
-  python3 -c "from huggingface_hub import hf_hub_download as d; d('$TOK_REPO','tokenizer.json',local_dir='$MODELS_DIR')" >&2 || \
-  curl -fL --progress-bar "https://huggingface.co/${TOK_REPO}/resolve/main/tokenizer.json" \
-       -o "$MODELS_DIR/tokenizer.json" >&2
-  [ -f "$MODELS_DIR/tokenizer.json" ] || { echo "!! tokenizer download failed for $TOK_REPO" >&2; return 1; }
+  # Download into a staging dir and only move into place once the file exists. The previous order
+  # -- rm the existing tokenizer FIRST, then fetch -- turns any transient network failure into a
+  # models dir with no tokenizer at all, which is strictly worse than the possibly-stale one it
+  # replaced, and leaves the server unable to start until someone re-fetches by hand. Observed for
+  # real on 2026-08-23: one `curl: (56) Failure when receiving data from the peer` deleted a
+  # perfectly good tokenizer and bricked an otherwise healthy box.
+  local stage="$MODELS_DIR/.tokenizer_stage"
+  rm -rf "$stage"; mkdir -p "$stage"
+  HF_HUB_DISABLE_XET=1 hf download "$TOK_REPO" tokenizer.json --local-dir "$stage" >&2 || \
+  python3 -c "from huggingface_hub import hf_hub_download as d; d('$TOK_REPO','tokenizer.json',local_dir='$stage')" >&2 || \
+  curl -fL --retry 3 --retry-all-errors --progress-bar "https://huggingface.co/${TOK_REPO}/resolve/main/tokenizer.json" \
+       -o "$stage/tokenizer.json" >&2
+  if [ ! -s "$stage/tokenizer.json" ]; then
+    rm -rf "$stage"
+    echo "!! tokenizer download failed for $TOK_REPO" >&2
+    if [ -f "$MODELS_DIR/tokenizer.json" ]; then
+      echo "!! keeping the existing tokenizer.json -- it may be the wrong one for $TOK_REPO." >&2
+      echo "!! Delete it and re-run once the network is back if scores look wrong." >&2
+    fi
+    return 1
+  fi
+  mv -f "$stage/tokenizer.json" "$MODELS_DIR/tokenizer.json"
+  rm -rf "$stage"
   printf '%s\n' "$TOK_REPO" > "$marker"
 }
 

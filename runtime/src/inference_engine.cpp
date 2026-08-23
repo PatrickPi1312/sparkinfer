@@ -341,8 +341,14 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         // once before a full batched pass runs, so that never hurts ITPS under mixed load.
         const int chunk_limit = chunked ? chunk : 0;
         int out_pos = job.prefill_pos;
+        // want_seed_logprob: the seed this returns IS the response's first emitted token, and it
+        // is produced here rather than by forward_token(), so its logprob has to be collected
+        // here too or the first token gets no entry at all. Asked for only when the request wants
+        // logprobs -- it costs a full-vocab sort, and unlike the decode path (frozen graph
+        // topology) this one is free to branch on the host.
+        const bool want_seed_logprob = job.req.logprobs && job.on_token_logprob;
         const int seed = model_->ingest_prompt_range(job.req.prompt.data(), job.prefill_pos, n,
-                                                      chunk_limit, &out_pos);
+                                                      chunk_limit, &out_pos, want_seed_logprob);
         job.prefill_pos = out_pos;
         if (job.prefill_pos >= n) {
             // Known v1 scope limitation for temperature sampling (runtime/src/models/qwen35.cpp's
@@ -357,6 +363,32 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
             if (job.next_token < 0 && job.req.use_prefix_session)
                 job.next_token = model_->prefix_seed_token();
             job.phase = SeqPhase::DECODE;
+            // Stage the seed's logprob exactly the way the decode branch stages every subsequent
+            // token's: the NEXT step_job() call emits job.next_token and flushes this pending
+            // entry alongside it, so the first entry describes the first emitted token and
+            // logprobs.content finally has one entry per generated token.
+            //
+            // Read here, synchronously, for the same reason the decode branch does it: the
+            // sampler scratch it comes from is shared across every job on this model, so it must
+            // be consumed before any other job's forward_token() can overwrite it.
+            //
+            // Teacher-forced scoring: the first token of the "response" is the caller's, not the
+            // model's, so replace the argmax seed before anything reports on it. The distribution
+            // just computed at the last prompt position is exactly the one that predicts it.
+            const bool forcing = !job.req.forced_tokens.empty();
+            if (forcing) job.next_token = job.req.forced_tokens[0];
+            if (want_seed_logprob && job.next_token >= 0 && (forcing || job.next_token == seed)) {
+                // job.next_token == seed guard (generation case): the use_prefix_session fallback
+                // above can substitute a token from a DIFFERENT forward pass (the cached prefix's
+                // own seed), which this scratch does not describe -- reporting it would be a wrong
+                // number rather than a missing one, so that case keeps the old one-short
+                // behaviour. Forcing is exempt: the forced token is scored against this
+                // distribution by definition, whatever the seed was.
+                job.pending_logprob =
+                    forcing ? model_->token_logprob_for(job.next_token, job.req.top_logprobs)
+                            : model_->last_token_logprobs(job.req.top_logprobs);
+                job.have_pending_logprob = true;
+            }
         }
         return false;
     }
@@ -396,8 +428,11 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         return true;
     }
 
-    const bool hit_eos = job.next_token == cfg.eos_id ||
-                         (cfg.eos_id2 >= 0 && job.next_token == cfg.eos_id2);
+    // EOS never ends a teacher-forced score: the caller asked about a specific token sequence and
+    // is owed a logprob for every token in it, even if it contains an end marker.
+    const bool hit_eos = job.req.forced_tokens.empty() &&
+                         (job.next_token == cfg.eos_id ||
+                          (cfg.eos_id2 >= 0 && job.next_token == cfg.eos_id2));
     const bool hit_token_limit = job.decode_emitted >= job.req.max_new_tokens;
     if (hit_eos || hit_token_limit) {
         job.reached_token_limit = hit_token_limit && !hit_eos;
@@ -412,16 +447,30 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     }
 
     const int prompt_len = (int)job.req.prompt.size();
-    job.next_token = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true,
+    const int sampled = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true,
                                            job.req.temperature, job.req.seed,
                                            (uint64_t)job.decode_emitted,
                                            job.req.top_k, job.req.top_p,
                                            job.req.presence_penalty, job.req.frequency_penalty);
+    // Teacher-forced scoring substitutes the caller's token for the sampler's pick. The forward
+    // pass above still ran in full, so the KV/GDN state this leaves behind is exactly the state
+    // the supplied sequence implies -- which is the whole point: position i+1 is scored under a
+    // context that actually contains token i.
+    //
+    // decode_emitted has already been incremented for the token emitted at the top of this call,
+    // so it indexes the NEXT forced token. Past the end (only reachable if max_new_tokens exceeds
+    // the forced sequence) it falls back to the sampled token rather than reading out of bounds.
+    const bool forcing = !job.req.forced_tokens.empty();
+    const size_t next_forced = (size_t)job.decode_emitted;
+    job.next_token = (forcing && next_forced < job.req.forced_tokens.size())
+                         ? job.req.forced_tokens[next_forced]
+                         : sampled;
     // Must run in THIS step_job() call, synchronously, before any OTHER job's forward_token()
     // (worker_loop() interleaves jobs sharing one Qwen35Model instance) can overwrite the shared
     // decode scratch last_token_logprobs() reads from. See Job::on_token_logprob's doc comment.
     if (job.req.logprobs && job.on_token_logprob) {
-        job.pending_logprob = model_->last_token_logprobs(job.req.top_logprobs);
+        job.pending_logprob = forcing ? model_->token_logprob_for(job.next_token, job.req.top_logprobs)
+                                      : model_->last_token_logprobs(job.req.top_logprobs);
         job.have_pending_logprob = true;
     }
     return false;

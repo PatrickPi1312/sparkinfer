@@ -34,12 +34,42 @@ void launch_pfm_bucket_pairs(const int* expert_ids, const float* expert_weights,
 
 // Same as above but with explicit GEMM row-tile size (16 or 128). Short-N prefill
 // uses bm=16 so underfilled experts don't pad to 128 WMMA rows.
+//
+// pair_orig (optional, nullptr to skip) additionally records each pair's ORIGINAL index
+// p = token*top_k + rank. Unlike the slot a pair is bucketed into -- assigned by an atomic
+// cursor, hence run-to-run variable -- p is stable by construction. It is what makes the
+// deterministic MoE combine below possible; see launch_pfm_moe_combine_det.
 void launch_pfm_bucket_pairs_bm(const int* expert_ids, const float* expert_weights,
                                 const int* counts, int* offsets, int* cursors,
                                 int* pair_tok, float* pair_w,
                                 int* tilemap, int* d_ntiles,
                                 int n_tokens, int n_experts, int top_k, int bm,
-                                cudaStream_t stream);
+                                cudaStream_t stream, int* pair_orig = nullptr);
+
+// DETERMINISTIC MoE COMBINE (SPARKINFER_DETERMINISTIC=1).
+//
+// The routed GEMM's C_SCATTER epilogue accumulates every expert's contribution to a token into
+// one fp32 accumulator with atomicAdd. Each contribution is itself deterministic, but the ORDER
+// the top_k of them land in is decided by hardware arbitration, and fp32 addition is not
+// associative -- so the routed hidden state differs by a few ULP between identical runs. That is
+// tiny, but it feeds discrete top-k expert routing at the next layer and int8 activation requant,
+// so across 40+ layers it occasionally flips an expert choice, which moves the logits enough to
+// fork a greedy decode. This is the dominant source of sparkinfer's run-to-run nondeterminism at
+// batch 1 (the decode path itself has no float atomics at all).
+//
+// The fix needs no change to the GEMM kernels. Hand the routed GEMM `pair_orig` in place of
+// `pair_tok` and a partials buffer in place of `out_f32`, and its existing epilogue writes each
+// pair to its OWN address (p = token*top_k + rank is unique per pair) -- the atomicAdd is still
+// there but is now uncontended, so it is a plain store of an already-deterministic value. This
+// function then folds the top_k partials per token in ascending rank, a fixed order on every run.
+//
+//   part    [n_tokens * top_k * n_cols] fp32, written by the GEMM as described above
+//   out     [n_tokens * n_cols] fp32, overwritten (not accumulated into)
+//
+// Only valid when A rows are per-pair (a_indirect=false), i.e. the down projection -- gate/up
+// index activations THROUGH pair_tok and must keep the real token ids.
+void launch_pfm_moe_combine_det(const float* part, float* out, int n_tokens, int top_k,
+                                int n_cols, cudaStream_t stream);
 
 // Build tilemap + d_ntiles for experts [e_base, e_base+n_in) from device counts.
 // Used by the short-N L2-serial / dual-stream path to avoid D2H counts sync.

@@ -36,6 +36,8 @@ target_include_directories(sparkinfer_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/examples
+    # kernels/deterministic.h -- header-only, for the SPARKINFER_DETERMINISTIC banner line.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include
 )
 
 target_link_libraries(sparkinfer_server PRIVATE

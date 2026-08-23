@@ -1,5 +1,6 @@
 #include "chat_tokenizer.hpp"
 #include "model_engine.hpp"
+#include "sparkinfer/kernels/deterministic.h"
 
 #include <nlohmann/json.hpp>
 
@@ -166,6 +167,23 @@ bool write_stream_role(GuardedSink& gs, const std::string& cid, long long create
                                                            {"content", nullptr}}},
                                                 {"finish_reason", nullptr},
                                                 {"logprobs", nullptr}}});
+    return write_sse_json(gs, chunk);
+}
+
+// Emits a delta carrying ONLY logprobs (empty content). write_stream_delta drops empty pieces, so
+// without this any entries still pending when generation ends -- the last tokens produced no text
+// of their own, e.g. a stop-sequence holdback or a trailing partial UTF-8 sequence -- would be
+// silently dropped, and the concatenated stream would carry fewer entries than completion_tokens.
+// A content delta with an empty string is well-formed and OpenAI clients tolerate it.
+bool write_stream_logprobs_only(GuardedSink& gs, const std::string& cid, long long created,
+                                int choice_index, const nlohmann::json& logprobs,
+                                const char* field = "content",
+                                const char* object = "chat.completion.chunk") {
+    auto chunk = stream_chunk_base(cid, created, object);
+    chunk["choices"] = nlohmann::json::array({{{"index", choice_index},
+                                                {"delta", {{field, ""}}},
+                                                {"finish_reason", nullptr},
+                                                {"logprobs", logprobs}}});
     return write_sse_json(gs, chunk);
 }
 
@@ -523,6 +541,171 @@ int main(int argc, char** argv) {
         res.set_content(body.str(), "application/json");
     });
 
+    // ---- POST /v1/score : teacher-forced scoring -------------------------------------------
+    //
+    // Given a prompt and a SUPPLIED continuation, return the per-token logprob of each
+    // continuation token under the model, without generating anything. The audit primitive an
+    // external verifier needs: it can score any text (another server's answer, a perturbed
+    // reference, mirrored organic traffic) rather than being limited to comparing its own
+    // sampled output, so there is no finite answer set to memorise.
+    //
+    // Why a dedicated endpoint rather than OpenAI's legacy `/v1/completions` with
+    // `echo: true, logprobs: 1, max_tokens: 0`: echo's contract is to report logprobs for the
+    // PROMPT tokens, and this runtime cannot produce those -- batched prefill runs the LM head
+    // only at the final prompt position, so per-prompt-token logits do not exist without a
+    // second, batched LM-head pass over the whole prompt. Rather than half-implement echo and
+    // return a shape that silently omits most of what the field promises, /v1/score states
+    // exactly what it does. (`/v1/completions` keeps its existing echo behaviour: text only.)
+    //
+    // Request:
+    //   {"model": "...",
+    //    "messages": [...],            // chat-templated, exactly as /v1/chat/completions
+    //     OR "prompt": "raw text",     // no chat template applied
+    //    "completion": "text to score",
+    //     OR "completion_token_ids": [1,2,3],   // bypasses tokenisation entirely
+    //    "top_logprobs": 0-20,         // optional, per-position alternatives
+    //    "enable_thinking": bool}      // optional, same meaning as chat completions
+    //
+    // Response: token/token_id/logprob triples in generation order, plus sum_logprob and the
+    // same `usage` block (including the ttft_ms/generation_ms/decode_tps timing fields) every
+    // other endpoint reports.
+    svr.Post("/v1/score", [&engine](const httplib::Request& req, httplib::Response& res) {
+        if (!auth_ok(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":{\"message\":\"unauthorized\"}}", "application/json");
+            return;
+        }
+        auto fail = [&res](int status, const std::string& msg) {
+            res.status = status;
+            res.set_content("{\"error\":{\"message\":\"" + json_escape(msg) + "\"}}",
+                            "application/json");
+        };
+
+        sparkinfer_server::ScoreRequest sreq;
+        std::string perr;
+        if (!sparkinfer_server::parse_score_request(req.body, sreq, perr, engine.vocab())) {
+            fail(400, perr);
+            return;
+        }
+
+        // Prompt side. The messages parse itself belongs to the chat tokenizer, which already
+        // owns it -- parse_score_request only decided WHICH form was supplied.
+        std::vector<int> prompt_ids;
+        if (sreq.use_messages) {
+            const bool enable_thinking =
+                sparkinfer_server::parse_enable_thinking(req.body, engine.is_qwen38());
+            std::string err;
+            if (!encode_messages(req.body, prompt_ids, enable_thinking, err)) {
+                fail(400, err);
+                return;
+            }
+        } else {
+            prompt_ids = g_tokenizer.encode_raw(sreq.prompt);
+        }
+        if (prompt_ids.empty()) { fail(400, "prompt encoded to zero tokens"); return; }
+
+        std::vector<int> forced = sreq.completion_is_ids ? sreq.completion_token_ids
+                                                         : g_tokenizer.encode_raw(sreq.completion);
+        if (forced.empty()) { fail(400, "completion encoded to zero tokens"); return; }
+        const int top_logprobs = sreq.top_logprobs;
+
+        // Bounded by the same per-request output cap generation uses, and by the live context.
+        if ((int)forced.size() > max_output_tokens()) {
+            fail(400, "completion has " + std::to_string(forced.size()) +
+                          " tokens, exceeds max_output_tokens=" + std::to_string(max_output_tokens()));
+            return;
+        }
+        if ((int)prompt_ids.size() + (int)forced.size() > engine.max_seq()) {
+            fail(400, "prompt + completion = " +
+                          std::to_string(prompt_ids.size() + forced.size()) +
+                          " tokens exceeds server ctx=" + std::to_string(engine.max_seq()));
+            return;
+        }
+
+        std::vector<sparkinfer_server::TokenLogprob> entries;
+        entries.reserve(forced.size());
+        auto outcome = engine.complete_streaming(
+            prompt_ids, (int)forced.size(), [](int) { return true; },
+            /*temperature=*/0.f, /*seed=*/0, /*top_k=*/0, /*top_p=*/1.0f,
+            /*presence_penalty=*/0.f, /*frequency_penalty=*/0.f, /*logit_bias=*/{},
+            /*logprobs=*/true, top_logprobs,
+            [&entries](const sparkinfer_server::TokenLogprob& tl) { entries.push_back(tl); },
+            forced);
+
+        if (!outcome.error.empty()) {
+            g_requests_total++;
+            if (outcome.overloaded) {
+                g_requests_overloaded++;
+                fail(429, outcome.error);
+            } else if (outcome.alloc_failed) {
+                g_requests_server_error++;
+                fail(503, outcome.error);
+            } else if (outcome.timed_out) {
+                g_requests_timeout++;
+                fail(504, outcome.error);
+            } else {
+                g_requests_client_error++;
+                fail(400, outcome.error);
+            }
+            return;
+        }
+
+        // The engine emits exactly the forced tokens, so a length mismatch here would mean the
+        // forced path silently diverged -- report it rather than returning a misaligned array
+        // that a verifier would compare position-by-position against its own reference.
+        if (outcome.tokens.size() != forced.size() || entries.size() != forced.size()) {
+            g_requests_total++;
+            g_requests_server_error++;
+            fail(500, "scoring returned " + std::to_string(entries.size()) + " logprobs for " +
+                          std::to_string(forced.size()) + " tokens");
+            return;
+        }
+
+        nlohmann::json tokens = nlohmann::json::array();
+        nlohmann::json token_ids = nlohmann::json::array();
+        nlohmann::json logprobs = nlohmann::json::array();
+        nlohmann::json alts = nlohmann::json::array();
+        double sum_logprob = 0.0;
+        for (const auto& e : entries) {
+            const auto piece = g_tokenizer.id_to_raw_piece(e.token_id);
+            tokens.push_back(piece.display);
+            token_ids.push_back(e.token_id);
+            logprobs.push_back(e.logprob);
+            sum_logprob += (double)e.logprob;
+            if (top_logprobs > 0) {
+                nlohmann::json per = nlohmann::json::array();
+                const int n = std::min((int)e.top_alternatives.size(), top_logprobs);
+                for (int i = 0; i < n; i++)
+                    per.push_back(token_logprob_entry_json(e.top_alternatives[i].first,
+                                                           e.top_alternatives[i].second));
+                alts.push_back(per);
+            }
+        }
+
+        nlohmann::json usage = {{"prompt_tokens", (int)prompt_ids.size()},
+                                {"completion_tokens", (int)forced.size()},
+                                {"total_tokens", (int)(prompt_ids.size() + forced.size())}};
+        if (outcome.ttft_ms >= 0) usage["ttft_ms"] = outcome.ttft_ms;
+        if (outcome.generation_ms >= 0) usage["generation_ms"] = outcome.generation_ms;
+        if (outcome.decode_tps >= 0) usage["decode_tps"] = outcome.decode_tps;
+
+        nlohmann::json body = {{"id", random_id()},
+                               {"object", "score"},
+                               {"model", g_model_name},
+                               {"tokens", tokens},
+                               {"token_ids", token_ids},
+                               {"logprobs", logprobs},
+                               {"sum_logprob", sum_logprob},
+                               {"usage", usage}};
+        if (top_logprobs > 0) body["top_logprobs"] = alts;
+
+        g_requests_total++;
+        g_requests_ok++;
+        g_prompt_tokens_total += prompt_ids.size();
+        g_completion_tokens_total += forced.size();
+        res.set_content(body.dump(), "application/json");
+    });
+
     svr.Post("/v1/chat/completions",
              [&engine](const httplib::Request& req, httplib::Response& res) {
                  if (!auth_ok(req)) {
@@ -836,6 +1019,17 @@ int main(int argc, char** argv) {
                                  auto on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
                                      pending_logprobs.push_back(tl);
                                  };
+                                 // Hand off every entry accumulated since the last delta and clear
+                                 // the buffer, so no entry is emitted twice or left behind. Returns
+                                 // null (not an empty array) when there is nothing to report or the
+                                 // request never asked -- which is what `"logprobs": null` means.
+                                 auto take_pending = [&]() -> nlohmann::json {
+                                     if (!want_logprobs || pending_logprobs.empty()) return nullptr;
+                                     nlohmann::json lp{{"content",
+                                         build_logprobs_content_json(pending_logprobs, top_logprobs)}};
+                                     pending_logprobs.clear();
+                                     return lp;
+                                 };
                                  auto on_tok = [&](int tid) -> bool {
                                      // Tool-capable responses are intentionally buffered until the
                                      // native Qwen XML is complete and schema-valid.
@@ -859,34 +1053,31 @@ int main(int argc, char** argv) {
                                              const auto delta = splitter.feed(safe);
                                              if (!delta.reasoning_content.empty())
                                                  write_stream_delta(gs, cid, created, "reasoning_content",
-                                                                    delta.reasoning_content, ci);
-                                             if (!delta.content.empty()) {
-                                                 nlohmann::json lp = nullptr;
-                                                 if (want_logprobs) {
-                                                     lp = nlohmann::json{{"content",
-                                                         build_logprobs_content_json(pending_logprobs, top_logprobs)}};
-                                                     pending_logprobs.clear();
-                                                 }
-                                                 write_stream_delta(gs, cid, created, "content", delta.content, ci, lp);
-                                             }
+                                                                    delta.reasoning_content, ci, take_pending());
+                                             if (!delta.content.empty())
+                                                 write_stream_delta(gs, cid, created, "content", delta.content,
+                                                                    ci, take_pending());
                                          }
                                          stopped_by_sequence = true;
                                          return false;
                                      }
                                      const auto delta = splitter.feed(safe);
                                      bool ok = true;
+                                     // take_pending() empties the buffer, so whichever delta is
+                                     // written first carries the entries for the tokens that
+                                     // produced it. Reasoning deltas take them too: a token routed
+                                     // to reasoning_content used to leave its entry behind to be
+                                     // misattributed to the next CONTENT chunk, which then reported
+                                     // logprobs for tokens whose text it does not contain.
+                                     // Concatenating every chunk's entries now yields exactly one
+                                     // per generated token, matching the non-streaming response.
                                      if (!delta.reasoning_content.empty())
                                          ok = write_stream_delta(gs, cid, created, "reasoning_content",
-                                                                  delta.reasoning_content, ci) && ok;
-                                     if (!delta.content.empty()) {
-                                         nlohmann::json lp = nullptr;
-                                         if (want_logprobs) {
-                                             lp = nlohmann::json{{"content",
-                                                 build_logprobs_content_json(pending_logprobs, top_logprobs)}};
-                                             pending_logprobs.clear();
-                                         }
-                                         ok = write_stream_delta(gs, cid, created, "content", delta.content, ci, lp) && ok;
-                                     }
+                                                                  delta.reasoning_content, ci,
+                                                                  take_pending()) && ok;
+                                     if (!delta.content.empty())
+                                         ok = write_stream_delta(gs, cid, created, "content", delta.content,
+                                                                 ci, take_pending()) && ok;
                                      return ok && sink.is_writable();
                                  };
                                  const std::function<void(const sparkinfer_server::TokenLogprob&)> maybe_on_tok_logprob =
@@ -953,10 +1144,24 @@ int main(int argc, char** argv) {
                                      // never vetted -- generation ends at the match point regardless.
                                      sparkinfer_server::ThinkingStreamSplitter::Delta flush;
                                      splitter.finish(flush);
-                                     write_stream_delta(gs, cid, created, "reasoning_content",
-                                                        flush.reasoning_content, ci);
-                                     write_stream_delta(gs, cid, created, "content", flush.content, ci);
+                                     // Guarded on non-empty exactly like the on_tok path: arguments
+                                     // are evaluated before the call, and write_stream_delta drops
+                                     // empty pieces, so an unguarded take_pending() here would
+                                     // consume the entries and then throw them away with the
+                                     // delta -- and the safety net below could not see them,
+                                     // because the buffer would already be clear.
+                                     if (!flush.reasoning_content.empty())
+                                         write_stream_delta(gs, cid, created, "reasoning_content",
+                                                            flush.reasoning_content, ci, take_pending());
+                                     if (!flush.content.empty())
+                                         write_stream_delta(gs, cid, created, "content", flush.content,
+                                                            ci, take_pending());
                                  }
+                                 // Neither flush piece may have had text to hang them on. Emit
+                                 // them rather than lose them.
+                                 if (want_logprobs && !pending_logprobs.empty())
+                                     write_stream_logprobs_only(gs, cid, created, ci, take_pending(),
+                                                                "content");
                                  out->ttft_ms = outcome.ttft_ms;
                                  out->generation_ms = outcome.generation_ms;
                                  out->decode_tps = outcome.decode_tps;
@@ -1663,6 +1868,19 @@ int main(int argc, char** argv) {
                                      out->fail_message = outcome.error;
                                      return;
                                  }
+                                 // Entries whose tokens decoded to no text of their own (a
+                                 // stop-sequence holdback, a partial UTF-8 sequence) are still
+                                 // pending here and would otherwise be dropped, leaving the
+                                 // concatenated stream short of usage.completion_tokens -- the
+                                 // same defect the chat path had at its tail flush.
+                                 if (logprobs && !pending_logprobs.empty()) {
+                                     write_stream_logprobs_only(
+                                         gs, cid, created, ci,
+                                         build_legacy_logprobs_json(pending_logprobs, top_logprobs,
+                                                                    offset_so_far),
+                                         "text", "text_completion");
+                                     pending_logprobs.clear();
+                                 }
                                  out->ttft_ms = outcome.ttft_ms;
                                  out->generation_ms = outcome.generation_ms;
                                  out->decode_tps = outcome.decode_tps;
@@ -1951,6 +2169,22 @@ int main(int argc, char** argv) {
     // gap between "signal received" and "svr.stop() called" (at most one poll interval) only
     // means a few new requests might land right before shutdown starts, not that the drain window
     // is unbounded.
+    // Bind BEFORE the shutdown watcher exists. listen() returning early is ambiguous -- it means
+    // either "we were asked to stop" or "we could never start" -- and the old code treated both as
+    // a shutdown: a port clash printed "shutdown signal received, draining in-flight requests...",
+    // sat through the full 30s grace period, and only then said what had actually gone wrong.
+    // Under a supervisor that restart-loops, that reads as a server that starts and mysteriously
+    // stops. Splitting the bind out reports the real cause immediately, on the first line.
+    if (!svr.bind_to_port(host.c_str(), port)) {
+        fprintf(stderr,
+                "[sparkinfer-server] FATAL: cannot bind %s:%d (in use, or not permitted).\n"
+                "  Another process is probably already listening there -- check with:\n"
+                "    ss -tlnp | grep :%d\n"
+                "  Then free it or start with a different --port / PORT=<n>.\n",
+                host.c_str(), port, port);
+        return 1;
+    }
+
     std::thread shutdown_watcher([&svr] {
         while (!g_shutdown_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         fprintf(stderr, "[sparkinfer-server] shutdown signal received, draining in-flight requests...\n");
@@ -1981,16 +2215,15 @@ int main(int argc, char** argv) {
             "  GET  /metrics\n"
             "  POST /v1/tokenize\n"
             "  POST /v1/chat/completions\n"
-            "  read_timeout=%lds write_timeout=%lds max_output_tokens=%d max_queue_depth=%s\n",
+            "  POST /v1/completions\n"
+            "  POST /v1/score\n"
+            "  read_timeout=%lds write_timeout=%lds max_output_tokens=%d max_queue_depth=%s%s\n",
             host.c_str(), port, read_timeout_s, write_timeout_s, max_output_tokens(),
-            queue_depth_label.c_str());
+            queue_depth_label.c_str(),
+            sparkinfer::deterministic_mode() ? "  DETERMINISTIC=1 (bit-reproducible)" : "");
 
-    const bool bound = svr.listen(host.c_str(), port);
+    svr.listen_after_bind();   // bind already succeeded above; this only returns on stop()
     g_shutdown_requested = true;  // unblock the watcher thread if listen() returned on its own
     shutdown_watcher.join();
-    if (!bound) {
-        fprintf(stderr, "[sparkinfer-server] failed to bind %s:%d\n", host.c_str(), port);
-        return 1;
-    }
     return 0;
 }
