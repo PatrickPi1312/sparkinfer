@@ -27,6 +27,9 @@ constexpr int kMaxLogitBiasEntries = 1024;
 // (see ContinuousBatchEngine::submit_locked / max_queue_depth in sparkinfer_server.cpp); this
 // caps how much queue footprint one HTTP request can claim via n-fanout.
 constexpr int kMaxN = 8;
+// OpenAI's documented ceiling for top_logprobs, and the same bound Qwen35Model::last_token_logprobs
+// clamps to on the device side.
+constexpr int kMaxTopLogprobs = 20;
 
 constexpr const char* kImStart = "<|im_start|>";
 constexpr const char* kImEnd = "<|im_end|>";
@@ -1360,6 +1363,96 @@ bool parse_legacy_completion_request(const std::string& body, std::string& promp
         }
     }
     prompt_out = prompt;
+    return true;
+}
+
+bool parse_score_request(const std::string& body, ScoreRequest& out, std::string& err, int vocab) {
+    out = ScoreRequest{};
+    json root;
+    try {
+        root = json::parse(body);
+    } catch (const std::exception&) {
+        err = "invalid JSON body";
+        return false;
+    }
+    if (!root.is_object()) {
+        err = "body must be a JSON object";
+        return false;
+    }
+
+    const bool has_messages = root.contains("messages") && !root["messages"].is_null();
+    const bool has_prompt = root.contains("prompt") && !root["prompt"].is_null();
+    if (has_messages == has_prompt) {
+        err = "provide exactly one of `messages` or `prompt`";
+        return false;
+    }
+    out.use_messages = has_messages;
+    if (has_prompt) {
+        if (!root["prompt"].is_string()) {
+            err = "prompt must be a string";
+            return false;
+        }
+        out.prompt = root["prompt"].get<std::string>();
+        if (out.prompt.empty()) {
+            err = "prompt is empty";
+            return false;
+        }
+    }
+
+    const bool has_ids = root.contains("completion_token_ids") && !root["completion_token_ids"].is_null();
+    const bool has_text = root.contains("completion") && !root["completion"].is_null();
+    if (has_ids == has_text) {
+        err = "provide exactly one of `completion` or `completion_token_ids`";
+        return false;
+    }
+    if (has_ids) {
+        if (!root["completion_token_ids"].is_array()) {
+            err = "completion_token_ids must be an array of integers";
+            return false;
+        }
+        const auto& arr = root["completion_token_ids"];
+        if (arr.empty()) {
+            err = "completion_token_ids is empty (no tokens to score)";
+            return false;
+        }
+        out.completion_token_ids.reserve(arr.size());
+        for (const auto& v : arr) {
+            if (!v.is_number_integer() && !v.is_number_unsigned()) {
+                err = "completion_token_ids must contain only integers";
+                return false;
+            }
+            const long long t = v.get<long long>();
+            if (t < 0 || (vocab > 0 && t >= (long long)vocab)) {
+                err = "completion_token_ids entry out of range: " + std::to_string(t);
+                return false;
+            }
+            out.completion_token_ids.push_back((int)t);
+        }
+        out.completion_is_ids = true;
+    } else {
+        if (!root["completion"].is_string()) {
+            err = "completion must be a string";
+            return false;
+        }
+        out.completion = root["completion"].get<std::string>();
+        if (out.completion.empty()) {
+            err = "completion is empty (no tokens to score)";
+            return false;
+        }
+    }
+
+    if (root.contains("top_logprobs") && !root["top_logprobs"].is_null()) {
+        if (!root["top_logprobs"].is_number_integer()) {
+            err = "top_logprobs must be an integer";
+            return false;
+        }
+        const long long n = root["top_logprobs"].get<long long>();
+        if (n < 0 || n > kMaxTopLogprobs) {
+            err = "top_logprobs must be between 0 and " + std::to_string(kMaxTopLogprobs);
+            return false;
+        }
+        out.top_logprobs = (int)n;
+    }
     return true;
 }
 

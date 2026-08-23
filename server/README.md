@@ -58,6 +58,19 @@ export SPARKINFER_ROOT="$(pwd)"
 | `POST /v1/score` | **Teacher-forced scoring.** Per-token logprobs of a *supplied* continuation, no generation. See below. |
 | `POST /v1/chat/completions` | Chat (JSON `messages`, optional `tools`, `tool_choice`, `stream`, `enable_thinking`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) plus additive GPU timing fields (`ttft_ms`, `generation_ms`, `decode_tps`) that standard OpenAI SDKs ignore. With `stream_options.include_usage=true`, streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]`. A streaming client that disconnects mid-response cancels generation (checked via `DataSink::is_writable()`) instead of running to completion for nobody. Overload (no queue capacity) returns `429`; a request that exceeds `SPARKINFER_REQUEST_TIMEOUT_S` returns `504`. |
 
+### Streaming logprobs
+
+With `stream: true` and `logprobs: true`, each chunk's `logprobs.content` holds the entries for the
+tokens that produced *that chunk's* text, so concatenating them across the stream yields exactly one
+entry per generated token — the same array the non-streaming response returns, in the same order.
+Reasoning deltas carry their own tokens' entries (a sparkinfer extension: OpenAI has no
+`reasoning_content`), and if generation ends with entries whose tokens produced no text of their
+own, a final `content: ""` delta carries them rather than dropping them.
+
+Two earlier defects here are fixed: entries for tokens routed to `reasoning_content` used to be
+held back and attached to the next *content* chunk (so a chunk reported logprobs for tokens whose
+text it did not contain), and any entries still pending at end of generation were dropped outright.
+
 ### Teacher-forced scoring (`POST /v1/score`)
 
 Given a prompt and a completion you supply, returns the per-token logprob of each completion token

@@ -24,6 +24,8 @@ using sparkinfer_server::parse_chat_request_json;
 using sparkinfer_server::parse_legacy_completion_request;
 using sparkinfer_server::parse_qwen36_tool_output;
 using sparkinfer_server::parse_request_controls;
+using sparkinfer_server::parse_score_request;
+using sparkinfer_server::ScoreRequest;
 using sparkinfer_server::should_reject_dflash_logit_bias;
 using sparkinfer_server::should_reject_dflash_penalty;
 using sparkinfer_server::should_reject_dflash_temperature;
@@ -1417,6 +1419,96 @@ bool test_unsafe_protocol_names() {
 
 } // namespace
 
+
+// ---- POST /v1/score (teacher-forced scoring) -------------------------------------------------
+bool test_parse_score_request() {
+    ScoreRequest r;
+    std::string err;
+
+    // messages + completion text: the ordinary audit shape.
+    CHECK(parse_score_request(
+        R"({"model":"m","messages":[{"role":"user","content":"hi"}],"completion":"there"})", r, err));
+    CHECK(r.use_messages);
+    CHECK(r.prompt.empty());
+    CHECK(!r.completion_is_ids);
+    CHECK(r.completion == "there");
+    CHECK(r.top_logprobs == 0);
+
+    // prompt + token ids: the drift-free shape a verifier should prefer.
+    r = ScoreRequest{};
+    CHECK(parse_score_request(R"({"prompt":"raw text","completion_token_ids":[1,2,3]})", r, err));
+    CHECK(!r.use_messages);
+    CHECK(r.prompt == "raw text");
+    CHECK(r.completion_is_ids);
+    CHECK(r.completion_token_ids == std::vector<int>({1, 2, 3}));
+
+    // top_logprobs bounds.
+    r = ScoreRequest{};
+    CHECK(parse_score_request(R"({"prompt":"p","completion":"c","top_logprobs":20})", r, err));
+    CHECK(r.top_logprobs == 20);
+    CHECK(parse_score_request(R"({"prompt":"p","completion":"c","top_logprobs":0})", r, err));
+    CHECK(!parse_score_request(R"({"prompt":"p","completion":"c","top_logprobs":21})", r, err));
+    CHECK(contains(err, "between 0 and 20"));
+    CHECK(!parse_score_request(R"({"prompt":"p","completion":"c","top_logprobs":-1})", r, err));
+    CHECK(!parse_score_request(R"({"prompt":"p","completion":"c","top_logprobs":1.5})", r, err));
+    CHECK(contains(err, "must be an integer"));
+
+    // Exactly one prompt form. Both and neither are errors, NOT a silent precedence rule: a
+    // verifier that believes it pinned one and silently got the other compares the wrong thing.
+    CHECK(!parse_score_request(
+        R"({"messages":[{"role":"user","content":"hi"}],"prompt":"p","completion":"c"})", r, err));
+    CHECK(contains(err, "exactly one of `messages` or `prompt`"));
+    CHECK(!parse_score_request(R"({"completion":"c"})", r, err));
+    CHECK(contains(err, "exactly one of `messages` or `prompt`"));
+
+    // Exactly one completion form, same reasoning.
+    CHECK(!parse_score_request(R"({"prompt":"p","completion":"c","completion_token_ids":[1]})", r, err));
+    CHECK(contains(err, "exactly one of `completion` or `completion_token_ids`"));
+    CHECK(!parse_score_request(R"({"prompt":"p"})", r, err));
+    CHECK(contains(err, "exactly one of `completion` or `completion_token_ids`"));
+
+    // Nothing to score is an error, not a zero-length success -- a caller that gets back an empty
+    // logprobs array would read it as "scored, and it agreed".
+    CHECK(!parse_score_request(R"({"prompt":"p","completion":""})", r, err));
+    CHECK(contains(err, "no tokens to score"));
+    CHECK(!parse_score_request(R"({"prompt":"p","completion_token_ids":[]})", r, err));
+    CHECK(contains(err, "no tokens to score"));
+    CHECK(!parse_score_request(R"({"prompt":"","completion":"c"})", r, err));
+    CHECK(contains(err, "prompt is empty"));
+
+    // Token id typing and range. vocab=0 skips only the UPPER bound; negatives are always rejected.
+    CHECK(!parse_score_request(R"({"prompt":"p","completion_token_ids":[1,"2"]})", r, err));
+    CHECK(contains(err, "only integers"));
+    CHECK(!parse_score_request(R"({"prompt":"p","completion_token_ids":[1,-3]})", r, err));
+    CHECK(contains(err, "out of range"));
+    CHECK(!parse_score_request(R"({"prompt":"p","completion_token_ids":[1,999]})", r, err, /*vocab=*/100));
+    CHECK(contains(err, "out of range"));
+    CHECK(parse_score_request(R"({"prompt":"p","completion_token_ids":[1,99]})", r, err, /*vocab=*/100));
+    CHECK(parse_score_request(R"({"prompt":"p","completion_token_ids":[999999]})", r, err, /*vocab=*/0));
+    CHECK(!parse_score_request(R"({"prompt":"p","completion_token_ids":{"a":1}})", r, err));
+    CHECK(contains(err, "array of integers"));
+
+    // Wrong scalar types.
+    CHECK(!parse_score_request(R"({"prompt":123,"completion":"c"})", r, err));
+    CHECK(contains(err, "prompt must be a string"));
+    CHECK(!parse_score_request(R"({"prompt":"p","completion":123})", r, err));
+    CHECK(contains(err, "completion must be a string"));
+
+    // Malformed bodies.
+    CHECK(!parse_score_request("not json", r, err));
+    CHECK(contains(err, "invalid JSON"));
+    CHECK(!parse_score_request("[1,2,3]", r, err));
+    CHECK(contains(err, "must be a JSON object"));
+
+    // A completion that happens to contain an end marker is still just text to score -- nothing
+    // here may treat it as a stop condition (the engine's forced path suppresses EOS for the same
+    // reason: the caller is owed a logprob for every token they asked about).
+    r = ScoreRequest{};
+    CHECK(parse_score_request(R"({"prompt":"p","completion":"a<|im_end|>b"})", r, err));
+    CHECK(r.completion == "a<|im_end|>b");
+    return true;
+}
+
 int main() {
     if (!test_hermes_request_and_template()) return 1;
     if (!test_tool_history_round_trip()) return 1;
@@ -1461,6 +1553,7 @@ int main() {
     if (!test_should_reject_dflash_logit_bias()) return 1;
     if (!test_request_controls_n_validation()) return 1;
     if (!test_parse_legacy_completion_request()) return 1;
+    if (!test_parse_score_request()) return 1;
     if (!test_request_controls_legacy_logprobs_validation()) return 1;
     if (!test_malformed_and_unknown_calls()) return 1;
     if (!test_invalid_requests_and_duplicate_tools()) return 1;
