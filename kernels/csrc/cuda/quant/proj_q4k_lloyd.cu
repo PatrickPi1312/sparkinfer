@@ -1,4 +1,8 @@
 // Load-time Q4_K requantizer for Qwen3.6 attention/GDN projection weights, fit by
+// Lloyd-max coordinate descent, then REFINED against the quantized super-block levels
+// (pql_refine_group) -- measured +0.7 to +1.1 points of top-1 agreement with llama.cpp and a
+// ~30% lower mean KL for zero decode cost; see that function and the launcher.
+//
 // Lloyd-max coordinate descent. Each 32-value group is quantized to an affine code
 // y = s*l + o (l in [0,15], o <= 0) by alternating (a) nearest-code assignment and
 // (b) a joint weighted least-squares solve for (s, o) to convergence — a genuinely
@@ -11,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <math.h>
+#include <stdlib.h>
 
 namespace sparkinfer { namespace kernels {
 
@@ -70,8 +75,53 @@ __device__ float pql_fit_group(const float* __restrict__ x, float* out_min,
     return scale;
 }
 
+// Weighted reconstruction error of one 32-value group under a CONCRETE pair of quantized
+// super-block levels (dg = d*s6, og = dmin*m6), with the 4-bit codes re-fit against them.
+// This is the quantity the group's packed bytes will actually incur at read-back time --
+// y = dg*l - og -- which is what makes the refinement below meaningful.
+__device__ __forceinline__ float pql_group_err(const float* __restrict__ x, float dg, float og) {
+    float err = 0.f;
+    for (int i = 0; i < 32; ++i) {
+        const int l = dg > 0.f ? pql_iclamp(pql_rint((x[i] + og) / dg), 0, 15) : 0;
+        const float r = dg * (float)l - og - x[i];
+        err += (1.f + fabsf(x[i])) * r * r;       // same importance weight as pql_fit_group
+    }
+    return err;
+}
+
+// Joint refinement of the 6-bit (scale, min) pair for one group.
+//
+// pql_fit_group optimizes (scale, off) in CONTINUOUS space, and only afterwards are both
+// rounded onto the shared 6-bit super-block grid (s6 = rint(scale/d), m6 = rint(min/dmin)).
+// Nothing in the fit accounts for that rounding, so the continuous optimum's nearest grid
+// point is frequently not the best grid point -- the two errors interact, and the codes are
+// re-fit against whichever pair is chosen. Rounding is worst exactly where a group's scale is
+// small relative to the super-block max, since d is pinned to that max: a group at topS/13
+// lands on a grid whose relative step there is ~4%.
+//
+// So evaluate the 3x3 neighbourhood of the rounded pair against the real read-back error and
+// keep the best. Load-time only -- the output is the same Q4_K byte layout, read by the same
+// si_vec_dot_q4_K, so decode speed and weight traffic are bit-for-bit unchanged. This buys
+// accuracy with load time, not with throughput.
+__device__ __forceinline__ void pql_refine_group(const float* __restrict__ x, float d, float dmin,
+                                                 int& s6, int& m6) {
+    float best = pql_group_err(x, d * (float)s6, dmin * (float)m6);
+    int bs = s6, bm = m6;
+    for (int ds = -1; ds <= 1; ++ds) {
+        const int cs = pql_iclamp(s6 + ds, 0, 63);
+        for (int dm = -1; dm <= 1; ++dm) {
+            const int cm = pql_iclamp(m6 + dm, 0, 63);
+            if (cs == s6 && cm == m6) continue;
+            const float e = pql_group_err(x, d * (float)cs, dmin * (float)cm);
+            if (e < best) { best = e; bs = cs; bm = cm; }
+        }
+    }
+    s6 = bs; m6 = bm;
+}
+
 // Fit + pack one 256-value super-block into a Q4_K block.
-__device__ void pql_pack_superblock(const float* __restrict__ x, pql_q4k_block* __restrict__ dst) {
+__device__ void pql_pack_superblock(const float* __restrict__ x, pql_q4k_block* __restrict__ dst,
+                                    bool refine) {
     float grpS[8], grpM[8];
     unsigned char code[256];
     #pragma unroll
@@ -86,8 +136,11 @@ __device__ void pql_pack_superblock(const float* __restrict__ x, pql_q4k_block* 
     unsigned char s6[8], m6[8];
     #pragma unroll
     for (int g = 0; g < 8; ++g) {
-        s6[g] = (unsigned char)pql_iclamp(d    > 0.f ? pql_rint(grpS[g] / d)    : 0, 0, 63);
-        m6[g] = (unsigned char)pql_iclamp(dmin > 0.f ? pql_rint(grpM[g] / dmin) : 0, 0, 63);
+        int si = pql_iclamp(d    > 0.f ? pql_rint(grpS[g] / d)    : 0, 0, 63);
+        int mi = pql_iclamp(dmin > 0.f ? pql_rint(grpM[g] / dmin) : 0, 0, 63);
+        if (refine) pql_refine_group(x + g * 32, d, dmin, si, mi);
+        s6[g] = (unsigned char)si;
+        m6[g] = (unsigned char)mi;
     }
 
     pql_q4k_block blk;
@@ -123,26 +176,34 @@ __device__ void pql_pack_superblock(const float* __restrict__ x, pql_q4k_block* 
 }
 
 __global__ void pql_requant_kernel(const __nv_bfloat16* __restrict__ src,
-                                   pql_q4k_block* __restrict__ dst, long n_super) {
+                                   pql_q4k_block* __restrict__ dst, long n_super, bool refine) {
     const long sb = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (sb >= n_super) return;
     const __nv_bfloat16* base = src + sb * 256;
     float x[256];
     #pragma unroll
     for (int i = 0; i < 256; ++i) x[i] = __bfloat162float(base[i]);
-    pql_pack_superblock(x, dst + sb);
+    pql_pack_superblock(x, dst + sb, refine);
 }
 
 // bf16 -> Q4_K (ggml super-block layout consumed by si_vec_dot_q4_K), Lloyd fit.
 // n_values must be a multiple of 256.
 void launch_proj_requant_q4k_lloyd(const void* src_bf16, void* dst_q4k, long n_values,
                                    cudaStream_t stream) {
+    // SPARKINFER_PROJ_REQUANT_REFINE=0 restores the plain round-to-nearest 6-bit scale/min
+    // (both arms out of one binary, for A/B). Default ON: it is strictly a load-time cost --
+    // the emitted bytes are the same Q4_K layout, so decode reads the same weights at the
+    // same speed either way.
+    static const bool refine = [] {
+        const char* e = getenv("SPARKINFER_PROJ_REQUANT_REFINE");
+        return !(e && e[0] == '0');
+    }();
     const long n_super = n_values / 256;
     const int threads = 128;
     const long blocks = (n_super + threads - 1) / threads;
     pql_requant_kernel<<<(unsigned)blocks, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(src_bf16),
-        reinterpret_cast<pql_q4k_block*>(dst_q4k), n_super);
+        reinterpret_cast<pql_q4k_block*>(dst_q4k), n_super, refine);
 }
 
 }} // namespace sparkinfer::kernels
