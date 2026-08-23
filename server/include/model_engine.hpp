@@ -85,7 +85,8 @@ public:
     // token, only when logprobs is true AND this callback is non-null -- pass nullptr (not a
     // no-op lambda) when logprobs aren't wanted; see ContinuousBatchEngine::complete_streaming's
     // doc comment for why an always-non-null callback would defeat the "costs nothing extra when
-    // unused" property. Same "first token has no logprobs" v1 gap as above.
+    // unused" property. Fires for EVERY emitted token including the first -- the old "first token
+    // has no logprobs" gap is fixed in ContinuousBatchEngine::step_job()'s PREFILL branch.
     CompletionResult complete_streaming(const std::vector<int>& prompt_ids, int max_new_tokens,
                                         const std::function<bool(int)>& on_token,
                                         float temperature = 0.f, uint64_t seed = 0,
@@ -94,7 +95,17 @@ public:
                                         const std::vector<std::pair<int, float>>& logit_bias = {},
                                         bool logprobs = false, int top_logprobs = 0,
                                         const std::function<void(const TokenLogprob&)>&
-                                            on_token_logprob = nullptr);
+                                            on_token_logprob = nullptr,
+                                        const std::vector<int>& forced_tokens = {});
+
+    // TEACHER-FORCED SCORING (POST /v1/score): non-empty `forced_tokens` turns the call into a
+    // scoring pass instead of a generation. max_new_tokens must equal forced_tokens.size(); the
+    // emitted tokens ARE forced_tokens; each on_token_logprob entry carries that token's logprob
+    // under the distribution at its own position rather than the sampler's pick. Numerically
+    // identical to what /v1/chat/completions reports for the same token at the same position --
+    // same logits, same fp32 logsumexp (Qwen35Model::token_logprob_for). See
+    // ContinuousBatchEngine::Request::forced_tokens for the rest of the semantics.
+
 
     // Live occupancy, for capacity-reporting endpoints. 0/0 if the model isn't loaded yet.
     int active_requests() const;

@@ -1,5 +1,6 @@
 #include "chat_tokenizer.hpp"
 #include "model_engine.hpp"
+#include "sparkinfer/kernels/deterministic.h"
 
 #include <nlohmann/json.hpp>
 
@@ -521,6 +522,219 @@ int main(int argc, char** argv) {
         body << "{\"tokens\":" << ids.size() << ",\"max_context\":" << engine.max_seq()
              << ",\"max_output_tokens\":" << max_output_tokens() << ",\"model\":\"" << g_model_name << "\"}";
         res.set_content(body.str(), "application/json");
+    });
+
+    // ---- POST /v1/score : teacher-forced scoring -------------------------------------------
+    //
+    // Given a prompt and a SUPPLIED continuation, return the per-token logprob of each
+    // continuation token under the model, without generating anything. The audit primitive an
+    // external verifier needs: it can score any text (another server's answer, a perturbed
+    // reference, mirrored organic traffic) rather than being limited to comparing its own
+    // sampled output, so there is no finite answer set to memorise.
+    //
+    // Why a dedicated endpoint rather than OpenAI's legacy `/v1/completions` with
+    // `echo: true, logprobs: 1, max_tokens: 0`: echo's contract is to report logprobs for the
+    // PROMPT tokens, and this runtime cannot produce those -- batched prefill runs the LM head
+    // only at the final prompt position, so per-prompt-token logits do not exist without a
+    // second, batched LM-head pass over the whole prompt. Rather than half-implement echo and
+    // return a shape that silently omits most of what the field promises, /v1/score states
+    // exactly what it does. (`/v1/completions` keeps its existing echo behaviour: text only.)
+    //
+    // Request:
+    //   {"model": "...",
+    //    "messages": [...],            // chat-templated, exactly as /v1/chat/completions
+    //     OR "prompt": "raw text",     // no chat template applied
+    //    "completion": "text to score",
+    //     OR "completion_token_ids": [1,2,3],   // bypasses tokenisation entirely
+    //    "top_logprobs": 0-20,         // optional, per-position alternatives
+    //    "enable_thinking": bool}      // optional, same meaning as chat completions
+    //
+    // Response: token/token_id/logprob triples in generation order, plus sum_logprob and the
+    // same `usage` block (including the ttft_ms/generation_ms/decode_tps timing fields) every
+    // other endpoint reports.
+    svr.Post("/v1/score", [&engine](const httplib::Request& req, httplib::Response& res) {
+        if (!auth_ok(req)) {
+            res.status = 401;
+            res.set_content("{\"error\":{\"message\":\"unauthorized\"}}", "application/json");
+            return;
+        }
+        auto fail = [&res](int status, const std::string& msg) {
+            res.status = status;
+            res.set_content("{\"error\":{\"message\":\"" + json_escape(msg) + "\"}}",
+                            "application/json");
+        };
+
+        nlohmann::json root;
+        try {
+            root = nlohmann::json::parse(req.body);
+        } catch (const std::exception&) {
+            fail(400, "invalid JSON body");
+            return;
+        }
+        if (!root.is_object()) { fail(400, "body must be a JSON object"); return; }
+
+        const bool has_messages = root.contains("messages") && !root["messages"].is_null();
+        const bool has_prompt = root.contains("prompt") && !root["prompt"].is_null();
+        if (has_messages == has_prompt) {
+            fail(400, "provide exactly one of `messages` or `prompt`");
+            return;
+        }
+
+        // Prompt side.
+        std::vector<int> prompt_ids;
+        if (has_messages) {
+            const bool enable_thinking =
+                sparkinfer_server::parse_enable_thinking(req.body, engine.is_qwen38());
+            std::string err;
+            if (!encode_messages(req.body, prompt_ids, enable_thinking, err)) {
+                fail(400, err);
+                return;
+            }
+        } else {
+            if (!root["prompt"].is_string()) { fail(400, "prompt must be a string"); return; }
+            prompt_ids = g_tokenizer.encode_raw(root["prompt"].get<std::string>());
+        }
+        if (prompt_ids.empty()) { fail(400, "empty prompt"); return; }
+
+        // Completion side. Token ids win when both are present -- they are the unambiguous form,
+        // and a caller that supplies them is explicitly opting out of tokenisation drift.
+        std::vector<int> forced;
+        const bool has_ids = root.contains("completion_token_ids") &&
+                             !root["completion_token_ids"].is_null();
+        const bool has_text = root.contains("completion") && !root["completion"].is_null();
+        if (!has_ids && !has_text) {
+            fail(400, "provide `completion` (string) or `completion_token_ids` (array of ints)");
+            return;
+        }
+        if (has_ids) {
+            if (!root["completion_token_ids"].is_array()) {
+                fail(400, "completion_token_ids must be an array of integers");
+                return;
+            }
+            for (const auto& v : root["completion_token_ids"]) {
+                if (!v.is_number_integer() && !v.is_number_unsigned()) {
+                    fail(400, "completion_token_ids must contain only integers");
+                    return;
+                }
+                const long long t = v.get<long long>();
+                if (t < 0 || t >= engine.vocab()) {
+                    fail(400, "completion_token_ids entry out of range: " + std::to_string(t));
+                    return;
+                }
+                forced.push_back((int)t);
+            }
+        } else {
+            if (!root["completion"].is_string()) { fail(400, "completion must be a string"); return; }
+            forced = g_tokenizer.encode_raw(root["completion"].get<std::string>());
+        }
+        if (forced.empty()) { fail(400, "completion is empty (no tokens to score)"); return; }
+
+        int top_logprobs = 0;
+        if (root.contains("top_logprobs") && !root["top_logprobs"].is_null()) {
+            if (!root["top_logprobs"].is_number_integer()) {
+                fail(400, "top_logprobs must be an integer");
+                return;
+            }
+            const long long n = root["top_logprobs"].get<long long>();
+            if (n < 0 || n > 20) { fail(400, "top_logprobs must be between 0 and 20"); return; }
+            top_logprobs = (int)n;
+        }
+
+        // Bounded by the same per-request output cap generation uses, and by the live context.
+        if ((int)forced.size() > max_output_tokens()) {
+            fail(400, "completion has " + std::to_string(forced.size()) +
+                          " tokens, exceeds max_output_tokens=" + std::to_string(max_output_tokens()));
+            return;
+        }
+        if ((int)prompt_ids.size() + (int)forced.size() > engine.max_seq()) {
+            fail(400, "prompt + completion = " +
+                          std::to_string(prompt_ids.size() + forced.size()) +
+                          " tokens exceeds server ctx=" + std::to_string(engine.max_seq()));
+            return;
+        }
+
+        std::vector<sparkinfer_server::TokenLogprob> entries;
+        entries.reserve(forced.size());
+        auto outcome = engine.complete_streaming(
+            prompt_ids, (int)forced.size(), [](int) { return true; },
+            /*temperature=*/0.f, /*seed=*/0, /*top_k=*/0, /*top_p=*/1.0f,
+            /*presence_penalty=*/0.f, /*frequency_penalty=*/0.f, /*logit_bias=*/{},
+            /*logprobs=*/true, top_logprobs,
+            [&entries](const sparkinfer_server::TokenLogprob& tl) { entries.push_back(tl); },
+            forced);
+
+        if (!outcome.error.empty()) {
+            g_requests_total++;
+            if (outcome.overloaded) {
+                g_requests_overloaded++;
+                fail(429, outcome.error);
+            } else if (outcome.alloc_failed) {
+                g_requests_server_error++;
+                fail(503, outcome.error);
+            } else if (outcome.timed_out) {
+                g_requests_timeout++;
+                fail(504, outcome.error);
+            } else {
+                g_requests_client_error++;
+                fail(400, outcome.error);
+            }
+            return;
+        }
+
+        // The engine emits exactly the forced tokens, so a length mismatch here would mean the
+        // forced path silently diverged -- report it rather than returning a misaligned array
+        // that a verifier would compare position-by-position against its own reference.
+        if (outcome.tokens.size() != forced.size() || entries.size() != forced.size()) {
+            g_requests_total++;
+            g_requests_server_error++;
+            fail(500, "scoring returned " + std::to_string(entries.size()) + " logprobs for " +
+                          std::to_string(forced.size()) + " tokens");
+            return;
+        }
+
+        nlohmann::json tokens = nlohmann::json::array();
+        nlohmann::json token_ids = nlohmann::json::array();
+        nlohmann::json logprobs = nlohmann::json::array();
+        nlohmann::json alts = nlohmann::json::array();
+        double sum_logprob = 0.0;
+        for (const auto& e : entries) {
+            const auto piece = g_tokenizer.id_to_raw_piece(e.token_id);
+            tokens.push_back(piece.display);
+            token_ids.push_back(e.token_id);
+            logprobs.push_back(e.logprob);
+            sum_logprob += (double)e.logprob;
+            if (top_logprobs > 0) {
+                nlohmann::json per = nlohmann::json::array();
+                const int n = std::min((int)e.top_alternatives.size(), top_logprobs);
+                for (int i = 0; i < n; i++)
+                    per.push_back(token_logprob_entry_json(e.top_alternatives[i].first,
+                                                           e.top_alternatives[i].second));
+                alts.push_back(per);
+            }
+        }
+
+        nlohmann::json usage = {{"prompt_tokens", (int)prompt_ids.size()},
+                                {"completion_tokens", (int)forced.size()},
+                                {"total_tokens", (int)(prompt_ids.size() + forced.size())}};
+        if (outcome.ttft_ms >= 0) usage["ttft_ms"] = outcome.ttft_ms;
+        if (outcome.generation_ms >= 0) usage["generation_ms"] = outcome.generation_ms;
+        if (outcome.decode_tps >= 0) usage["decode_tps"] = outcome.decode_tps;
+
+        nlohmann::json body = {{"id", random_id()},
+                               {"object", "score"},
+                               {"model", g_model_name},
+                               {"tokens", tokens},
+                               {"token_ids", token_ids},
+                               {"logprobs", logprobs},
+                               {"sum_logprob", sum_logprob},
+                               {"usage", usage}};
+        if (top_logprobs > 0) body["top_logprobs"] = alts;
+
+        g_requests_total++;
+        g_requests_ok++;
+        g_prompt_tokens_total += prompt_ids.size();
+        g_completion_tokens_total += forced.size();
+        res.set_content(body.dump(), "application/json");
     });
 
     svr.Post("/v1/chat/completions",
@@ -1951,6 +2165,22 @@ int main(int argc, char** argv) {
     // gap between "signal received" and "svr.stop() called" (at most one poll interval) only
     // means a few new requests might land right before shutdown starts, not that the drain window
     // is unbounded.
+    // Bind BEFORE the shutdown watcher exists. listen() returning early is ambiguous -- it means
+    // either "we were asked to stop" or "we could never start" -- and the old code treated both as
+    // a shutdown: a port clash printed "shutdown signal received, draining in-flight requests...",
+    // sat through the full 30s grace period, and only then said what had actually gone wrong.
+    // Under a supervisor that restart-loops, that reads as a server that starts and mysteriously
+    // stops. Splitting the bind out reports the real cause immediately, on the first line.
+    if (!svr.bind_to_port(host.c_str(), port)) {
+        fprintf(stderr,
+                "[sparkinfer-server] FATAL: cannot bind %s:%d (in use, or not permitted).\n"
+                "  Another process is probably already listening there -- check with:\n"
+                "    ss -tlnp | grep :%d\n"
+                "  Then free it or start with a different --port / PORT=<n>.\n",
+                host.c_str(), port, port);
+        return 1;
+    }
+
     std::thread shutdown_watcher([&svr] {
         while (!g_shutdown_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         fprintf(stderr, "[sparkinfer-server] shutdown signal received, draining in-flight requests...\n");
@@ -1981,16 +2211,15 @@ int main(int argc, char** argv) {
             "  GET  /metrics\n"
             "  POST /v1/tokenize\n"
             "  POST /v1/chat/completions\n"
-            "  read_timeout=%lds write_timeout=%lds max_output_tokens=%d max_queue_depth=%s\n",
+            "  POST /v1/completions\n"
+            "  POST /v1/score\n"
+            "  read_timeout=%lds write_timeout=%lds max_output_tokens=%d max_queue_depth=%s%s\n",
             host.c_str(), port, read_timeout_s, write_timeout_s, max_output_tokens(),
-            queue_depth_label.c_str());
+            queue_depth_label.c_str(),
+            sparkinfer::deterministic_mode() ? "  DETERMINISTIC=1 (bit-reproducible)" : "");
 
-    const bool bound = svr.listen(host.c_str(), port);
+    svr.listen_after_bind();   // bind already succeeded above; this only returns on stop()
     g_shutdown_requested = true;  // unblock the watcher thread if listen() returned on its own
     shutdown_watcher.join();
-    if (!bound) {
-        fprintf(stderr, "[sparkinfer-server] failed to bind %s:%d\n", host.c_str(), port);
-        return 1;
-    }
     return 0;
 }

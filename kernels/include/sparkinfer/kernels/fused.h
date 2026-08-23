@@ -154,6 +154,44 @@ void launch_topk_topp_mask(float* logits, int vocab,
                            int* rank_by_id,
                            cudaStream_t stream = nullptr);
 
+// The non-destructive prefix of launch_topk_topp_mask: the descending sort, the stable-softmax
+// numerators + inverse permutation, and the cumulative sum -- everything Qwen35Model::
+// last_token_logprobs() reads, and nothing that writes to `logits`. launch_topk_topp_mask is
+// literally this call followed by its mask kernel, so a caller that only needs the reported
+// distribution gets bit-identical numbers to the decode path by construction rather than by
+// a comment asking two code paths to stay in step.
+//
+// Exists for the PREFILL seed token. The first token of a response is the argmax of the last
+// prompt position, produced by prefill_batched()'s own truncated LM-head tail rather than by
+// forward_token(), so none of this scratch was populated for it and the response's first token
+// had no logprob entry at all (`logprobs.content` came back completion_tokens-1 long). Unlike the
+// decode path this may be host-gated freely: it runs after the prefill graph capture has been
+// closed, so there is no frozen-topology constraint, and a full-vocab sort is worth skipping when
+// the request never asked for logprobs.
+//
+// `logits` is read-only here. Same scratch-lifetime rules as launch_topk_topp_mask: every buffer
+// is length `vocab`, allocated once with a fixed address, vocab_iota filled once at load time.
+// Deterministic replacement for reading the softmax normalizer off the end of the CUB scan.
+// CUB's DeviceScan decoupled look-back folds a timing-dependent number of predecessor tile
+// aggregates, so for fp32 its total varies by an ULP run to run -- and that ULP lands in
+// logsumexp, i.e. in every logprob reported at that position. This recomputes the same sum with
+// the summation tree pinned (fixed grid, ascending index at both levels). Used only under
+// SPARKINFER_DETERMINISTIC=1; the default path keeps the free scan read.
+//
+//   topk_exp   [vocab] softmax numerators, as written by launch_logprob_distribution
+//   partials   [256] fp32 scratch, allocated once
+//   out        [1] fp32, receives the total
+void launch_logprob_denom_det(const float* topk_exp, int vocab, float* partials, float* out,
+                              cudaStream_t stream = nullptr);
+
+void launch_logprob_distribution(const float* logits, int vocab,
+                                 const int* vocab_iota, float* sorted_logits, int* sorted_idx,
+                                 float* topk_exp, float* topk_cumsum,
+                                 void* sort_temp, size_t sort_temp_bytes,
+                                 void* scan_temp, size_t scan_temp_bytes,
+                                 int* rank_by_id,
+                                 cudaStream_t stream = nullptr);
+
 // Looks up the raw (pre-mask, pre-temperature-noise) logit of *out_id (whatever launch_argmax
 // picked, downstream of launch_temperature_sample -- not necessarily rank 0 once real temperature
 // sampling is active) via rank_by_id + sorted_logits from the launch_topk_topp_mask call that

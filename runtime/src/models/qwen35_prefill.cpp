@@ -22,6 +22,7 @@
 #include "sparkinfer/kernels/prefill_i8.h"
 #include "sparkinfer/kernels/prefill_fp8.h"
 #include "sparkinfer/kernels/prefill_moe.h"
+#include "sparkinfer/kernels/deterministic.h"
 #include "sparkinfer/kernels/prefill_router_mma.h"
 #include "sparkinfer/kernels/prefill_moe_q.h"
 #include "sparkinfer/kernels/prefill_nvfp4.h"
@@ -789,6 +790,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     // old L2 path back on for A/B; GROUP default 32.
     const bool moe_serial = [&]{
         if (!moe || moe_fused) return false;
+        // Deterministic mode routes every MoE prefill through the bulk path below, whose down
+        // projection has the per-pair-destination combine wired up (down_dst/down_out). The
+        // group and dual-stream variants inside this branch still scatter into one shared
+        // accumulator, so allowing them here would silently reintroduce the nondeterminism this
+        // mode exists to remove. Not a real loss: for every default Qwen3.6 shape this already
+        // evaluates false (moe_bm==16 && moe_qb_avail at N<=512, and N<=512 is false above it).
+        if (sparkinfer::deterministic_mode()) return false;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_SERIAL");
         if (e) return e[0] != '0';
         if (moe_bm == 16 && moe_qb_avail) return false;
@@ -852,6 +860,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     float *mlogits = nullptr, *mweights = nullptr, *pair_w = nullptr, *routed_f32 = nullptr, *dw = nullptr;
     int *mids = nullptr, *mcounts = nullptr, *moffsets = nullptr, *mcursors = nullptr;
     int *pair_tok = nullptr, *tilemap = nullptr, *d_ntiles = nullptr, *d_live_le = nullptr;
+    // Deterministic MoE combine (SPARKINFER_DETERMINISTIC=1): per-pair destinations + partials.
+    // See kernels/prefill_moe.h's launch_pfm_moe_combine_det for why this removes the dominant
+    // source of run-to-run nondeterminism, and why it needs no change to the GEMM kernels.
+    int* pair_orig = nullptr;
+    float* moe_part = nullptr;
     bf16 *hg = nullptr, *hu = nullptr, *hh = nullptr, *sfg = nullptr, *sfu = nullptr, *sfh = nullptr;
     if (moe) {
         if (!moe_fused) {
@@ -882,6 +895,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         h_i8 = am.alloc<signed char>((size_t)P * mffn);
         sh = am.alloc<float>((size_t)P);
         routed_f32 = am.alloc<float>((size_t)N * H);
+        if (sparkinfer::deterministic_mode()) {
+            pair_orig = am.alloc<int>((size_t)P);
+            moe_part = am.alloc<float>((size_t)P * H);   // P = N*topk, so topk x routed_f32
+        }
         dw = am.alloc<float>((size_t)N);
         mA_i8 = am.alloc<signed char>((size_t)N * H);          // int8 activation for the grouped GEMMs
         msx = am.alloc<float>((size_t)N);
@@ -1768,7 +1785,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             pf_cu(cudaMemsetAsync(mcounts, 0, E * sizeof(int), st), "moe counts zero");
             kernels::launch_moe_router(mlogits, mids, mweights, mcounts, N, E, topk, 1, st);
             kernels::launch_pfm_bucket_pairs_bm(mids, mweights, mcounts, moffsets, mcursors,
-                                                pair_tok, pair_w, tilemap, d_ntiles, N, E, topk, moe_bm, st);
+                                                pair_tok, pair_w, tilemap, d_ntiles, N, E, topk, moe_bm, st,
+                                                pair_orig);
+            // Deterministic combine: hand the DOWN projection per-pair destinations and a partials
+            // buffer instead of token destinations and the shared accumulator, so its C_SCATTER
+            // epilogue writes one value per address rather than racing top_k of them into one.
+            // Only the down projection -- gate/up pass a_indirect=true and index activations
+            // THROUGH pair_tok, which must stay real token ids.
+            const bool det_moe = moe_part != nullptr && pair_orig != nullptr;
+            const int* down_dst = det_moe ? pair_orig : pair_tok;
+            float* down_out = det_moe ? moe_part : routed_f32;
+            const size_t down_zero_elems = det_moe ? (size_t)P * H : (size_t)N * H;
             kernels::launch_prefill_quantize_rows_i8(hn, mA_i8, msx, N, H, st);
             bool sg_hid = false;  // shared-gate scalar already on stream_k
             if (moe_fused) {
@@ -1780,10 +1807,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                 moffsets, tilemap, d_ntiles, hu, nullptr, mffn, H, max_tiles,
                                                 true, false, st);
                 kernels::launch_prefill_swiglu_quant_i8(hg, hu, h_i8, sh, P, mffn, st);
-                pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
-                kernels::launch_pfm_moe_gemm_qk(h_i8, sh, w.down_q, w.down_qtype, pair_tok, pair_w,
-                                                moffsets, tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles,
+                pf_cu(cudaMemsetAsync(down_out, 0, down_zero_elems * sizeof(float), st), "routed zero");
+                kernels::launch_pfm_moe_gemm_qk(h_i8, sh, w.down_q, w.down_qtype, down_dst, pair_w,
+                                                moffsets, tilemap, d_ntiles, nullptr, down_out, H, mffn, max_tiles,
                                                 /*a_indirect=*/false, /*c_scatter=*/true, st);
+                if (det_moe) kernels::launch_pfm_moe_combine_det(moe_part, routed_f32, N, topk, H, st);
             } else if (moe_serial) {
                 // Expert-group L2 path on top of main(#561), tuned for N≈512:
                 //   - D2H counts, skip empty groups, exact-ntm GEMM grids
@@ -2192,19 +2220,20 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
                                                            true, false, st);
                 }
                 kernels::launch_prefill_swiglu_quant_i8(hg, hu, h_i8, sh, P, mffn, st);
-                pf_cu(cudaMemsetAsync(routed_f32, 0, (size_t)N * H * sizeof(float), st), "routed zero");
+                pf_cu(cudaMemsetAsync(down_out, 0, down_zero_elems * sizeof(float), st), "routed zero");
                 bool qb_d = false;
                 if (rs_d && (moe_qb_mask & 4))
                     qb_d = kernels::launch_pfm_moe_gemm_qi8(
-                        w.down_qtype, h_i8, sh, w.down_q, rs_d, pair_tok, pair_w, moffsets,
-                        tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles, moe_bm,
+                        w.down_qtype, h_i8, sh, w.down_q, rs_d, down_dst, pair_w, moffsets,
+                        tilemap, d_ntiles, nullptr, down_out, H, mffn, max_tiles, moe_bm,
                         /*a_indirect=*/false, /*c_scatter=*/true, st);
                 if (!qb_d) {
                     kernels::launch_gguf_dequant_rows_i8(w.down_qtype, w.down_q, Wd_i8, swd, E * H, mffn, st);
-                    kernels::launch_pfm_moe_gemm_i8_bm(h_i8, sh, Wd_i8, swd, pair_tok, pair_w, moffsets,
-                                                       tilemap, d_ntiles, nullptr, routed_f32, H, mffn, max_tiles, moe_bm,
+                    kernels::launch_pfm_moe_gemm_i8_bm(h_i8, sh, Wd_i8, swd, down_dst, pair_w, moffsets,
+                                                       tilemap, d_ntiles, nullptr, down_out, H, mffn, max_tiles, moe_bm,
                                                        /*a_indirect=*/false, /*c_scatter=*/true, st);
                 }
+                if (det_moe) kernels::launch_pfm_moe_combine_det(moe_part, routed_f32, N, topk, H, st);
             }
             // Shared expert (Qwen3.6 UD): out scaled by sigmoid(hn . gate_inp) per token.
             bf16* shared_out = nullptr;

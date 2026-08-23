@@ -332,6 +332,14 @@ public:
     // graph replay safety regardless of whether THIS request wants logprobs).
     TokenLogprob last_token_logprobs(int top_n = kMaxTopLogprobs) const;
 
+    // Same distribution, different token: reports the logprob of `token_id` (any vocab entry)
+    // under whatever distribution the preceding forward_token()/prefill produced, instead of the
+    // argmax's. The primitive teacher-forced scoring is built on -- feed position i, ask for the
+    // logprob of the token that ACTUALLY follows at i+1, regardless of what the model would have
+    // picked. Same validity window and top_alternatives semantics as last_token_logprobs(); an
+    // out-of-range token_id returns a default-constructed (token_id = -1) entry.
+    TokenLogprob token_logprob_for(int token_id, int top_n = kMaxTopLogprobs) const;
+
     struct BenchDecodeResult {
         double decode_tps = 0;
         double prefill_pp = 0;
@@ -351,7 +359,11 @@ public:
     // (Qwen3.6-35B-A3B) and the dense-FFN Qwen3.8-27B both take this path, as does Muse Glimmer.
     // The eligibility checks at the top of prefill_batched_run (qwen35_prefill.cpp) are
     // authoritative -- do not infer the supported set from here.
-    int prefill_batched(const int* prompt_ids, int n);
+    // want_seed_logprob additionally leaves the sampler-scratch distribution populated for the
+    // seed token, so last_token_logprobs() is valid immediately after this returns -- see
+    // ingest_prompt_range's identical parameter. Off by default: it costs a full-vocab sort, and
+    // the seed's logprob is only wanted when the request asked for logprobs.
+    int prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob = false);
 
     // Prefill prompt tokens [start, end) with the batched path when start==0 and eligible, else
     // the token loop. chunk_limit > 0 caps the token-loop path to at most chunk_limit tokens per
@@ -364,8 +376,15 @@ public:
     // ContinuousBatchEngine::step_job()'s continuous-batch path dispatch prefill through, so
     // batched-vs-token-loop routing and external KV cache lookup/store (when a bridge is
     // attached via set_lmcache_bridge()) only need to be implemented once.
+    //
+    // want_seed_logprob: leave the sampler scratch populated for the seed token so that
+    // last_token_logprobs() is valid for it once this returns out_pos == end. The token-loop path
+    // gets this for free (its final forward_token(sample=true) runs the whole sampler tail), but
+    // the batched path's own LM-head tail stops at argmax, which is why the first token of every
+    // response had no logprob entry. Off by default: a full-vocab sort is not worth paying when
+    // the caller never asked for logprobs.
     int ingest_prompt_range(const int* ids, int start, int end, int chunk_limit = 0,
-                            int* out_pos = nullptr);
+                            int* out_pos = nullptr, bool want_seed_logprob = false);
 
     // Attaches an optional external KV cache tier (docs/lmcache_bridge_protocol.md). Null (the
     // default) leaves every lookup/store call site a no-op -- existing behavior is unchanged

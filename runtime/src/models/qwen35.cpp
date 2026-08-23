@@ -31,6 +31,7 @@
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/prefill.h"   // launch_prefill_swiglu, for the NVFP4 decode FFN
 #include "sparkinfer/kernels/fused.h"
+#include "sparkinfer/kernels/deterministic.h"
 #include "sparkinfer/kernels/moe.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/qtype.h"
@@ -263,6 +264,13 @@ struct Qwen35Model::Impl {
     // by launch_extract_chosen_logit. See Qwen35Model::last_token_logprobs's doc comment.
     int* d_rank_by_id = nullptr;
     float* d_chosen_logit = nullptr;
+    // Device staging for token_logprob_for()'s arbitrary token id. The decode graph bakes
+    // d_out_id into its captured launch_extract_chosen_logit node, so a teacher-forced caller
+    // that wants some OTHER token's logit has to re-run that kernel against its own id buffer.
+    int* d_score_id = nullptr;
+    // Deterministic-mode softmax normalizer (see launch_logprob_denom_det). 256 partials + total.
+    float* d_denom_partials = nullptr;
+    float* d_denom_det = nullptr;
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
     // GGUF fused-expert decode scratch (allocated by load_gguf)
@@ -498,6 +506,9 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // topk_topp_exp_kernel fully overwrites it every decode step before it is ever read.
     p_->d_rank_by_id=p_->alloc<int>(cfg.vocab);
     p_->d_chosen_logit=p_->alloc<float>(1);
+    p_->d_score_id=p_->alloc<int>(1);
+    p_->d_denom_partials=p_->alloc<float>(256);
+    p_->d_denom_det=p_->alloc<float>(1);
     p_->d_shared_ids=p_->alloc<int>(1); p_->d_shared_w=p_->alloc<float>(1);
     int zero=0; float one=1.f;
     cu(cudaMemcpy(p_->d_shared_ids,&zero,sizeof(int),cudaMemcpyHostToDevice),"shared ids");
@@ -652,7 +663,8 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->d_vocab_iota); cudaFree(p_->d_sorted_logits); cudaFree(p_->d_sorted_idx);
     cudaFree(p_->d_topk_exp); cudaFree(p_->d_topk_cumsum);
     cudaFree(p_->d_sort_temp); cudaFree(p_->d_scan_temp);
-    cudaFree(p_->d_rank_by_id); cudaFree(p_->d_chosen_logit);
+    cudaFree(p_->d_rank_by_id); cudaFree(p_->d_chosen_logit); cudaFree(p_->d_score_id);
+    cudaFree(p_->d_denom_partials); cudaFree(p_->d_denom_det);
     cudaFree(p_->d_shared_ids); cudaFree(p_->d_shared_w);
     // Qwen3.6 Gated-DeltaNet buffers (allocated only for the hybrid model)
     cudaFree(p_->qraw); cudaFree(p_->qgate);
@@ -710,7 +722,18 @@ Qwen35Model::TokenLogprob Qwen35Model::last_token_logprobs(int top_n) const {
     out.token_id = *s.h_out_id;   // already synced by forward_token() before it returned
 
     float denom = 1.f, chosen_logit = 0.f;
-    cudaMemcpy(&denom, s.d_topk_cumsum + (s.cfg.vocab - 1), sizeof(float), cudaMemcpyDeviceToHost);
+    if (deterministic_mode()) {
+        // Recompute the normalizer with a pinned summation order instead of reading the CUB
+        // scan's last element, whose low bit is timing-dependent -- see launch_logprob_denom_det.
+        // Legal to branch on here (unlike inside the captured decode graph) because this runs on
+        // the host after forward_token() has already returned.
+        kernels::launch_logprob_denom_det(s.d_topk_exp, s.cfg.vocab, s.d_denom_partials,
+                                          s.d_denom_det, s.stream);
+        cu(cudaStreamSynchronize(s.stream), "logprob denom sync");
+        cudaMemcpy(&denom, s.d_denom_det, sizeof(float), cudaMemcpyDeviceToHost);
+    } else {
+        cudaMemcpy(&denom, s.d_topk_cumsum + (s.cfg.vocab - 1), sizeof(float), cudaMemcpyDeviceToHost);
+    }
     cudaMemcpy(&chosen_logit, s.d_chosen_logit, sizeof(float), cudaMemcpyDeviceToHost);
 
     float row_max = 0.f;
@@ -730,6 +753,27 @@ Qwen35Model::TokenLogprob Qwen35Model::last_token_logprobs(int top_n) const {
     out.logprob = chosen_logit - logsumexp;
     out.top_alternatives.reserve((size_t)top_n);
     for (int i = 0; i < top_n; i++) out.top_alternatives.emplace_back(ids[i], logits[i] - logsumexp);
+    return out;
+}
+
+Qwen35Model::TokenLogprob Qwen35Model::token_logprob_for(int token_id, int top_n) const {
+    Impl& s = *p_;
+    TokenLogprob out;
+    if (token_id < 0 || token_id >= s.cfg.vocab) return out;   // caller validates; be defensive
+    // The sort/scan half of the distribution (d_sorted_logits / d_topk_cumsum / d_rank_by_id) is
+    // whatever the preceding forward_token() or prefill left behind and is reused as-is -- it
+    // describes the full vocab, so it already contains this token's logit at rank
+    // d_rank_by_id[token_id]. Only the single-element "which token did we pick" extraction has to
+    // be redone, which is the same <<<1,1>>> kernel the decode path runs, pointed at our id
+    // instead of the argmax's. That keeps a teacher-forced score numerically IDENTICAL to what
+    // /v1/chat/completions would report for the same token at the same position: same logits,
+    // same fp32 logsumexp, same subtraction.
+    cudaMemcpy(s.d_score_id, &token_id, sizeof(int), cudaMemcpyHostToDevice);
+    kernels::launch_extract_chosen_logit(s.d_score_id, s.d_rank_by_id, s.d_sorted_logits,
+                                         s.d_chosen_logit, s.stream);
+    cu(cudaStreamSynchronize(s.stream), "token_logprob_for sync");
+    out = last_token_logprobs(top_n);   // reads the d_chosen_logit we just rewrote
+    out.token_id = token_id;            // ...whose token_id would otherwise be the argmax's
     return out;
 }
 
@@ -2408,7 +2452,7 @@ bool Qwen35Model::prompt_matches_prefix(const std::vector<int>& prompt) const {
 }
 
 int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chunk_limit,
-                                     int* out_pos) {
+                                     int* out_pos, bool want_seed_logprob) {
     Impl& s = *p_;
     if (!ids || end <= start) {
         if (out_pos) *out_pos = start;
@@ -2419,7 +2463,7 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
     // only eligible on the very first call for this range (start==0) and always covers the
     // whole [0,end) in one pass regardless of chunk_limit.
     if (start == 0 && batched_prefill_enabled(s.gguf, s.cfg, n)) {
-        int seed = prefill_batched(ids, n);
+        int seed = prefill_batched(ids, n, want_seed_logprob);
         if (seed >= 0 && seed < s.cfg.vocab) {
             if (out_pos) *out_pos = end;
             return seed;
@@ -2589,7 +2633,7 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 
 // Thin adapter: hand the batched-prefill orchestration (qwen35_prefill.cpp) exactly the scratch
 // buffers, streams and config it needs, so Impl stays private to this file.
-int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
+int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob) {
     Impl& s = *p_;
     auto it = s.sessions.find(s.active_seq_id);
     float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
@@ -2600,7 +2644,38 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
                           s.emb_norm_ones,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits };
-    return prefill_batched_run(ctx, prompt_ids, n);
+    const int seed = prefill_batched_run(ctx, prompt_ids, n);
+    // Seed-token logprob (see ingest_prompt_range's want_seed_logprob). prefill_batched_run's
+    // LM-head tail stops at argmax -- it never runs the sort/scan that last_token_logprobs()
+    // reads -- so without this the FIRST token of every response has no logprob entry and
+    // `logprobs.content` comes back one short of usage.completion_tokens.
+    //
+    // Deliberately here in the adapter rather than inside prefill_batched_run: this is the one
+    // point both of that function's exits pass through (the full pass AND the CUDA-graph replay
+    // fast path), it needs Impl's sampler scratch which Qwen35PrefillCtx does not carry, and it
+    // must stay OUTSIDE the prefill graph capture -- the capture is closed by the time control
+    // returns here, so a plain host-side `if` is legal, which it would not be inside the
+    // captured region.
+    //
+    // s.logits still holds this call's last-position logits and d_out_id the argmax of them:
+    // both are dedicated Impl buffers, not arena scratch, so the arena release at the end of
+    // prefill_batched_run cannot have clobbered them. The distribution is computed from those
+    // logits UNCHANGED, so the seed token reported here is exactly the token already chosen --
+    // this reports, it never re-decides.
+    if (seed >= 0 && want_seed_logprob) {
+        kernels::launch_logprob_distribution(s.logits, s.cfg.vocab, s.d_vocab_iota,
+                                             s.d_sorted_logits, s.d_sorted_idx, s.d_topk_exp,
+                                             s.d_topk_cumsum, s.d_sort_temp, s.sort_temp_bytes,
+                                             s.d_scan_temp, s.scan_temp_bytes, s.d_rank_by_id,
+                                             s.stream);
+        kernels::launch_extract_chosen_logit(s.d_out_id, s.d_rank_by_id, s.d_sorted_logits,
+                                             s.d_chosen_logit, s.stream);
+        // last_token_logprobs() reads this scratch with blocking cudaMemcpy on the legacy default
+        // stream, which is not ordered against s.stream -- sync here, exactly as forward_token()
+        // does before returning, so that contract ("valid after the call returns") holds.
+        cu(cudaStreamSynchronize(s.stream), "prefill seed logprob sync");
+    }
+    return seed;
 }
 
 int Qwen35Model::session_token_budget(size_t prompt_len, int max_new, int max_seq) {

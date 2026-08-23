@@ -39,6 +39,7 @@
 // range is computed once per block and only the causal bound varies per row.
 // ============================================================================
 #include "sparkinfer/kernels/prefill_attn_mma.h"
+#include "sparkinfer/kernels/deterministic.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -627,10 +628,29 @@ bool launch_prefill_attn_mma(
     }();
     // GQA fusion: one block owns RQH q-heads sharing a kv-head, so each K page / V tile
     // is loaded once and fed RQH mma's instead of being re-read per q-head. RQH=1 disables.
+    //
+    // DEFAULTS TO 1 (fusion off) IN DETERMINISTIC MODE. The GQA-fused tiers are both
+    // nondeterministic and materially INACCURATE once n_tokens passes ~2048 with int8 KV.
+    // Measured on an RTX 5090, Qwen3.6-35B-A3B (GQA-6), qwen3_gguf_prefill_check against the
+    // token-loop reference, mean KL over 16 teacher-forced positions:
+    //
+    //     prefix   1500      2000      2100      3000      4000
+    //     fused    0.00043   0.00022   0.18672   0.20657   0.23978   <- and varies run to run
+    //     RQH=1    ~0.0001   ~0.0001   ~0.0001   ~0.0001   0.00008   <- stable
+    //
+    // The cliff is exactly at 2048 and it is not the RQH=3 tier's `n_tokens >= 2048` gate:
+    // RQH=2 is selected both below and above it and is equally wrong above, so the length
+    // dependence lives inside launch_attn_gqa itself. Only RQH=1, which skips the fused family
+    // for the per-q-head fallback, is correct there. That is a PRE-EXISTING defect independent of
+    // this mode -- it is the default serving path today, and the server enables int8 KV whenever
+    // max_seq >= 4096 -- and it is left ON by default here rather than silently changed, because
+    // turning it off moves the long-context prefill numbers the eval scores against. It is
+    // reported separately; deterministic mode simply refuses to build on top of it.
     static const int gqa_rqh = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA_RQH");
-        const int v = e ? atoi(e) : 4;
-        return (v == 1 || v == 2 || v == 3 || v == 4) ? v : 4;
+        const int dflt = deterministic_mode() ? 1 : 4;
+        const int v = e ? atoi(e) : dflt;
+        return (v == 1 || v == 2 || v == 3 || v == 4) ? v : dflt;
     }();
 
     if (!enabled || head_dim != HD || block_size != 16 || n_tokens < minctx) return false;

@@ -63,11 +63,16 @@ public:
         // on_token_logprob callback (complete_streaming's new trailing param), not this struct --
         // pure data here, same as every other sampling control.
         //
-        // KNOWN v1 GAP: the prefill-phase seed token (this response's very first token) never
-        // gets a last_token_logprobs() call -- same root cause as temperature's "first token is
-        // always greedy" gap above (ingest_prompt_range() is a funnel shared by other callers,
-        // not worth threading through for one token). Callers should expect one fewer logprobs
-        // entry than emitted tokens.
+        // One entry per emitted token, including the first. The prefill-phase seed token (this
+        // response's very first token) is produced by ingest_prompt_range() rather than
+        // forward_token(), so it used to get no last_token_logprobs() call at all and callers
+        // saw one FEWER entry than emitted tokens; step_job()'s PREFILL branch now asks prefill
+        // to leave the sampler distribution populated for the seed and stages its logprob the
+        // same way decode stages every other token's.
+        //
+        // The temperature gap below is NOT fixed by that and still stands: the seed is still
+        // always the greedy argmax. The logprob reported for it is the true logprob of the token
+        // that was actually emitted either way, so the two are independent.
         bool logprobs = false;
         int top_logprobs = 0;   // 0-20; only meaningful when logprobs is true
         // OpenAI's logit_bias: (token_id, bias in [-100,100]) pairs, added to every vocab logit
@@ -81,6 +86,28 @@ public:
         // `job.req = req;`, same safe-across-the-async-worker-boundary mechanism `prompt` already
         // relies on.
         std::vector<std::pair<int, float>> logit_bias;
+        // TEACHER-FORCED SCORING. Non-empty => this request does not generate: it replays exactly
+        // these tokens as its output and reports what the model thought of each one. Every decode
+        // step still runs a real forward pass (so KV/GDN state advances exactly as it would while
+        // generating), but the token emitted is forced_tokens[i] instead of the sampler's pick,
+        // and the logprob reported for it is that token's logprob under the distribution at its
+        // own position -- see Qwen35Model::token_logprob_for().
+        //
+        // Deliberately routed through the ordinary Job/step_job machinery rather than an
+        // exclusive direct-model path: scoring then inherits continuous batching, right-sized KV
+        // allocation, admission control/429 and the request deadline, and shares one code path
+        // (and therefore one set of numerics) with generation.
+        //
+        // Semantics when set:
+        //   * max_new_tokens should equal forced_tokens.size(); scoring stops on that limit.
+        //   * EOS does NOT stop generation -- a supplied completion may legitimately contain one,
+        //     and truncating there would silently score fewer tokens than the caller asked about.
+        //   * sampling controls (temperature/top_k/top_p/penalties/logit_bias) are irrelevant to
+        //     the OUTPUT (the tokens are given) but are still applied to the logits, so leave
+        //     them at their defaults for a faithful score.
+        //   * the LAST forced token costs no forward pass: its logprob comes from the position
+        //     before it, and nothing is predicted after it.
+        std::vector<int> forced_tokens;
     };
 
     struct Result {

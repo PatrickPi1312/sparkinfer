@@ -75,13 +75,40 @@ __global__ void pfm_scatter_kernel(const int* __restrict__ expert_ids,
                                    const float* __restrict__ expert_weights,
                                    const int* __restrict__ offsets, int* __restrict__ cursors,
                                    int* __restrict__ pair_tok, float* __restrict__ pair_w,
+                                   int* __restrict__ pair_orig,
                                    int n_pairs, int top_k) {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_pairs) return;
     const int e = expert_ids[p];
+    // Which slot a pair lands in is decided by an atomic cursor, so the slot ORDER within an
+    // expert varies run to run. That alone is harmless (each pair computes the same value
+    // wherever it sits), but it is why the C_SCATTER epilogue's accumulation order into a token's
+    // row varies -- which is not harmless in fp32. pair_orig records the pair's ORIGINAL index
+    // p = token*top_k + rank, which is stable by construction; the deterministic MoE combine
+    // (launch_pfm_moe_combine_det) uses it as a per-pair destination so no two pairs ever share
+    // an accumulator. Optional: nullptr on the default path costs nothing.
     const int slot = offsets[e] + atomicAdd(&cursors[e], 1);
     pair_tok[slot] = p / top_k;
     pair_w[slot]   = expert_weights[p];
+    if (pair_orig) pair_orig[slot] = p;
+}
+
+// Fixed-order combine of the per-pair partials the deterministic path produces.
+// out[t*n_cols + c] = sum over the token's top_k slots, ascending rank. One thread per output
+// element; the summation order is the loop order, identical on every run and every launch shape.
+__global__ void pfm_moe_combine_det_kernel(const float* __restrict__ part,
+                                           float* __restrict__ out,
+                                           int n_tokens, int top_k, int n_cols) {
+    const long long total = (long long)n_tokens * n_cols;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long long)gridDim.x * blockDim.x) {
+        const int t = (int)(i / n_cols);
+        const int c = (int)(i - (long long)t * n_cols);
+        float acc = 0.f;
+        for (int k = 0; k < top_k; k++)
+            acc += part[((long long)t * top_k + k) * n_cols + c];
+        out[i] = acc;
+    }
 }
 
 // Device-side tilemap for one expert group [e_base, e_base+n_in). Replaces the host
@@ -815,12 +842,21 @@ void launch_pfm_bucket_pairs_bm(const int* expert_ids, const float* expert_weigh
                                 int* pair_tok, float* pair_w,
                                 int* tilemap, int* d_ntiles,
                                 int n_tokens, int n_experts, int top_k, int bm,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, int* pair_orig) {
     pfm_scan_tiles_kernel<<<1, n_experts + 1, 0, stream>>>(counts, offsets, cursors,
                                                            tilemap, d_ntiles, n_experts, bm);
     const int P = n_tokens * top_k;
     pfm_scatter_kernel<<<(P + 255) / 256, 256, 0, stream>>>(
-        expert_ids, expert_weights, offsets, cursors, pair_tok, pair_w, P, top_k);
+        expert_ids, expert_weights, offsets, cursors, pair_tok, pair_w, pair_orig, P, top_k);
+}
+
+void launch_pfm_moe_combine_det(const float* part, float* out, int n_tokens, int top_k,
+                                int n_cols, cudaStream_t stream) {
+    const long long total = (long long)n_tokens * n_cols;
+    int blocks = (int)((total + 255) / 256);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 65535) blocks = 65535;
+    pfm_moe_combine_det_kernel<<<blocks, 256, 0, stream>>>(part, out, n_tokens, top_k, n_cols);
 }
 
 void launch_pfm_group_tilemap(const int* counts, int* tilemap, int* d_ntiles,

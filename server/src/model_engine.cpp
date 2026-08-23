@@ -453,11 +453,13 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
                                                  const std::vector<std::pair<int, float>>& logit_bias,
                                                  bool logprobs, int top_logprobs,
                                                  const std::function<void(const TokenLogprob&)>&
-                                                     on_token_logprob) {
+                                                     on_token_logprob,
+                                                 const std::vector<int>& forced_tokens) {
     CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
     req.max_new_tokens = max_new_tokens;
+    req.forced_tokens = forced_tokens;
     req.temperature = temperature;
     req.seed = seed;
     req.top_k = top_k;
@@ -482,6 +484,18 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
             out.error = "max_new_tokens must be positive";
             return out;
         }
+        if (!forced_tokens.empty()) {
+            if ((int)forced_tokens.size() != max_new_tokens) {
+                out.error = "forced_tokens size must equal max_new_tokens";
+                return out;
+            }
+            for (int t : forced_tokens) {
+                if (t < 0 || t >= impl_->cfg.vocab) {
+                    out.error = "forced token id out of range: " + std::to_string(t);
+                    return out;
+                }
+            }
+        }
         if ((int)prompt_ids.size() + max_new_tokens > impl_->cfg.max_seq) {
             out.error = "prompt + max_tokens exceeds context limit (" +
                         std::to_string(impl_->cfg.max_seq) + ")";
@@ -491,7 +505,17 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
         }
 
         // Shared prefix KV (session 0) is only safe when no other request is in-flight.
-        const bool prefix_match = !impl_->prefix_tokens.empty() &&
+        //
+        // Never used for a teacher-forced score. Taking the prefix path prefills the shared
+        // prefix on its own (batched prefill at M = prefix_len) and only the suffix per request,
+        // versus one batched pass at M = prompt_len otherwise -- a different tile decomposition,
+        // so a few ULP of difference in the KV the score is computed against. Which branch runs
+        // depends on whether another request happened to be in flight (prefix_exclusive), so with
+        // a prefix configured the same /v1/score call could return marginally different logprobs
+        // depending on server load. A scoring endpoint exists to be compared against another copy
+        // of itself; co-tenancy-dependent numerics defeat that, and the prefill it saves is not
+        // worth it.
+        const bool prefix_match = forced_tokens.empty() && !impl_->prefix_tokens.empty() &&
                                   prompt_starts_with(prompt_ids, impl_->prefix_tokens);
         const bool prefix_exclusive = impl_->batch_engine->num_active() == 0;
         if (prefix_match && prefix_exclusive) {
