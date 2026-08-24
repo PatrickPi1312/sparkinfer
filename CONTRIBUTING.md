@@ -126,11 +126,34 @@ table is a summary and can lag it.
 | **Model pair** | target = Qwen3.8-27B ModelOpt NVFP4; draft = released DSpark checkpoint |
 | **Harness** | `runtime/examples/dspark_tau_check.cpp` — both legs in one process, one model load |
 | **Not measured at all** | ctx=128 (any length below `kEngageMinSeq`=1024), batched-prefill parity |
+| **Explicitly out of scope** | replacing the DSpark drafter — including the checkpoint's MTP head. See below. |
 
 Nothing at ctx=128 has coverage any more. That was deliberate: below `kEngageMinSeq` the batched
 verify never arms, so the token loop runs one target forward per *kept* token — exactly what AR
 runs — and the only way to move the metric was to speculate less. A metric whose optimum is
 "turn the feature off" measures the wrong thing.
+
+#### Replacing the drafter is out of scope — MTP included
+
+The work wanted here is **optimizing the DSpark drafter**. Swapping it for a different drafter is
+not in scope, however well it measures, and that specifically includes drafting with the
+checkpoint's own MTP head. Such a PR will be closed on scope, not on merit.
+
+This is a real precedent, not a hypothetical. #912 did exactly that — MTP head recursed to depth 2
+— and it was **merged and then reverted**. Its numbers were not the problem; they were the best
+any PR has posted: `eval-dspark:XL`, +24.4% (dspark 149.29 against main's 119.99), τ 1.969, AR
+flat, byte-lossless, `top1=1.0 kl=0.0`, both no-regression guards green.
+
+It was reverted because of what it did to the *measurement*. `SPARKINFER_DSPARK_MTP` defaulted ON
+wherever a checkpoint ships `mtp.*` tensors, which on the scored Qwen3.8 ModelOpt build meant
+DSpark silently stopped being the drafter — while the bot, the metric name, the harness and the
+labels all still said "dspark". Every later round would have reported `dspark-decode@4k` while
+measuring MTP. Contributors optimizing that number would have been tuning the wrong component,
+and genuine DSpark drafter improvements would have scored as regressions against an MTP baseline.
+
+The general rule this stands for: **a change that redefines what the scored dimension measures is
+out of scope even when it improves the number.** If you believe the target itself should move,
+open an issue and argue it — do not land it inside a perf PR.
 
 ### Lane 1 — evaluated and scored
 
@@ -194,7 +217,10 @@ against you.
   back up on the next cycle. `hold` and the current round winner are exempt.
 - **Repeated `none`/REJECT.** A third consecutive unscored result auto-closes; `hold` and
   `merge-first` are exempt.
-- **Out-of-scope optimizations**, per Lane 2 above.
+- **Out-of-scope optimizations**, per Lane 2 above — including anything that replaces the
+  DSpark drafter rather than optimizing it (MTP head and equivalents), and more generally any
+  change that redefines what the scored dimension measures. See *Replacing the drafter is out
+  of scope* above for the #912 precedent.
 - **Maintainer-owned paths** (below) — cannot merge regardless of content.
 - **Gaming** — copycatting, sybil farming; see *Anti-gaming*.
 
