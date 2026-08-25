@@ -184,7 +184,7 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         //
         // Ordering is mu_ (held by our caller) then device_mutex(). The worker takes only
         // device_mutex() and never mu_ while stepping, so there is no cycle.
-        std::lock_guard<std::mutex> device_lock(model_->device_mutex());
+        std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
         if (job.req.use_prefix_session) {
             seq_id = 0;
             if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);

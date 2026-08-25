@@ -208,7 +208,11 @@ public:
     //
     // Lock ordering: ContinuousBatchEngine takes its own mu_ first, then this. The worker takes
     // only this. No cycle.
-    std::mutex& device_mutex();
+    // RECURSIVE: cache_prefix() holds it and then calls ingest_prompt_range() ->
+    // forward_token(), which takes it again on the same thread. A plain mutex self-deadlocks
+    // there. Recursion only helps same-thread re-entry, which is exactly this case; the worker
+    // thread still blocks normally.
+    std::recursive_mutex& device_mutex();
 
     // Load weights from a sparkinfer weight directory (see runtime/tools/convert_qwen35.py).
     // Returns false on failure. Allocates device buffers it owns.

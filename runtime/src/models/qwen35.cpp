@@ -181,7 +181,7 @@ struct Qwen35Model::Impl {
     bool gguf = false;   // true after load_gguf: dense weights are native [out,in], use GEMV
     // Guards the capture window against legacy-default-stream work issued by other threads.
     // See Qwen35Model::device_mutex() in the header for why this is required.
-    std::mutex device_mu;
+    std::recursive_mutex device_mu;
     // CUDA-graph capture of the decode compute (captured once, replayed each token)
     cudaGraph_t cu_graph{};
     cudaGraphExec_t cu_exec{};
@@ -827,7 +827,7 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
     return want;
 }
 
-std::mutex& Qwen35Model::device_mutex() { return p_->device_mu; }
+std::recursive_mutex& Qwen35Model::device_mutex() { return p_->device_mu; }
 
 int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
                                unsigned long long seed, unsigned long long sample_step,
@@ -838,7 +838,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // has to be released on every one of them is a lock that will eventually be leaked by an
     // edit. worker_loop() is single-threaded so this never contends with another decode step --
     // the only waiter is a submit on the HTTP thread, which pays at most one step (~ms).
-    std::lock_guard<std::mutex> device_lock(p_->device_mu);
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -2555,6 +2555,13 @@ int Qwen35Model::ingest_prompt_range(const int* ids, int start, int end, int chu
 }
 
 bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
+    // Runs on the HTTP thread while the continuous-batch worker may be mid-forward_token.
+    // Everything below touches the device -- and invalidate_decode_graph() calls
+    // cudaGraphExecDestroy/cudaGraphDestroy, which would free the very graph the worker is
+    // replaying. Guarded by the same lock capture uses; see device_mutex(). The
+    // prefix_exclusive (num_active()==0) check the server does before calling these is a
+    // snapshot taken without holding anything, so it does not order against the worker.
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     clear_prefix_cache();
     if (tokens.empty()) return false;
@@ -2576,6 +2583,13 @@ bool Qwen35Model::cache_prefix(const std::vector<int>& tokens) {
 }
 
 void Qwen35Model::clear_prefix_cache() {
+    // Runs on the HTTP thread while the continuous-batch worker may be mid-forward_token.
+    // Everything below touches the device -- and invalidate_decode_graph() calls
+    // cudaGraphExecDestroy/cudaGraphDestroy, which would free the very graph the worker is
+    // replaying. Guarded by the same lock capture uses; see device_mutex(). The
+    // prefix_exclusive (num_active()==0) check the server does before calling these is a
+    // snapshot taken without holding anything, so it does not order against the worker.
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (s.prefix_active || s.kv->allocated_tokens(s.active_seq_id) > 0) {
         // Store to the external cache tier before the blocks it reads are freed below -- this
@@ -2594,6 +2608,13 @@ void Qwen35Model::clear_prefix_cache() {
 }
 
 void Qwen35Model::release_prefix_session() {
+    // Runs on the HTTP thread while the continuous-batch worker may be mid-forward_token.
+    // Everything below touches the device -- and invalidate_decode_graph() calls
+    // cudaGraphExecDestroy/cudaGraphDestroy, which would free the very graph the worker is
+    // replaying. Guarded by the same lock capture uses; see device_mutex(). The
+    // prefix_exclusive (num_active()==0) check the server does before calling these is a
+    // snapshot taken without holding anything, so it does not order against the worker.
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     // Caller already freed session-0 KV. Keep the token fingerprint for matching;
     // mark inactive so the next request re-runs cache_prefix() instead of
@@ -2708,6 +2729,10 @@ int Qwen35Model::session_token_budget(size_t prompt_len, int max_new, int max_se
 }
 
 uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
+    // cudaMalloc + kv->allocate (block-table copy on the legacy stream). submit_locked already
+    // holds this lock around its call, but guard here too so a future caller cannot miss it --
+    // the mutex is recursive, so the nested acquisition is free.
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (num_tokens <= 0) return 0;
     const uint64_t seq_id = s.next_session_id.fetch_add(1);
@@ -2759,6 +2784,10 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed) {
 void Qwen35Model::set_lmcache_bridge(BridgeClient* bridge) { p_->lmcache_bridge = bridge; }
 
 void Qwen35Model::close_session(uint64_t seq_id, const std::vector<int>* store_tokens) {
+    // Device work (lmcache store reads KV, kv->free, buffer frees) reachable from the worker
+    // while the HTTP thread may be in clear_prefix_cache()/cache_prefix(). Same lock as capture;
+    // see device_mutex(). Recursive, so nesting under an already-held lock is fine.
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (seq_id == 0) return;
     // Store to the external cache tier before freeing the blocks it reads -- this is the
