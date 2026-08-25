@@ -1,5 +1,7 @@
 // DFlash draft runtime: safetensors load + GGUF load + block-parallel forward.
 #include "sparkinfer/models/dflash_draft.h"
+#include "sparkinfer/device_health.h"
+#include <atomic>
 #include "sparkinfer/models/dflash_kernels.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/fused.h"
@@ -32,8 +34,17 @@ namespace {
 using bf16 = __nv_bfloat16;
 
 inline void cu(cudaError_t e, const char* what) {
-    if (e != cudaSuccess)
-        fprintf(stderr, "[dflash] %s: %s\n", what, cudaGetErrorString(e));
+    if (e == cudaSuccess) return;
+    // See device_health.h: sticky errors kill the context, so record them and let the
+    // engine refuse work rather than issuing more against a dead device.
+    const bool fatal = note_cuda_error(e);
+    static std::atomic<int> logged{0};
+    const int n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n < 20 || fatal)
+        fprintf(stderr, "[dflash] %s: %s%s\n", what, cudaGetErrorString(e),
+                fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
+    else if (n == 20)
+        fprintf(stderr, "[dflash] (further CUDA errors suppressed)\n");
 }
 
 struct TensorView {

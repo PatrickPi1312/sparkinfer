@@ -1,5 +1,7 @@
 #include "sparkinfer/inference_engine.h"
 
+#include "sparkinfer/device_health.h"
+
 #include <mutex>
 
 #include <algorithm>
@@ -154,6 +156,12 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
     auto fail = [&](EnqueueError e) { if (err_out) *err_out = e; return uint64_t{0}; };
 
     if (!model_ || !kv_) return fail(err);
+    // Context already dead (see device_health.h). Refuse immediately with the same code a real
+    // device OOM uses -- ALLOC_FAILED maps to 503 "requires operator attention", which is exactly
+    // right: this is permanent until the process restarts. Admitting the request instead would
+    // launch more work against a dead context, and that is the path that ends in a corrupted host
+    // heap rather than an error response.
+    if (device_lost()) return fail(EnqueueError::ALLOC_FAILED);
     if (job.req.prompt.empty() || job.req.max_new_tokens <= 0) return fail(err);
     if ((int)job.req.prompt.size() + job.req.max_new_tokens > model_->config().max_seq)
         return fail(EnqueueError::BAD_REQUEST);
@@ -306,6 +314,18 @@ void ContinuousBatchEngine::worker_loop() {
 
 bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
     const Qwen35Config& cfg = model_->config();
+    // Bail before touching the device. An in-flight job on a lost context would otherwise keep
+    // stepping -- every launch failing, every readback leaving stale host memory -- for the rest
+    // of its max_new_tokens budget, across every queued job. That grind is what turned one
+    // illegal access into 21,535 error lines and, eventually, a corrupted host heap. Fail the
+    // job with a clear reason instead; submit_locked() is already refusing new ones.
+    if (device_lost()) {
+        job.error = "CUDA context lost (unrecoverable device error) -- request aborted; "
+                    "the server requires a restart";
+        job.done = true;
+        cv_.notify_all();
+        return true;
+    }
     model_->activate_session(job.seq_id);
 
     // Shared "finish this job" helper: closes/frees whatever KV/session it holds and marks

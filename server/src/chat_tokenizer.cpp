@@ -1,4 +1,5 @@
 #include "chat_tokenizer.hpp"
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 #include <tokenizers_cpp.h>
@@ -240,6 +241,7 @@ ChatTokenizer::ChatTokenizer() : impl_(std::make_unique<Impl>()) {}
 ChatTokenizer::~ChatTokenizer() = default;
 
 bool ChatTokenizer::load(const std::string& tokenizer_json_path, std::string& err) {
+    std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     const std::string blob = read_file(tokenizer_json_path);
     if (blob.empty()) {
         err = "cannot read tokenizer: " + tokenizer_json_path;
@@ -684,6 +686,7 @@ std::string StopSequenceFilter::feed(const std::string& piece) {
 bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::vector<int>& ids,
                                          bool enable_thinking, std::string& err,
                                          ChatRequest* parsed_request) const {
+    std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     ids.clear();
     if (!impl_->tok) {
         err = "tokenizer not loaded";
@@ -703,6 +706,7 @@ bool ChatTokenizer::encode_chat_request(const std::string& request_json, std::ve
 }
 
 std::vector<int> ChatTokenizer::encode_augmented(const ChatRequest& request, bool enable_thinking) const {
+    std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     if (!impl_->tok) return {};
     const std::string prompt = impl_->museglimmer
         ? apply_museglimmer_chat_template(request.messages, enable_thinking ? "high" : "low")
@@ -712,12 +716,14 @@ std::vector<int> ChatTokenizer::encode_augmented(const ChatRequest& request, boo
 }
 
 std::vector<int> ChatTokenizer::encode_raw(const std::string& text) const {
+    std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     if (!impl_->tok) return {};
     const std::vector<int32_t> enc = impl_->tok->Encode(text);
     return std::vector<int>(enc.begin(), enc.end());
 }
 
 std::string ChatTokenizer::decode(const std::vector<int>& ids) const {
+    std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     if (!impl_->tok || ids.empty()) return {};
     std::vector<int32_t> v(ids.begin(), ids.end());
 
@@ -770,6 +776,7 @@ std::string ChatTokenizer::decode(const std::vector<int>& ids) const {
 }
 
 std::string ChatTokenizer::decode_delta(std::vector<int>& acc, int new_id) const {
+    std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     acc.push_back(new_id);
     const std::string full = decode(acc);
     if (acc.size() == 1) return full;
@@ -788,6 +795,7 @@ std::string ChatTokenizer::decode_delta(std::vector<int>& acc, int new_id) const
 }
 
 RawTokenPiece ChatTokenizer::id_to_raw_piece(int id) const {
+    std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
     if (!impl_->tok) return {};
     const std::string raw = impl_->tok->IdToToken(static_cast<int32_t>(id));
     return gpt2_bytelevel_decode(raw);

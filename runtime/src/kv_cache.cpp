@@ -8,6 +8,8 @@
 // to the pool base, not the table).
 
 #include "sparkinfer/kv_cache.h"
+#include "sparkinfer/device_health.h"
+#include <atomic>
 
 #include <cuda_runtime.h>
 #include <vector>
@@ -19,7 +21,19 @@ namespace sparkinfer {
 
 namespace {
 inline void cu(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) fprintf(stderr, "[kv] %s: %s\n", what, cudaGetErrorString(e));
+    if (e == cudaSuccess) return;
+    // Record context-killing errors so the engine can refuse new work instead of
+    // issuing more against a dead context (see device_health.h).
+    const bool fatal = note_cuda_error(e);
+    // Rate-limit: a lost context makes EVERY subsequent call fail, which produced
+    // 21,535 identical lines in one burst and buried the first, real error.
+    static std::atomic<int> logged{0};
+    const int n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n < 20 || fatal)
+        fprintf(stderr, "[kv] %s: %s%s\n", what, cudaGetErrorString(e),
+                fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
+    else if (n == 20)
+        fprintf(stderr, "[kv] (further CUDA errors suppressed)\n");
 }
 constexpr int kMaxSeqs = 256;
 constexpr int kMaxBlocksPerSeq = 10240;  // 10240 * 16 = 163840 tokens (128k ctx + decode headroom)

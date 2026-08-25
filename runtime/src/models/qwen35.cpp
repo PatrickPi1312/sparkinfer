@@ -19,6 +19,8 @@
 // respect those forks, and anything captured into the decode graph has to capture them too.
 
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/device_health.h"
+#include <atomic>
 
 #include <mutex>
 #include "sparkinfer/models/dflash_draft.h"
@@ -62,7 +64,19 @@ namespace sparkinfer {
 
 namespace {
 inline void cu(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) fprintf(stderr, "[qwen35] %s: %s\n", what, cudaGetErrorString(e));
+    if (e == cudaSuccess) return;
+    // Record context-killing errors so the engine can refuse new work instead of
+    // issuing more against a dead context (see device_health.h).
+    const bool fatal = note_cuda_error(e);
+    // Rate-limit: a lost context makes EVERY subsequent call fail, which produced
+    // 21,535 identical lines in one burst and buried the first, real error.
+    static std::atomic<int> logged{0};
+    const int n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n < 20 || fatal)
+        fprintf(stderr, "[qwen35] %s: %s%s\n", what, cudaGetErrorString(e),
+                fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
+    else if (n == 20)
+        fprintf(stderr, "[qwen35] (further CUDA errors suppressed)\n");
 }
 // SPARKINFER_MUSE_FUSE_TAIL=0 splits Muse Glimmer's sandwich-norm tail back into the original
 // launch_norm_then_add + launch_rmsnorm pair (the two produce bit-identical output).
@@ -725,6 +739,10 @@ Qwen35Model::TokenLogprob Qwen35Model::last_token_logprobs(int top_n) const {
 
     TokenLogprob out;
     out.token_id = *s.h_out_id;   // already synced by forward_token() before it returned
+    // A lost context makes every copy below fail, leaving the locals at their initialised values
+    // -- which would be published as a real, confident-looking distribution. Return the token id
+    // with no logprob data instead; the engine is about to fail this request anyway.
+    if (device_lost()) return out;
 
     float denom = 1.f, chosen_logit = 0.f;
     if (deterministic_mode()) {
@@ -735,11 +753,12 @@ Qwen35Model::TokenLogprob Qwen35Model::last_token_logprobs(int top_n) const {
         kernels::launch_logprob_denom_det(s.d_topk_exp, s.cfg.vocab, s.d_denom_partials,
                                           s.d_denom_det, s.stream);
         cu(cudaStreamSynchronize(s.stream), "logprob denom sync");
-        cudaMemcpy(&denom, s.d_denom_det, sizeof(float), cudaMemcpyDeviceToHost);
+        cu(cudaMemcpy(&denom, s.d_denom_det, sizeof(float), cudaMemcpyDeviceToHost), "logprob denom");
     } else {
-        cudaMemcpy(&denom, s.d_topk_cumsum + (s.cfg.vocab - 1), sizeof(float), cudaMemcpyDeviceToHost);
+        cu(cudaMemcpy(&denom, s.d_topk_cumsum + (s.cfg.vocab - 1), sizeof(float), cudaMemcpyDeviceToHost),
+           "logprob denom (scan)");
     }
-    cudaMemcpy(&chosen_logit, s.d_chosen_logit, sizeof(float), cudaMemcpyDeviceToHost);
+    cu(cudaMemcpy(&chosen_logit, s.d_chosen_logit, sizeof(float), cudaMemcpyDeviceToHost), "logprob chosen");
 
     float row_max = 0.f;
     std::vector<int> ids;
@@ -747,11 +766,13 @@ Qwen35Model::TokenLogprob Qwen35Model::last_token_logprobs(int top_n) const {
     if (top_n > 0) {
         ids.resize(top_n);
         logits.resize(top_n);
-        cudaMemcpy(ids.data(), s.d_sorted_idx, (size_t)top_n * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(logits.data(), s.d_sorted_logits, (size_t)top_n * sizeof(float), cudaMemcpyDeviceToHost);
+        cu(cudaMemcpy(ids.data(), s.d_sorted_idx, (size_t)top_n * sizeof(int), cudaMemcpyDeviceToHost),
+           "logprob top ids");
+        cu(cudaMemcpy(logits.data(), s.d_sorted_logits, (size_t)top_n * sizeof(float), cudaMemcpyDeviceToHost),
+           "logprob top logits");
         row_max = logits[0];   // rank 0 is always the row max, free from the descending sort
     } else {
-        cudaMemcpy(&row_max, s.d_sorted_logits, sizeof(float), cudaMemcpyDeviceToHost);
+        cu(cudaMemcpy(&row_max, s.d_sorted_logits, sizeof(float), cudaMemcpyDeviceToHost), "logprob row max");
     }
 
     const float logsumexp = row_max + logf(denom);

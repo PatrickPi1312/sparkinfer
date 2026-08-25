@@ -49,6 +49,10 @@ public:
 
     std::string model_path() const;
     int eos_id() const;
+    // False once an unrecoverable CUDA error has killed the context. Permanent until restart --
+    // /health reports it so an orchestrator replaces the process instead of routing to a server
+    // that can only 503.
+    bool device_healthy() const;
     // True for any token the runtime treats as a stop token -- eos_id AND the optional second
     // stop id (cfg.eos_id2, e.g. Muse Glimmer's <|eot|>). eos_id() alone is not sufficient:
     // step_job() stops on either, so either can be the final emitted token.

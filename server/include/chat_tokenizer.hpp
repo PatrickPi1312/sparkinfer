@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chat_tools.hpp"
+#include <mutex>
 
 #include <cstdint>
 #include <memory>
@@ -68,6 +69,36 @@ public:
     RawTokenPiece id_to_raw_piece(int id) const;
 
 private:
+    // Serializes every call that reaches the tokenizers-cpp handle.
+    //
+    // NOT defensive: that handle is genuinely not thread-safe. tokenizers-cpp's Rust FFI keeps
+    // per-handle scratch on the wrapper struct --
+    //
+    //     pub struct TokenizerWrapper { decode_str: String, id_to_token_result: String, ... }
+    //     extern "C" fn tokenizers_id_to_token(...) { (*handle).id_to_token_result = ...; }
+    //
+    // -- and returns a pointer INTO that field. Two threads calling id_to_token concurrently
+    // reallocate the same String under each other, so one frees a buffer the other is reading or
+    // writing. That is glibc heap corruption, and it presents exactly as reported from a
+    // 16-concurrent burst: "malloc(): unaligned tcache chunk detected",
+    // "corrupted size vs. prev_size", std::length_error, SIGSEGV -- with no CUDA error anywhere,
+    // because the device was never involved.
+    //
+    // logprobs:true is what makes it reachable in practice: token_logprob_entry_json() calls
+    // id_to_raw_piece() once per emitted token AND once per top_logprobs alternative, so a
+    // logprobs request drives roughly (1 + top_logprobs) x tokens lookups per request, from one
+    // httplib thread per request. Without logprobs the call rate is low enough that threads
+    // rarely overlap inside the FFI.
+    //
+    // Held here rather than at the ~10 call sites so a new caller cannot forget. The critical
+    // sections are microseconds of vocab lookup; the contended path is JSON assembly, not
+    // generation, so this does not serialize decoding.
+    // RECURSIVE: encode_chat_request() calls encode_augmented(), and decode_delta() calls
+    // decode() twice -- both would self-deadlock on a plain mutex, which under load is a hung
+    // server rather than a crashed one. Recursion only permits same-thread re-entry; concurrent
+    // threads still serialize, which is the whole point.
+    mutable std::recursive_mutex tok_mu_;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

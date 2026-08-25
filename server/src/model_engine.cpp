@@ -1,4 +1,5 @@
 #include "model_engine.hpp"
+#include "sparkinfer/device_health.h"
 
 #include "sparkinfer/gguf.h"
 #include "sparkinfer/inference_engine.h"
@@ -384,6 +385,8 @@ int ModelEngine::eos_id() const {
     std::lock_guard<std::mutex> lock(mu_);
     return impl_->ready ? impl_->cfg.eos_id : -1;
 }
+
+bool ModelEngine::device_healthy() const { return !sparkinfer::device_lost(); }
 
 bool ModelEngine::is_stop_token(int token_id) const {
     if (!impl_ || !impl_->ready || token_id < 0) return false;

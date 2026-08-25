@@ -3,6 +3,8 @@
 // full layer (and a full model, looped) is CUDA-graph capturable.
 
 #include "sparkinfer/decode.h"
+#include "sparkinfer/device_health.h"
+#include <atomic>
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/kernels/attention.h"
 #include "sparkinfer/kernels/gemm.h"
@@ -15,7 +17,19 @@ namespace sparkinfer {
 
 namespace {
 inline void cu(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) fprintf(stderr, "[decode] %s: %s\n", what, cudaGetErrorString(e));
+    if (e == cudaSuccess) return;
+    // Record context-killing errors so the engine can refuse new work instead of
+    // issuing more against a dead context (see device_health.h).
+    const bool fatal = note_cuda_error(e);
+    // Rate-limit: a lost context makes EVERY subsequent call fail, which produced
+    // 21,535 identical lines in one burst and buried the first, real error.
+    static std::atomic<int> logged{0};
+    const int n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n < 20 || fatal)
+        fprintf(stderr, "[decode] %s: %s%s\n", what, cudaGetErrorString(e),
+                fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
+    else if (n == 20)
+        fprintf(stderr, "[decode] (further CUDA errors suppressed)\n");
 }
 using bf16 = unsigned short;
 }

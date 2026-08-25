@@ -429,7 +429,18 @@ int main(int argc, char** argv) {
 
     httplib::Server svr;
 
-    svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    // Reports the DEVICE, not just the process. A lost CUDA context leaves the HTTP thread
+    // perfectly able to answer -- which is exactly the failure that hid a dead server behind a
+    // green health check while every real request 503'd. 503 here so an orchestrator replaces
+    // the process; it cannot recover without a restart.
+    svr.Get("/health", [&engine](const httplib::Request&, httplib::Response& res) {
+        if (!engine.device_healthy()) {
+            res.status = 503;
+            res.set_content("{\"status\":\"unhealthy\",\"reason\":\"cuda context lost "
+                            "(unrecoverable device error) -- restart required\"}",
+                            "application/json");
+            return;
+        }
         res.set_content("{\"status\":\"ok\"}", "application/json");
     });
 
