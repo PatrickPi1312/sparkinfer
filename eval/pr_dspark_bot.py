@@ -455,6 +455,15 @@ def check_q38_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
     measurement, for the same reason check_q36_guard does: a PR build that crashes partway through
     its own sweep must not make that context silently uncheckable."""
     problems = []
+    # Checkpoint not installed on the box. Report it every round rather than letting it read as
+    # a pass: this guard was silently vacuous for its entire life (it benched the scored
+    # checkpoint against itself), and the failure mode of a guard nobody notices is exactly how
+    # that went unseen. Not a REJECT -- a missing download is not the PR's fault -- but the
+    # verdict line will say SKIPPED, so "guarded" is never claimed when nothing was guarded.
+    if pr.get("guard38_unavailable") or main.get("guard38_unavailable"):
+        return True, ["qwen3.8 guard SKIPPED -- upstream checkpoint not installed "
+                      "(Q38_GUARD_MODEL_DIR); the shared-code regression it exists to catch is "
+                      "UNCOVERED this round"]
     if (pr.get("guard38_failed") or main.get("guard38_failed")
             or not pr.get("guard38") or not main.get("guard38")):
         problems.append("qwen3.8 guard measurement unavailable")
@@ -1052,7 +1061,19 @@ SI_BIN="$PWD/build/runtime"; SI_LD=""
 # vanished, which is the gap this closes.
 echo "GUARD38_START"
 wait_gpu_clear
-if bench_sweep_run "$MODEL_DIR" 128 16384 5; then
+# $Q38_GUARD_MODEL_DIR, NOT $MODEL_DIR. This benched $MODEL_DIR -- the SCORED checkpoint --
+# until 2026-08-25, i.e. it measured the scored build against itself and called the result a
+# guard. The upstream unsloth NVFP4 build it exists to protect had no coverage at all, and every
+# q38_guard_ok=True this bot has ever reported was vacuous. The sibling pr_modelopt_bot.py had
+# it right; this one lost the variable when the block was copied across.
+#
+# The guard checkpoint is a separate ~22 GB download and may simply not be present. Say so
+# explicitly instead of failing: a missing checkpoint is an operator/provisioning fact, not a
+# verdict on the PR, and failing closed here would halt every round. GUARD38_UNAVAILABLE is
+# surfaced loudly by the bot rather than folded into a pass.
+if [ ! -f "$Q38_GUARD_MODEL_DIR/config.json" ]; then
+  echo "GUARD38_UNAVAILABLE $Q38_GUARD_MODEL_DIR"
+elif bench_sweep_run "$Q38_GUARD_MODEL_DIR" 128 16384 5; then
   echo "GUARD38 16384 $(_bench_sweep_get 16384 decode_tps) $(_bench_sweep_get 16384 prefill_pp)"
 else
   echo "GUARD38_FAILED"
@@ -1161,6 +1182,9 @@ def _parse_remote(stdout: str) -> dict:
                                               "prefill": float(parts[3])}
                 except ValueError:
                     pass
+        elif line.startswith("GUARD38_UNAVAILABLE"):
+            # Checkpoint not installed -- distinct from FAILED (which means it ran and broke).
+            out["guard38_unavailable"] = True
         elif line.startswith("GUARD38_FAILED"):
             out["guard38_failed"] = True
         elif line.startswith("GUARD36 "):
@@ -1373,7 +1397,11 @@ def measure_main_baseline(host, port):
     # fail its guard "measurement unavailable" branch and collect a REJECT for what is really one
     # shared infra problem -- so bail out of the round instead, same reasoning as the caller's own
     # baseline bail-out.
-    if main.get("guard38_failed") or not main.get("guard38"):
+    # guard38_unavailable is NOT a bail: the checkpoint simply is not installed, which is a
+    # standing operator condition rather than a transient infra fault. Bailing on it would stop
+    # the eval loop entirely until someone downloads ~22 GB. check_q38_guard reports it as a
+    # loud SKIP on every round instead.
+    if not main.get("guard38_unavailable") and (main.get("guard38_failed") or not main.get("guard38")):
         return {"ok": False, "reason": "main run produced no qwen3.8 16k guard baseline",
                 "log": (r.stdout or "")[-1500:]}
     if main.get("guard36_failed") or not main.get("guard36"):
@@ -1703,7 +1731,11 @@ def format_comment(commit: str, res: dict) -> str:
         problems = "; ".join((res.get(prob_key) or [])[:4])
         return (f"| {name} guard @16k | ❌ **FAILED** — {problems} — "
                 "**verdict forced to REJECT regardless of speed** |\n")
-    q38_row = _guard_row("qwen3.8 (ModelOpt)", "q38_guard_ok", "q38_guard_problems", "q38_guard")
+    # "(upstream unsloth)", not "(ModelOpt)": ModelOpt is the SCORED checkpoint, and labelling the
+    # guard after it is what made the $MODEL_DIR/$Q38_GUARD_MODEL_DIR mix-up invisible in the PR
+    # comment for as long as it lasted -- the row read exactly as intended while measuring the
+    # wrong build.
+    q38_row = _guard_row("qwen3.8 (upstream unsloth)", "q38_guard_ok", "q38_guard_problems", "q38_guard")
     q36_row = _guard_row("qwen3.6", "q36_guard_ok", "q36_guard_problems", "q36_guard")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
