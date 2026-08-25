@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <mutex>
 #include <vector>
 #include <string>
 #include "sparkinfer/kv_cache.h"
@@ -186,6 +187,28 @@ public:
     ~Qwen35Model();
 
     void set_weights(const Qwen35Weights& w);
+
+    // Serializes CUDA-graph capture against any OTHER thread issuing work on the legacy default
+    // stream. Capture happens inside forward_token on the continuous-batch worker thread; the HTTP
+    // thread concurrently runs submit-time device work (KVCacheManager::allocate's block-table
+    // cudaMemcpy, open_session's cudaMalloc, reset_penalty_counts, set_logit_bias).
+    //
+    // The decode stream is created with cudaStreamCreate, i.e. a BLOCKING stream, so the legacy
+    // stream implicitly synchronizes with it. Issuing anything on the legacy stream while that
+    // stream is capturing is a hard CUDA error -- "operation would make the legacy stream depend
+    // on a capturing blocking stream" -- and it poisons the capture, after which end-capture fails
+    // and the process dies (std::length_error / corrupted size vs. prev_size / SIGSEGV, depending
+    // on what reads the half-built graph first). Reported from a 16-concurrent burst against
+    // /v1/chat/completions; never seen at <=12 because a submit has to land inside the capture
+    // window, which is a narrow target until the request rate is high enough.
+    //
+    // cudaStreamCaptureModeThreadLocal does NOT protect against this: that mode governs the
+    // capture-safety check for unsafe API calls, not the legacy stream's implicit-sync semantics,
+    // which apply regardless of mode or calling thread.
+    //
+    // Lock ordering: ContinuousBatchEngine takes its own mu_ first, then this. The worker takes
+    // only this. No cycle.
+    std::mutex& device_mutex();
 
     // Load weights from a sparkinfer weight directory (see runtime/tools/convert_qwen35.py).
     // Returns false on failure. Allocates device buffers it owns.

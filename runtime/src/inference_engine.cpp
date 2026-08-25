@@ -1,5 +1,7 @@
 #include "sparkinfer/inference_engine.h"
 
+#include <mutex>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -167,18 +169,35 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         job.req.prompt.size(), job.req.max_new_tokens, model_->config().max_seq);
 
     uint64_t seq_id = 0;
-    if (job.req.use_prefix_session) {
-        seq_id = 0;
-        if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
-        model_->activate_session(seq_id);
-        model_->reset_penalty_counts(seq_id);   // session 0 is shared across unrelated requests
-        model_->set_logit_bias(seq_id, job.req.logit_bias);   // same reason
-    } else {
-        bool alloc_failed = false;
-        seq_id = model_->open_session(budget, &alloc_failed);
-        if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
-        model_->reset_penalty_counts(seq_id);   // explicit, not relying on open_session's internal zero
-        model_->set_logit_bias(seq_id, job.req.logit_bias);    // same reason
+    {
+        // EVERY device call below must be excluded from the worker thread's CUDA-graph capture.
+        // They all issue work on the legacy default stream -- allocate()'s block-table cudaMemcpy,
+        // open_session()'s cudaMalloc, reset_penalty_counts()'s memset, set_logit_bias()'s copy --
+        // and the decode stream is a blocking stream, so the legacy stream implicitly synchronizes
+        // with it. Landing any of them inside a capture is a hard CUDA error that poisons the
+        // graph and takes the process down a few instructions later. See
+        // Qwen35Model::device_mutex().
+        //
+        // Scoped to just this block, NOT the whole function: submit_locked already holds mu_, and
+        // holding a device lock across the queue bookkeeping below would widen the window a decode
+        // step can be blocked for, for no benefit -- none of that bookkeeping touches the device.
+        //
+        // Ordering is mu_ (held by our caller) then device_mutex(). The worker takes only
+        // device_mutex() and never mu_ while stepping, so there is no cycle.
+        std::lock_guard<std::mutex> device_lock(model_->device_mutex());
+        if (job.req.use_prefix_session) {
+            seq_id = 0;
+            if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
+            model_->activate_session(seq_id);
+            model_->reset_penalty_counts(seq_id);   // session 0 is shared across unrelated requests
+            model_->set_logit_bias(seq_id, job.req.logit_bias);   // same reason
+        } else {
+            bool alloc_failed = false;
+            seq_id = model_->open_session(budget, &alloc_failed);
+            if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
+            model_->reset_penalty_counts(seq_id);   // explicit, not relying on open_session's internal zero
+            model_->set_logit_bias(seq_id, job.req.logit_bias);    // same reason
+        }
     }
 
     job.request_id = next_req_id_.fetch_add(1);

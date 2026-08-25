@@ -254,6 +254,11 @@ nlohmann::json token_logprob_entry_json(int token_id, float logprob) {
 // Builds the OpenAI-shaped logprobs.content array from a flat, generation-ordered list of
 // per-token entries. Each entry's own top_alternatives list is truncated to top_logprobs_n
 // (the request's requested top_logprobs value) regardless of how many were captured on-device.
+// OpenAI omits the stop token from logprobs.content: the assistant text a client re-tokenises
+// never contains <|im_end|>, so including its entry makes logprobs.content exactly one longer
+// than the text and breaks anyone zipping the two together (reported as 41 entries vs 40 tokens).
+// Dropped at the source rather than trimmed afterwards, because the streaming path flushes
+// entries incrementally and has no "this was the last one" moment to trim at.
 nlohmann::json build_logprobs_content_json(const std::vector<sparkinfer_server::TokenLogprob>& entries,
                                            int top_logprobs_n) {
     nlohmann::json content = nlohmann::json::array();
@@ -1017,6 +1022,7 @@ int main(int argc, char** argv) {
                                  const bool want_logprobs = logprobs && !tool_protocol;
                                  std::vector<sparkinfer_server::TokenLogprob> pending_logprobs;
                                  auto on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
+                                     if (engine.is_stop_token(tl.token_id)) return;
                                      pending_logprobs.push_back(tl);
                                  };
                                  // Hand off every entry accumulated since the last delta and clear
@@ -1434,6 +1440,7 @@ int main(int argc, char** argv) {
                          std::string nonstream_stop_text;
                          bool stopped_by_sequence = false;
                          auto nonstream_on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
+                             if (engine.is_stop_token(tl.token_id)) return;
                              logprob_entries.push_back(tl);
                          };
                          auto nonstream_on_tok = [&](int tid) -> bool {
@@ -1816,6 +1823,7 @@ int main(int argc, char** argv) {
                                  size_t offset_so_far = echo ? prompt.size() : 0;
                                  std::vector<sparkinfer_server::TokenLogprob> pending_logprobs;
                                  auto on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
+                                     if (engine.is_stop_token(tl.token_id)) return;
                                      pending_logprobs.push_back(tl);
                                  };
                                  if (echo) write_stream_delta(gs, cid, created, "text", prompt, ci, nullptr,
@@ -1999,6 +2007,7 @@ int main(int argc, char** argv) {
                      bool stopped_by_sequence = false;
                      std::vector<sparkinfer_server::TokenLogprob> logprob_entries;
                      auto on_tok_logprob = [&](const sparkinfer_server::TokenLogprob& tl) {
+                         if (engine.is_stop_token(tl.token_id)) return;
                          logprob_entries.push_back(tl);
                      };
                      auto on_tok = [&](int tid) -> bool {

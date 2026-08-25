@@ -49,6 +49,10 @@ public:
 
     std::string model_path() const;
     int eos_id() const;
+    // True for any token the runtime treats as a stop token -- eos_id AND the optional second
+    // stop id (cfg.eos_id2, e.g. Muse Glimmer's <|eot|>). eos_id() alone is not sufficient:
+    // step_job() stops on either, so either can be the final emitted token.
+    bool is_stop_token(int token_id) const;
     int vocab() const;
     int max_seq() const;
     bool is_museglimmer() const;

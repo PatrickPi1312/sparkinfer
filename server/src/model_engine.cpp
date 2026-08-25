@@ -385,6 +385,12 @@ int ModelEngine::eos_id() const {
     return impl_->ready ? impl_->cfg.eos_id : -1;
 }
 
+bool ModelEngine::is_stop_token(int token_id) const {
+    if (!impl_ || !impl_->ready || token_id < 0) return false;
+    return token_id == impl_->cfg.eos_id ||
+           (impl_->cfg.eos_id2 >= 0 && token_id == impl_->cfg.eos_id2);
+}
+
 int ModelEngine::vocab() const {
     std::lock_guard<std::mutex> lock(mu_);
     return impl_->ready ? impl_->cfg.vocab : 0;

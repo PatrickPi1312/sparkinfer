@@ -19,6 +19,8 @@
 // respect those forks, and anything captured into the decode graph has to capture them too.
 
 #include "sparkinfer/models/qwen35.h"
+
+#include <mutex>
 #include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/models/dflash_kernels.h"
 #include "qwen35_prefill.h"
@@ -177,6 +179,9 @@ struct Qwen35Model::Impl {
     int qdim, kvdim;
     int linear_qdim = 0, linear_vdim = 0, linear_qkvdim = 0;
     bool gguf = false;   // true after load_gguf: dense weights are native [out,in], use GEMV
+    // Guards the capture window against legacy-default-stream work issued by other threads.
+    // See Qwen35Model::device_mutex() in the header for why this is required.
+    std::mutex device_mu;
     // CUDA-graph capture of the decode compute (captured once, replayed each token)
     cudaGraph_t cu_graph{};
     cudaGraphExec_t cu_exec{};
@@ -822,10 +827,18 @@ int Qwen35Model::adaptive_nsplits_for(int seqlen) const {
     return want;
 }
 
+std::mutex& Qwen35Model::device_mutex() { return p_->device_mu; }
+
 int Qwen35Model::forward_token(int token_id, int position, bool sample, float temperature,
                                unsigned long long seed, unsigned long long sample_step,
                                int top_k, float top_p,
                                float presence_penalty, float frequency_penalty) {
+    // Held for the whole call, not just the capture window. The window has four exits
+    // (three EndCapture sites plus the replay-instead-of-capture early path), and a lock that
+    // has to be released on every one of them is a lock that will eventually be leaked by an
+    // edit. worker_loop() is single-threaded so this never contends with another decode step --
+    // the only waiter is a submit on the HTTP thread, which pays at most one step (~ms).
+    std::lock_guard<std::mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
