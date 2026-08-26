@@ -57,7 +57,7 @@ def main():
     # vocab from token_embd if metadata missing
     ten = {t.name: t for t in r.tensors}
     if "token_embd.weight" in ten:
-        cfg["vocab"] = int(ten["token_embd.weight"].shape[-1]) if False else cfg["vocab"]
+        cfg["vocab"] = int(ten["token_embd.weight"].shape[-1])
 
     with open(os.path.join(out, "config.txt"), "w") as f:
         for k, v in cfg.items():
