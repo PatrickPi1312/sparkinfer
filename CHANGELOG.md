@@ -3,6 +3,19 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## Unreleased
+
+- Added `server/scripts/diagnose_concurrency.py`, a reproducible 6/8/10/12-stream diagnostic that
+  captures external token throughput, request accounting, capacity, container configuration, GPU
+  telemetry and PCIe state in one JSON report.
+- Documented the exact trust boundary and compatibility semantics of the server's `ttft_ms`,
+  `generation_ms` and `decode_tps` fields. They are engine telemetry, not trusted billing or reward
+  measurements.
+- Clarified that deterministic concurrent batching is promised only for a qualified runtime,
+  artifact, configuration and GPU-model tuple.
+- Clarified that `SPARKINFER_MAX_QUEUE_DEPTH=0` is unlimited admission and that deployments which
+  require immediate overload rejection must configure a finite cap.
+
 ## [0.4.5] — 2026-08-10
 
 sparkinfer's **plain autoregressive decode is ~2× llama.cpp** on Qwen3.6-35B-A3B — flat across

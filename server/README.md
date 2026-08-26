@@ -58,6 +58,22 @@ export SPARKINFER_ROOT="$(pwd)"
 | `POST /v1/score` | **Teacher-forced scoring.** Per-token logprobs of a *supplied* continuation, no generation. See below. |
 | `POST /v1/chat/completions` | Chat (JSON `messages`, optional `tools`, `tool_choice`, `stream`, `enable_thinking`). Responses include OpenAI `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) plus additive GPU timing fields (`ttft_ms`, `generation_ms`, `decode_tps`) that standard OpenAI SDKs ignore. With `stream_options.include_usage=true`, streaming sends a final chunk with `choices:[]` + `usage` before `[DONE]`. A streaming client that disconnects mid-response cancels generation (checked via `DataSink::is_writable()`) instead of running to completion for nobody. Overload (no queue capacity) returns `429`; a request that exceeds `SPARKINFER_REQUEST_TIMEOUT_S` returns `504`. |
 
+### Timing fields
+
+The additive fields in `usage` measure work inside the inference engine, not end-to-end HTTP
+latency:
+
+| field | definition |
+|---|---|
+| `ttft_ms` | Time from successful engine admission (after request parsing, tokenisation and session/KV setup) until the first token is ready for the HTTP layer. |
+| `generation_ms` | Time from successful engine admission until generation finishes or is cancelled. |
+| `decode_tps` | `completion_tokens / (generation_ms - ttft_ms)`, with the denominator floored at 1 ms. This includes the first token in the numerator and is therefore an engine compatibility metric, not the conventional post-first-token rate. |
+
+These values exclude request parsing, tokenisation, admission setup, SSE writes, network transit and
+client backpressure. They are useful for operator telemetry, but a remote service can report
+arbitrary values: gateways, auditors and billing systems must measure latency and throughput at
+their own trust boundary rather than using these fields for rewards or accounting.
+
 ### Streaming logprobs
 
 With `stream: true` and `logprobs: true`, each chunk's `logprobs.content` holds the entries for the
@@ -119,8 +135,11 @@ Measured on an RTX 5090, Qwen3.6-35B-A3B UD-Q4_K_M, 12 prompts × 3 repeats at 4
 | mean logprob drift | 0.44 nats | **0** |
 | max logprob drift | 1.43 nats | **0** |
 
-It is also batch-invariant: a request returns the same bytes whether the server is idle or serving
-concurrent traffic, so a server can be audited while it is in use.
+It is also batch-invariant on the qualified configuration: a request returns the same token IDs and
+logprobs whether the server is idle or serving concurrent traffic, so a server can be audited while
+it is in use. This promise is scoped to the exact runtime build, model and tokenizer artifacts,
+runtime configuration, and GPU model. Changing any of those requires requalification; it does not
+promise equality across different GPU models or future commits.
 
 The nondeterminism is not in decode — the decode path has no float atomics at all. It is in batched
 prompt prefill, in two fp32 `atomicAdd` accumulations whose operand order is decided by hardware
@@ -139,9 +158,9 @@ Verified bit-identical at every prompt length up to a full 8k context (117 / 782
 Cost, same hardware and model: decode throughput is unchanged (decode is untouched); TTFT is
 **+2% at short prompts and +8% at 2k**. Above ~2048 tokens the mode also turns the GQA-fused int8
 MMA prefill attention off (`SPARKINFER_PREFILL_ATTN_GQA_RQH=1`), which costs some long-context
-prefill throughput — see the warning below for why. Bit-exactness holds for a fixed (build, GPU
-model, batch = 1) triple — a few launch geometries elsewhere are chosen from the device's SM count,
-so two *different* GPU models are not promised to agree with each other even in this mode.
+prefill throughput — see the warning below for why. Bit-exactness holds for a fixed qualified
+configuration, including concurrent batches. A few launch geometries elsewhere are chosen from the
+device's SM count, so two *different* GPU models are not promised to agree even in this mode.
 
 > **Known defect, independent of this mode: GQA-fused int8 prefill attention above ~2048 tokens.**
 > With int8 KV (which the server enables whenever `--ctx` ≥ 4096) and a prompt of 2048 tokens or
@@ -268,6 +287,25 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |
 | `SPARKINFER_DETERMINISTIC` | `0` | `1` = bit-reproducible output (see **Determinism** above). Decode speed unchanged; TTFT +2–8%. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `4096` | Per-request generation cap (independent of context length, which is checked separately against the live `--ctx`) |
-| `SPARKINFER_MAX_QUEUE_DEPTH` | `0` (unlimited) | Admission-time cap on in-flight + queued requests. Beyond it, new requests are rejected as `429` before any KV allocation is attempted, instead of failing later on KV exhaustion. |
+| `SPARKINFER_MAX_QUEUE_DEPTH` | `0` (unlimited) | Admission-time cap on the total active continuous-batch set (running and waiting between scheduler steps). Beyond it, new requests are rejected as `429` before KV allocation. Production services that promise bounded admission should set this explicitly; `0` does not satisfy such a promise. |
 | `SPARKINFER_REQUEST_TIMEOUT_S` | `0` (disabled) | Per-request wall-clock deadline from submission to finish; exceeding it returns `504`. Left disabled by default — a cold 32k-context prefill alone has been measured taking ~90s of TTFT, so an aggressive default would misfire on legitimate long-context requests. |
 | `SPARKINFER_READ_TIMEOUT_S` / `SPARKINFER_WRITE_TIMEOUT_S` | `300` | Transport-level socket timeouts (httplib). Reset on each byte transferred, so a slow-but-progressing stream doesn't trip them. |
+
+### Concurrency diagnostic
+
+To investigate host-dependent scaling, run the stdlib-only diagnostic against a live server:
+
+```bash
+python3 server/scripts/diagnose_concurrency.py \
+  --base-url http://127.0.0.1:8080 \
+  --container sparkinfer \
+  --concurrency 6,8,10,12 \
+  --max-tokens 64 \
+  --repeats 3
+```
+
+It writes one JSON report containing the exact payloads and token counts, external start/end/TTFT
+measurements, server-reported usage, `/v1/capacity` samples, relevant container limits and
+`SPARKINFER_*` variables, plus GPU clocks, utilization, power, temperature, memory and negotiated
+PCIe link state throughout each burst. Use `external_aggregate_completion_tps` for capacity
+comparisons; `usage.decode_tps` is retained only to diagnose differences in internal engine time.
