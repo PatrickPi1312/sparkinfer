@@ -26,10 +26,12 @@ static constexpr int SI_QTYPE_Q3A = 112;   // == the block size in bytes, per 25
 static constexpr int SI_QTYPE_FP8 = 108;
 
 // Compressed-tensors NVFP4 (E2M1, block 16) kept native. Payload is
-//   [256 B header: f32 global_scale at byte 0 |
+//   [256 B header: f32 global_scale at byte 0, i32 stored_rows at byte 4 |
 //    ue4m3 scale[N*(K/16)] |
 //    packed u8[N*(K/2)]]
 // The 256-byte header keeps the packed region 256-aligned for CUTLASS TMA.
+// stored_rows lets callers score a vocab prefix without mistaking that prefix length for the
+// packed weight offset; zero retains compatibility with payloads created before this field.
 // Dequant matches launch_ct_dequant_nvfp4:
 //   W[r,c] = e2m1(nibble) * ue4m3(scale[r,c/16]) / global_scale.
 // 109 is unused as a ggml type id.

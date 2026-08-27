@@ -4,6 +4,7 @@
 #include <atomic>
 #include "sparkinfer/models/dflash_kernels.h"
 #include "sparkinfer/kernels/gemm.h"
+#include "sparkinfer/kernels/qtype.h"
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/prefill.h"
@@ -373,6 +374,8 @@ struct DFlashDraftModel::Impl {
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
     float* logits = nullptr;        // [B, vocab]
     void* head_q8 = nullptr;        // [B] Q8_1 rows of xn for the multi-row head MMVQ
+    signed char* head_nv_q = nullptr; // [B,H] int8, one scale per native-NVFP4 group
+    float* head_nv_s = nullptr;       // [B,H/16]
     int *d_ids = nullptr, *d_out = nullptr;
     int *h_ids = nullptr;                        // PINNED staging for the block ids
     // Q8_1 staging for the dp4a backbone: one 36-byte block per 32 values per block row, sized for
@@ -468,6 +471,8 @@ struct DFlashDraftModel::Impl {
         down = alloc<bf16>((size_t)B * H);
         logits = alloc<float>((size_t)B * std::max(cfg.vocab, 1));
         head_q8 = alloc<char>((size_t)B * kernels::llama_q8_1_bytes(H));
+        head_nv_q = alloc<signed char>((size_t)B * H);
+        head_nv_s = alloc<float>((size_t)B * (H / 16));
         d_ids = alloc<int>(B);
         // Proposal-indexed, not row-indexed. Under the row-shift mapping the chain writes
         // d_out[r] / d_confidence[r] for r = 1..kProposalDepth, and a block_size-wide block
@@ -1592,7 +1597,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     }();
     const int head_row0 = kRowShift ? 0 : 1;
     bool head_done = false;
-    if (head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
+    if (head_mr && s.lm_head_type == kernels::SI_QTYPE_NVFP4 &&
+        s.head_nv_q && s.head_nv_s) {
+        kernels::launch_gemv_nvfp4_quant_x(
+            s.xn + (size_t)head_row0 * H, s.head_nv_q, s.head_nv_s,
+            kProposalDepth, H, st);
+        head_done = kernels::launch_gemv_nvfp4_rows_dp4a_f32(
+            s.head_nv_q, s.head_nv_s, s.lm_head,
+            s.logits + (size_t)head_row0 * Vd, kProposalDepth, Vd, H, st);
+    }
+    else if (head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
         // Score only the proposal rows the verifier can consume. One row-batched quantize launch
         // instead of kProposalDepth tiny ones (8 CTAs each, so launch latency dominated them).
         // DSpark's Markov chain consumes base-logit rows [0, depth): row 0 plus the anchor token

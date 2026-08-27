@@ -833,7 +833,9 @@ __global__ void gemv_nvfp4_sk_kernel(const __nv_bfloat16* __restrict__ x,
     if (n < N) {
         const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
         const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
-        const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+        const int stored_rows = *(reinterpret_cast<const int*>(packed) + 1);
+        const int weight_rows = stored_rows > 0 ? stored_rows : N;
+        const unsigned char* w = sf + (size_t)weight_rows * (size_t)(K >> 4);
         const unsigned char* srow = sf + (size_t)n * (size_t)(K >> 4);
         const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
         const int ng = K >> 4;
@@ -1030,7 +1032,9 @@ __global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
     if (n0 < N) {
         const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
         const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
-        const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+        const int stored_rows = *(reinterpret_cast<const int*>(packed) + 1);
+        const int weight_rows = stored_rows > 0 ? stored_rows : N;
+        const unsigned char* w = sf + (size_t)weight_rows * (size_t)(K >> 4);
         const int ng = K >> 4;
         const int gstride = S * 32;
         int g = split * 32 + lane;
@@ -1215,7 +1219,9 @@ __global__ void gemv_nvfp4_kernel(const __nv_bfloat16* __restrict__ x,
     if (n >= N) return;
     const float inv_g = 1.f / *reinterpret_cast<const float*>(packed);
     const unsigned char* sf = reinterpret_cast<const unsigned char*>(packed) + SI_NVFP4_HDR;
-    const unsigned char* w = sf + (size_t)N * (size_t)(K >> 4);
+    const int stored_rows = *(reinterpret_cast<const int*>(packed) + 1);
+    const int weight_rows = stored_rows > 0 ? stored_rows : N;
+    const unsigned char* w = sf + (size_t)weight_rows * (size_t)(K >> 4);
     const unsigned char* srow = sf + (size_t)n * (size_t)(K >> 4);
     const unsigned char* prow = w + (size_t)n * (size_t)(K >> 1);
     float acc = 0.f;
@@ -3081,14 +3087,15 @@ bool launch_gemv_nvfp4_rows_dp4a2(const void* xq, const void* xs,
     return true;
 }
 
-bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, void* y,
-                                 int M, int N, int K, cudaStream_t stream) {
+template <typename OutT>
+static bool launch_gemv_nvfp4_rows_dp4a_t(const void* xq, const void* xs, const void* W, OutT* y,
+                                          int M, int N, int K, cudaStream_t stream) {
     if (!xq || !xs || !W || !y || N < 1 || K < 1 || (K & 15)) return false;
     if (!gemv_bf16_splitk()) return false;
     if (M < 1 || M > 8) return false;
     const auto* xp = reinterpret_cast<const signed char*>(xq);
     const auto* sp = reinterpret_cast<const float*>(xs);
-    auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
+    auto* yp = reinterpret_cast<OutT*>(y);
     // Split-K chosen by N exactly as the float rows kernel does, so the two paths fan out over the
     // GPU identically and a comparison between them is a comparison of the arithmetic alone.
     //
@@ -3113,10 +3120,10 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
         const int nr = nr_mode ? nr_mode : (R == 1 ? 1 : 2); \
         if (nr == 1) { \
             const dim3 grid((N + RPB - 1) / RPB); \
-            gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+            gemv_nvfp4_rows_dp4a_kernel<OutT, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
         } else { \
             const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
-            gemv_nvfp4_rows_dp4a_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
+            gemv_nvfp4_rows_dp4a_kernel<OutT, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, sp, W, yp, N, K); \
         } \
     } while (0)
 #define SI_NVFP4_DP4A_S(R_) do { \
@@ -3133,6 +3140,17 @@ bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, 
 #undef SI_NVFP4_DP4A_S
 #undef SI_NVFP4_DP4A
     return true;
+}
+
+bool launch_gemv_nvfp4_rows_dp4a(const void* xq, const void* xs, const void* W, void* y,
+                                 int M, int N, int K, cudaStream_t stream) {
+    return launch_gemv_nvfp4_rows_dp4a_t(
+        xq, xs, W, reinterpret_cast<__nv_bfloat16*>(y), M, N, K, stream);
+}
+
+bool launch_gemv_nvfp4_rows_dp4a_f32(const void* xq, const void* xs, const void* W, float* y,
+                                     int M, int N, int K, cudaStream_t stream) {
+    return launch_gemv_nvfp4_rows_dp4a_t(xq, xs, W, y, M, N, K, stream);
 }
 
 bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N, int K,
@@ -3218,6 +3236,24 @@ void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int 
     }
 }
 void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N, int K, cudaStream_t stream) {
+    if (wtype == SI_QTYPE_NVFP4) {
+        const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
+        if (gemv_bf16_splitk()) {
+            if (N >= 8192) {
+                constexpr int S = 2, RPB = GEMV_WPB / S;
+                gemv_nvfp4_sk_kernel<float, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, y, N, K);
+            } else if (N >= 4096) {
+                constexpr int S = 4, RPB = GEMV_WPB / S;
+                gemv_nvfp4_sk_kernel<float, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, y, N, K);
+            } else {
+                constexpr int S = 8, RPB = GEMV_WPB / S;
+                gemv_nvfp4_sk_kernel<float, S><<<dim3((N + RPB - 1) / RPB), GEMV_WPB * 32, 0, stream>>>(xp, W, y, N, K);
+            }
+        } else {
+            gemv_nvfp4_kernel<float><<<dim3((N + GEMV_WPB - 1) / GEMV_WPB), GEMV_WPB * 32, 0, stream>>>(xp, W, y, N, K);
+        }
+        return;
+    }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     if (gemv_mmvq() && wtype == 12) {
         size_t sm = 2 * (size_t)(K >> 5) * sizeof(float) + (size_t)K;
