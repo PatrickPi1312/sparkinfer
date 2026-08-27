@@ -1905,10 +1905,15 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             if (ok && exec) {
                 s.graphs.push_back(Impl::DraftGraph{ctx_len, BW, kProposalDepth, target_hidden,
                                                     out_confidence != nullptr, exec});
+                if (s.graphs.size() == 1)
+                    fprintf(stderr, "[dflash] draft graph: replaying (first tier ctx_len=%d "
+                                    "width=%d depth=%d)\n", ctx_len, BW, kProposalDepth);
             } else {
                 (void)cudaGetLastError();          // clear the capture error, if any
                 s.graph_disabled = true;
                 exec = nullptr;
+                fprintf(stderr, "[dflash] draft graph: capture failed at ctx_len=%d -- "
+                                "staying eager\n", ctx_len);
             }
         }
         if (exec) {
