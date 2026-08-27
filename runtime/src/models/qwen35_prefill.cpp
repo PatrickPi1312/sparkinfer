@@ -3376,6 +3376,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (verify_head_i8_on && verify_head_i8) {
         head_ok = kernels::launch_gemv_i8_q81_multirow_f32(
             q81, verify_head_i8, verify_head_scale, logits, c.vocab, H, N, st);
+    } else if (s.w.lm_head_type == kernels::SI_QTYPE_NVFP4) {
+        quant_nv_rows(xn, H);
+        head_ok = kernels::launch_gemv_nvfp4_rows_dp4a_f32(
+            nvq_use_b ? nv_pq_b : nv_pq_a, nvq_use_b ? nv_ps_b : nv_ps_a,
+            s.w.lm_head, logits, N, c.vocab, H, st);
     } else if (s.w.lm_head_type == 12) {
         // AR decode drives the LM head with launch_mmvq_q4k_f32 at one row (qwen35.cpp:1888);
         // this makes the verify call the identical kernel instead of launch_mmvq_rows_f32's

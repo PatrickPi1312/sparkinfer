@@ -2093,7 +2093,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // silently fed the LM head a stale aq81 left over from the last layer's fresh
     // prepare_xn_quant(xn) quantize (a *different*, pre-final-norm activation vector) --
     // wrong logits on every single decode step. Force a fresh quantize for muse_glimmer.
-    if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
+    if (s.w.lm_head_type == kernels::SI_QTYPE_NVFP4) {
+        kernels::launch_gemv_nvfp4_quant_x(s.xn, s.nv_xq, s.nv_xs, 1, H, st);
+        if (!kernels::launch_gemv_nvfp4_rows_dp4a_f32(
+                s.nv_xq, s.nv_xs, s.w.lm_head, s.logits, 1, c.vocab, H, st))
+            kernels::launch_gemv_q_f32(
+                s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
+    }
+    else if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
         if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
         kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
@@ -5250,6 +5257,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         if (cudaMalloc(&payload, hdr + scale_bytes + packed_bytes) != cudaSuccess) return nullptr;
         cudaMemset(payload, 0, hdr);
         cudaMemcpy(payload, &global_scale, 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(payload) + 4, &rows, sizeof(rows), cudaMemcpyHostToDevice);
         cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes, cudaMemcpyHostToDevice);
         cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
@@ -5407,11 +5415,13 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     }();
     auto keep_nvfp4_native = [&](const std::string& prefix, int rows, int cols, int& qtype,
                                  const void** fp4 = nullptr, const void** fp4_sf = nullptr,
-                                 float* fp4_alpha = nullptr) -> const void* {
+                                 float* fp4_alpha = nullptr,
+                                 bool respect_gdn_toggle = true) -> const void* {
         NvFp4Src src{};
         if (!nvfp4_src(prefix, rows, cols, src)) return nullptr;
-        if (!gdn_keep_nvfp4) return requant_q4k(dequant_nvfp4(prefix, rows, cols),
-                                                (long)rows * cols, qtype);
+        if (respect_gdn_toggle && !gdn_keep_nvfp4)
+            return requant_q4k(dequant_nvfp4(prefix, rows, cols),
+                               (long)rows * cols, qtype);
         const size_t scale_bytes = (size_t)rows * cols / 16;
         const size_t packed_bytes = (size_t)rows * cols / 2;
         const size_t hdr = (size_t)kernels::SI_NVFP4_HDR;
@@ -5419,6 +5429,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         if (cudaMalloc(&payload, hdr + scale_bytes + packed_bytes) != cudaSuccess) return nullptr;
         cudaMemset(payload, 0, hdr);
         cudaMemcpy(payload, &src.global, 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<char*>(payload) + 4, &rows, sizeof(rows), cudaMemcpyHostToDevice);
         cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes,
                    cudaMemcpyHostToDevice);
         cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
@@ -5463,10 +5474,21 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
     // transpose needed -- matches load_gguf()'s own dense("token_embd.weight", false).
     s.w.embed_tokens = plain_bf16("model.language_model.embed_tokens.weight", (long)c.vocab * H);
     s.w.final_norm = load_norm_plus1("model.language_model.norm.weight", H);
-    // lm_head: FP8 in the compressed-tensors checkpoint, plain bf16 in the ModelOpt one (which
-    // lists it under quantization_config.ignore). Either way it ends up Q4_K, as in load_gguf().
-    s.w.lm_head = requant_q4k(dequant_any("lm_head", c.vocab, H), (long)c.vocab * H,
-                              s.w.lm_head_type);
+    // The current ModelOpt checkpoint ships lm_head in native NVFP4. Keep it in that exact format:
+    // requantizing the 4-bit checkpoint weights to another 4-bit grid both moves the target away
+    // from the model the DSpark draft was trained against and wastes the native dp4a path. Older
+    // BF16/FP8 exports retain the Q4_K fallback.
+    static const bool lm_head_nvfp4 = [] {
+        const char* e = getenv("SPARKINFER_QWEN38_LMHEAD_NVFP4");
+        return !(e && e[0] == '0');
+    }();
+    NvFp4Src lm_probe{};
+    if (lm_head_nvfp4 && nvfp4_src("lm_head", c.vocab, H, lm_probe))
+        s.w.lm_head = keep_nvfp4_native("lm_head", c.vocab, H, s.w.lm_head_type,
+                                        nullptr, nullptr, nullptr, false);
+    else
+        s.w.lm_head = requant_q4k(dequant_any("lm_head", c.vocab, H), (long)c.vocab * H,
+                                  s.w.lm_head_type);
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
     s.w.layers.resize(c.n_layers);
