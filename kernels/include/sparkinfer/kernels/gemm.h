@@ -220,6 +220,16 @@ void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, i
 // Same, for a Q4_K weight (the LM-head copy the target keeps). ~280 MB vs ~417 MB at V=248k.
 bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream = nullptr);
+// SHARED Q4_K LM HEAD (SPARKINFER_Q4K_HEAD_MULTIROW=0 restores the previous kernels).
+// True when AR decode and the DSpark batched verify should BOTH score the Q4_K LM head with the
+// multi-row kernel above (M=1 for AR, M=N for the verify). The two must agree bit-for-bit for the
+// verify's argmax to reproduce AR's, which is why the verify used si_mmvq_q4k_rows_exact_kernel --
+// AR's per-row mapping widened to N rows -- and paid for it: at N=4 on the 248320x5120 head that
+// kernel runs at ~53% of HBM (750 us), while the multi-row form moves the same bytes at ~84%.
+// Sharing the multi-row kernel keeps the two legs identical by construction (each (row, m) dot is
+// the same warp walk in the same order whatever M is) and takes the verify's head to the faster
+// form; AR at M=1 gives back a little of its own single-row peak for it.
+bool q4k_head_multirow();
 bool launch_gemv_i8_q81_multirow_f32(const void* q81, const signed char* W,
                                      const float* sw, float* y,
                                      int N, int K, int M, cudaStream_t stream = nullptr);

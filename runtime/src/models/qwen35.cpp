@@ -2095,7 +2095,13 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // wrong logits on every single decode step. Force a fresh quantize for muse_glimmer.
     if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
         if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
-        kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+        // Shared with the DSpark verify's head (see kernels::q4k_head_multirow): the same kernel
+        // at M=1 here and M=N there, so the verify's argmax reproduces this one bit-for-bit while
+        // its head runs at the multi-row kernel's bandwidth. Shapes it declines keep the old call.
+        if (!(kernels::q4k_head_multirow() &&
+              kernels::launch_gemv_q4k_dp4a_multirow_f32(s.aq81, s.w.lm_head, s.logits,
+                                                         c.vocab, H, 1, st)))
+            kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
     }
     else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
         if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm

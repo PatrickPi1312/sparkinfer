@@ -3409,9 +3409,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_ROWS");
             return !(e && e[0] == '0');
         }();
-        head_ok = head_rows_on && N > 1 &&
-                  kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
-                                                N, c.vocab, H, st);
+        // UPDATE (2026-08-27): nsys on the ModelOpt checkpoint at ctx 4k puts
+        // si_mmvq_q4k_rows_exact_kernel at 750 us per 4-row verify -- 0.95 TB/s, 53% of HBM --
+        // against 423 us for AR's one-row kernel on the same bytes. The multi-row draft-head
+        // kernel moves those bytes at ~84%. So AR decode (qwen35.cpp, M=1) and this call (M=N)
+        // now share THAT kernel: one warp per output row walking its super-blocks once, each
+        // activation row's dot the same sum in the same order whatever M is, hence bit-identical
+        // between the two legs by construction. SPARKINFER_Q4K_HEAD_MULTIROW=0 restores the
+        // previous pair (rows_exact here, kfixed in AR) for an A/B.
+        head_ok = kernels::q4k_head_multirow() &&
+                  kernels::launch_gemv_q4k_dp4a_multirow_f32(q81, s.w.lm_head, logits,
+                                                             c.vocab, H, N, st);
+        if (!head_ok)
+            head_ok = head_rows_on && N > 1 &&
+                      kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
+                                                    N, c.vocab, H, st);
         if (!head_ok) {
             const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
             for (int r = 0; r < N; ++r) {

@@ -3599,6 +3599,12 @@ void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K,
 }
 // M activation rows against one shared Q6_K weight. q81 is M contiguous llama_q8_1_bytes(K)
 // activation rows; y is [M, N] fp32. Returns false when the shape is unsupported (caller loops).
+bool q4k_head_multirow() {
+    static const bool on = []{ const char* e = getenv("SPARKINFER_Q4K_HEAD_MULTIROW");
+                               return !(e && e[0] == '0'); }();
+    return on;
+}
+
 bool launch_gemv_q4k_dp4a_multirow_f32(const void* q81, const void* W, float* y,
                                        int N, int K, int M, cudaStream_t stream) {
     // NSUPER is K/256, the super-block count the kernel strides the weight by. It was
