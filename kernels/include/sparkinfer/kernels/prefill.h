@@ -103,18 +103,6 @@ void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
                                     void* out, int n_tokens, int q_heads, int v_heads,
                                     int head_dim, bool qh_block = false,
                                     cudaStream_t stream = nullptr);
-// The conv_compact + scan_compact pair as ONE launch: every scan CTA re-derives the post-conv
-// q/k head and v column it consumes from the pre-conv projection `qkv` (bit-identical to the
-// pair, see df_gdn_conv_scan_compact_kernel) and writes k/v for the commit. Returns false for
-// shapes it does not cover (head_dim != 128) or when SPARKINFER_DFLASH_GDN_FUSE=0; the caller
-// then issues the pair.
-bool launch_dflash_gdn_conv_scan_compact(const void* qkv, const void* conv_w,
-                                         const void* conv_live, void* k_out, void* v_out,
-                                         const void* alpha, const void* beta,
-                                         const void* dt, const void* a, const float* live_state,
-                                         void* out, int n_tokens, int q_heads, int v_heads,
-                                         int head_dim, int conv_kernel, float eps,
-                                         bool qh_block = false, cudaStream_t stream = nullptr);
 
 // Compact accepted-prefix commit. Verification retains qkv plus k/v/alpha/beta per GDN layer;
 // these launchers update the live decode state once after posterior selection, avoiding both

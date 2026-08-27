@@ -2984,22 +2984,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (!supported) break;
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) +
                 (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+            kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
+                N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
             const float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
             // ra/rb are the scan's only side-branch inputs.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "verify gdn ab wait");
-            // One node for conv + scan (see launch_dflash_gdn_conv_scan_compact): the scan
-            // re-derives the q/k head and v column it reads from rq and writes rk/rv for the
-            // commit itself. Bit-identical to the pair below, which stays for the shapes it
-            // declines and for the SPARKINFER_DFLASH_GDN_FUSE=0 A/B.
-            if (!kernels::launch_dflash_gdn_conv_scan_compact(
-                    rq, w.ssm_conv, conv_live, rk, rv, ra, rb, w.ssm_dt, w.ssm_a, state, att,
-                    N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps,
-                    c.gdn_qh_block, st)) {
-                kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
-                    N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
-                kernels::launch_dflash_gdn_scan_compact(gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
-                    state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
-            }
+            kernels::launch_dflash_gdn_scan_compact(gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
+                state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
             // ...and lz is gated_norm's.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn z wait");
             // The out-projection is about to quantize lnrm to the NVFP4 activation form; this
