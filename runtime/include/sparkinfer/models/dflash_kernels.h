@@ -8,7 +8,7 @@ namespace dflash_kernels {
 
 // Upper bounds for the hd128 row-batched KV-split attention path, so the caller can size
 // its per-split partial-state scratch once at load instead of per call.
-constexpr int kDFlashAttnMaxSplits = 32;
+constexpr int kDFlashAttnMaxSplits = 16;
 constexpr int kDFlashAttnMaxRows = 16;
 // Below this key count the split path is not worth taking: the unsplit kernel is already short
 // enough that the extra combine pass eats the gain, and re-associating the reduction perturbs the
