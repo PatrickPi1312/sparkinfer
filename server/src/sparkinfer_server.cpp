@@ -248,7 +248,7 @@ nlohmann::json token_logprob_entry_json(int token_id, float logprob) {
     const auto piece = g_tokenizer.id_to_raw_piece(token_id);
     nlohmann::json bytes = nlohmann::json::array();
     for (uint8_t b : piece.bytes) bytes.push_back((int)b);
-    return {{"token", piece.display}, {"logprob", logprob}, {"bytes", bytes}};
+    return {{"token", piece.display}, {"token_id", token_id}, {"logprob", logprob}, {"bytes", bytes}};
 }
 
 // Builds the OpenAI-shaped logprobs.content array from a flat, generation-ordered list of
@@ -679,6 +679,7 @@ int main(int argc, char** argv) {
 
         nlohmann::json tokens = nlohmann::json::array();
         nlohmann::json token_ids = nlohmann::json::array();
+        nlohmann::json token_bytes = nlohmann::json::array();
         nlohmann::json logprobs = nlohmann::json::array();
         nlohmann::json alts = nlohmann::json::array();
         double sum_logprob = 0.0;
@@ -686,6 +687,9 @@ int main(int argc, char** argv) {
             const auto piece = g_tokenizer.id_to_raw_piece(e.token_id);
             tokens.push_back(piece.display);
             token_ids.push_back(e.token_id);
+            nlohmann::json bytes = nlohmann::json::array();
+            for (uint8_t b : piece.bytes) bytes.push_back((int)b);
+            token_bytes.push_back(std::move(bytes));
             logprobs.push_back(e.logprob);
             sum_logprob += (double)e.logprob;
             if (top_logprobs > 0) {
@@ -710,6 +714,7 @@ int main(int argc, char** argv) {
                                {"model", g_model_name},
                                {"tokens", tokens},
                                {"token_ids", token_ids},
+                               {"bytes", token_bytes},
                                {"logprobs", logprobs},
                                {"sum_logprob", sum_logprob},
                                {"usage", usage}};

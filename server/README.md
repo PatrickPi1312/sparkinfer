@@ -111,7 +111,7 @@ curl -s http://127.0.0.1:8080/v1/score -H 'Content-Type: application/json' -d '{
 | `top_logprobs` | optional, 0–20 alternatives per position. |
 | `enable_thinking` | optional, same meaning as chat completions. |
 
-Response: `tokens`, `token_ids`, `logprobs` (natural log, generation order), `sum_logprob`,
+Response: `tokens`, `token_ids`, `bytes` (raw UTF-8 bytes of each scored token), `logprobs` (natural log, generation order), `sum_logprob`,
 optional `top_logprobs`, and the same `usage` block every other endpoint returns.
 
 The numbers are **identical** to what `/v1/chat/completions` reports for the same token at the same
