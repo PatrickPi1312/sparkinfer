@@ -52,7 +52,11 @@ inline bool qwen_checkpoint_open(const std::string& path,
                                  QwenCheckpointKind& kind_out,
                                  std::string& err) {
     struct stat st {};
+#ifdef _WIN32
+    const bool is_dir = stat(path.c_str(), &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
+#else
     const bool is_dir = stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 
     if (!is_dir) {
         kind_out = QwenCheckpointKind::Gguf;
