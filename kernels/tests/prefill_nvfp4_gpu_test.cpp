@@ -36,9 +36,9 @@ bool test_large_row_dequant() {
 
 bool test_vocab_prefix_offset() {
     using namespace sparkinfer::kernels;
-    // Use a real projection-sized grid. The production prefix is 65,536 of 248,320 rows; this
-    // smaller ratio exercises the identical stored-rows offset without making the unit test big.
-    constexpr int stored_rows = 4096, scored_rows = 2048, k = 16;
+    // Exercise both the stored-row offset and the vocab-sized one-warp dispatch. K=16 keeps the
+    // allocation small while N=65,536 takes the same launcher branch as the production prefix.
+    constexpr int stored_rows = 65537, scored_rows = 65536, k = 16;
     const size_t scale_bytes = (size_t)stored_rows * k / 16;
     const size_t packed_bytes = (size_t)stored_rows * k / 2;
     std::vector<unsigned char> payload(SI_NVFP4_HDR + scale_bytes + packed_bytes, 0);

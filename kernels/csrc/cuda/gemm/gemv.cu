@@ -3127,7 +3127,12 @@ static bool launch_gemv_nvfp4_rows_dp4a_t(const void* xq, const void* xs, const 
         } \
     } while (0)
 #define SI_NVFP4_DP4A_S(R_) do { \
-        if (N >= 8192)      SI_NVFP4_DP4A(2, R_); \
+        /* LM heads already expose tens of thousands of independent output rows. Splitting each */ \
+        /* one across two warps only doubles the grid and adds a shared-memory reduction; the */ \
+        /* row grid alone has ample occupancy. Keep split-K for the smaller projections it was */ \
+        /* tuned on, and use one warp per row for vocab-sized matrices. */ \
+        if (N >= 65536)     SI_NVFP4_DP4A(1, R_); \
+        else if (N >= 8192) SI_NVFP4_DP4A(2, R_); \
         else if (N >= 4096) SI_NVFP4_DP4A(4, R_); \
         else                SI_NVFP4_DP4A(8, R_); \
     } while (0)
