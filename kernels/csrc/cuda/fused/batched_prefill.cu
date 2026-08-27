@@ -686,8 +686,8 @@ __global__ void df_gdn_scan_checkpoint_kernel(
 // travelled through memory. The scan itself is df_gdn_scan_checkpoint_kernel's, unchanged. The
 // commit still needs post-conv k/v, so this kernel writes them where the conv did: v from every
 // warp for its own column, k once per q head from the first CTA of that head's group.
-template <int COLS, int HEAD_DIM, int MAXN>
-__global__ __launch_bounds__(COLS * 32) void df_gdn_conv_scan_compact_kernel(
+template <int COLS, int HEAD_DIM>
+__global__ void df_gdn_conv_scan_compact_kernel(
     const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
     const __nv_bfloat16* __restrict__ conv_live,
     __nv_bfloat16* __restrict__ k_out, __nv_bfloat16* __restrict__ v_out,
@@ -696,92 +696,92 @@ __global__ __launch_bounds__(COLS * 32) void df_gdn_conv_scan_compact_kernel(
     const float* __restrict__ live_state, __nv_bfloat16* __restrict__ out,
     int n_tokens, int q_heads, int v_heads, int conv_kernel, float eps, bool qh_block) {
     constexpr int NROW = HEAD_DIM / 32;
-    static_assert(HEAD_DIM == 128 && COLS * 32 >= 3 * HEAD_DIM,
-                  "the conv prologue needs one thread per q/k/v dim of the head");
+    static_assert(NROW == 4, "the folded norm seats one 32-dim slice sum per lane 0..3");
     const int vh = blockIdx.x;
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int j = blockIdx.y * COLS + warp;
-    if (vh >= v_heads) return;
+    const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads || j >= HEAD_DIM) return;
     const int qh = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
     const int q_dim = q_heads * HEAD_DIM;
     const int v_dim = v_heads * HEAD_DIM;
     const int qkv_dim = 2 * q_dim + v_dim;
-    // Post-conv q / k head and v head for every token, as bf16 -- what the conv kernel wrote.
-    __shared__ __nv_bfloat16 sq[MAXN][HEAD_DIM], sk[MAXN][HEAD_DIM], sv[MAXN][HEAD_DIM];
-    __shared__ float sw[2][4];
-
-    // ---- conv prologue: one thread per (q | k | v) dim of this head, all tokens -------------
-    // Thread groups mirror the conv kernel's CTAs: warps 0-3 = the q head (dims 32w..32w+31 per
-    // warp), 4-7 = the k head, 8-11 = the v head. Taps ascending, current token last, SiLU, then
-    // for q/k the two-stage norm fold with the four slice sums seated in lanes 0..3.
-    const bool write_k = (blockIdx.y == 0) &&
-                         (qh_block ? (vh % (v_heads / q_heads)) == 0 : vh < q_heads);
-    if (tid < 3 * HEAD_DIM) {
-        const int grp = tid / HEAD_DIM, i = tid - grp * HEAD_DIM;
-        const int d = grp == 0 ? qh * HEAD_DIM + i
-                    : grp == 1 ? q_dim + qh * HEAD_DIM + i
-                               : 2 * q_dim + vh * HEAD_DIM + i;
-        float w[8];
-#pragma unroll
-        for (int c = 0; c < 8; c++)
-            w[c] = c < conv_kernel ? pf_to_f(conv_w[(size_t)d * conv_kernel + c]) : 0.f;
-        for (int t = 0; t < n_tokens; t++) {
-            float y = 0.f;
-#pragma unroll
-            for (int c = 0; c < 7; c++) {
-                if (c >= conv_kernel - 1) break;
-                const int p = t - (conv_kernel - 1) + c;
-                const float h = p >= 0 ? pf_to_f(qkv[(size_t)p * qkv_dim + d])
-                                       : pf_to_f(conv_live[(size_t)(t + c) * qkv_dim + d]);
-                y += h * w[c];
-            }
-            y += pf_to_f(qkv[(size_t)t * qkv_dim + d]) * w[conv_kernel - 1];
-            float cval = pf_silu(y);
-            if (grp < 2) {
-                const float ss = pf_wsum(cval * cval);
-                if (lane == 0) sw[grp][warp & 3] = ss;
-            }
-            __syncthreads();
-            if (grp < 2) {
-                float vv = lane < 4 ? sw[grp][lane] : 0.f;
-                vv = pf_wsum(vv);
-                cval *= rsqrtf(vv + eps);
-            }
-            const __nv_bfloat16 b = __float2bfloat16(cval);
-            if (grp == 0)      sq[t][i] = b;
-            else if (grp == 1) { sk[t][i] = b; if (write_k) k_out[(size_t)t * q_dim + qh * HEAD_DIM + i] = b; }
-            else               { sv[t][i] = b; if (blockIdx.y == 0) v_out[(size_t)t * v_dim + vh * HEAD_DIM + i] = b; }
-            __syncthreads();   // sw is reused by the next token
-        }
-    } else {
-        for (int t = 0; t < n_tokens; t++) { __syncthreads(); __syncthreads(); }
-    }
-    __syncthreads();
-
-    // ---- scan: df_gdn_scan_checkpoint_kernel's body, reading the head from shared memory -----
-    if (j >= HEAD_DIM) return;
     const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
     const float scale = rsqrtf((float)HEAD_DIM);
     const float a_h = pf_to_f(a[vh]);
     const float dt_h = pf_to_f(dt[vh]);
+    // The one CTA per q head that materialises k for the commit.
+    const bool write_k = (blockIdx.y == 0) &&
+                         (qh_block ? (vh % (v_heads / q_heads)) == 0 : vh < q_heads);
+
+    // conv for one pre-conv column d at token t: taps ascending, current token last (the order
+    // df_gdn_conv_par_kernel uses), then SiLU. Negative positions come from the live conv state.
+    auto conv_at = [&](int d, int t) -> float {
+        float y = 0.f;
+#pragma unroll
+        for (int c = 0; c < 7; c++) {
+            if (c >= conv_kernel - 1) break;
+            const int p = t - (conv_kernel - 1) + c;
+            const float h = p >= 0 ? pf_to_f(qkv[(size_t)p * qkv_dim + d])
+                                   : pf_to_f(conv_live[(size_t)(t + c) * qkv_dim + d]);
+            y += h * pf_to_f(conv_w[(size_t)d * conv_kernel + c]);
+        }
+        y += pf_to_f(qkv[(size_t)t * qkv_dim + d]) *
+             pf_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+        return pf_silu(y);
+    };
+    // The conv kernel's norm over a 128-dim head: warp w summed dims 32w..32w+31 with one
+    // butterfly, the four sums were folded by a second butterfly over lanes 0..3 (zeros beyond),
+    // and the head was scaled by rsqrtf(sum + eps). Slice r here IS dims 32r..32r+31, lane by lane.
+    auto head_norm = [&](const float (&cv)[NROW]) -> float {
+        float ss[NROW];
+#pragma unroll
+        for (int r = 0; r < NROW; r++) ss[r] = pf_wsum(cv[r] * cv[r]);
+        float vv = lane == 0 ? ss[0] : lane == 1 ? ss[1] : lane == 2 ? ss[2] : lane == 3 ? ss[3] : 0.f;
+        vv = pf_wsum(vv);
+        return rsqrtf(vv + eps);
+    };
+
     float sloc[NROW];
 #pragma unroll
     for (int r = 0; r < NROW; r++) sloc[r] = live_state[col_off + lane + r * 32];
+
     for (int t = 0; t < n_tokens; t++) {
+        // q and k heads for this token, exactly as the conv kernel would have stored them.
+        float qc[NROW], kc[NROW];
+#pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            qc[r] = conv_at(qh * HEAD_DIM + i, t);
+            kc[r] = conv_at(q_dim + qh * HEAD_DIM + i, t);
+        }
+        const float qinv = head_norm(qc);
+        const float kinv = head_norm(kc);
+        float qv[NROW], kv[NROW];
+#pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const __nv_bfloat16 qb = __float2bfloat16(qc[r] * qinv);
+            const __nv_bfloat16 kb = __float2bfloat16(kc[r] * kinv);
+            qv[r] = pf_to_f(qb);
+            kv[r] = pf_to_f(kb);
+            if (write_k) k_out[(size_t)t * q_dim + qh * HEAD_DIM + lane + r * 32] = kb;
+        }
+        const __nv_bfloat16 vb = __float2bfloat16(conv_at(2 * q_dim + vh * HEAD_DIM + j, t));
+        const float vval = pf_to_f(vb);
+        if (lane == 0) v_out[(size_t)t * v_dim + vh * HEAD_DIM + j] = vb;
+
         const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * v_heads + vh]));
         const float g = __expf(pf_softplus(pf_to_f(alpha[(size_t)t * v_heads + vh]) + dt_h) * a_h);
         float part_sk = 0.f;
 #pragma unroll
-        for (int r = 0; r < NROW; r++) part_sk += sloc[r] * pf_to_f(sk[t][lane + r * 32]);
-        const float sk_ = g * pf_wsum(part_sk);
-        const float delta = (pf_to_f(sv[t][j]) - sk_) * bb;
+        for (int r = 0; r < NROW; r++) part_sk += sloc[r] * kv[r];
+        const float sk = g * pf_wsum(part_sk);
+        const float delta = (vval - sk) * bb;
         float part_y = 0.f;
 #pragma unroll
         for (int r = 0; r < NROW; r++) {
-            const int i = lane + r * 32;
-            const float s_new = sloc[r] * g + pf_to_f(sk[t][i]) * delta;
+            const float s_new = sloc[r] * g + kv[r] * delta;
             sloc[r] = s_new;
-            part_y += s_new * pf_to_f(sq[t][i]) * scale;
+            part_y += s_new * qv[r] * scale;
         }
         const float y = pf_wsum(part_y);
         if (lane == 0) out[(size_t)t * v_dim + vh * HEAD_DIM + j] = __float2bfloat16(y);
@@ -1640,10 +1640,9 @@ bool launch_dflash_gdn_conv_scan_compact(const void* qkv, const void* conv_w,
                                return !(e && e[0] == '0'); }();
     if (!on || n_tokens <= 0 || head_dim != 128 || conv_kernel < 2 || conv_kernel > 8) return false;
     if (q_heads <= 0 || v_heads <= 0 || (qh_block ? (v_heads % q_heads) != 0 : false)) return false;
-    if (n_tokens > 8) return false;
-    constexpr int COLS = 32;   // 32 warps: one column each, and 384 threads for the conv prologue
+    constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
-    df_gdn_conv_scan_compact_kernel<COLS, 128, 8><<<grid, COLS * 32, 0, stream>>>(
+    df_gdn_conv_scan_compact_kernel<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
         reinterpret_cast<const __nv_bfloat16*>(conv_live),
         reinterpret_cast<__nv_bfloat16*>(k_out), reinterpret_cast<__nv_bfloat16*>(v_out),
