@@ -3544,7 +3544,18 @@ verify_forward_done:
                 c.gdn_qh_block, st);
         }
     }
-    pf_cu(cudaStreamSynchronize(st), "verify commit");
+    // The commit used to be drained here before returning. Nothing on the host reads what it
+    // writes -- the live GDN state is consumed only by the NEXT verify, which is stream-ordered
+    // behind it on `st` -- and the draft block that runs next lives on the draft's own stream
+    // and touches neither the live state nor the rec_* buffers the commit reads. So the drain
+    // only kept ~0.2 ms of commit on the critical path between two steps; without it the commit
+    // overlaps the draft. The argmax the caller needs was already synchronised above.
+    // SPARKINFER_DFLASH_COMMIT_SYNC=1 restores the drain for an A/B out of one binary.
+    static const bool commit_sync = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_COMMIT_SYNC");
+        return e && e[0] == '1';
+    }();
+    if (commit_sync) pf_cu(cudaStreamSynchronize(st), "verify commit");
     return keep;
 }
 
