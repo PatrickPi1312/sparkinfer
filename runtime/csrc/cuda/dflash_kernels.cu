@@ -167,11 +167,22 @@ __global__ void k_rms_heads(bf16* x, const bf16* w, int seq, int n_heads, int d,
 // collapsed acceptance rate.
 // att_scale: YaRN's attention_factor (0.1*ln(factor)+1 = 1.3466 here), a magnitude scaling on
 // cos/sin. 1.0f for non-YaRN callers.
+// d_past / x_off_per_past: GRAPH-REPLAY form. When d_past is non-null the kernel reads the block's
+// `past` (the draft KV length the block appends at) from device memory and applies it itself --
+// `x` advances by past * x_off_per_past elements and every position by `past` -- so a captured
+// launch stays valid as the generation advances. Null (every pre-existing caller) is bit-identical
+// to the eager form: nothing is added.
 __global__ void k_rms_heads_rope(bf16* x, const bf16* w, int seq, int n_heads, int d,
                                  float eps, int pos0, float theta,
-                                 const float* inv_freq, float att_scale) {
+                                 const float* inv_freq, float att_scale,
+                                 const int* __restrict__ d_past, int x_off_per_past) {
     const int idx = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (idx >= seq * n_heads) return;
+    if (d_past) {
+        const int p = *d_past;
+        x += (size_t)p * (size_t)x_off_per_past;
+        pos0 += p;
+    }
     bf16* h = x + (size_t)idx * d;
     const int lane = threadIdx.x & 31;
     float ss = 0.f;
@@ -343,13 +354,33 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
 // serial chain shortens and the grid grows with context. Per-split partial (m, l, acc)
 // states are merged by k_attn_split_combine, which is the same online-softmax merge the
 // in-CTA warp reduction already does -- exact for any split count.
+// d_past / lo_dyn: GRAPH-REPLAY form (see k_rms_heads_rope). With d_past set, kv_len and q_pos0
+// arrive WITHOUT the block's `past` and the kernel adds it from device memory; lo_dyn additionally
+// re-derives the windowed key floor exactly as attn_gqa_kv_lo does on the host, from the same
+// n_splits the launch was captured with. Null d_past is bit-identical to the eager form.
+__device__ __forceinline__ void attn_apply_past(const int* __restrict__ d_past, int lo_dyn,
+                                                int n_splits, int k_pos0, int window,
+                                                int& kv_lo, int& kv_len, int& q_pos0) {
+    if (!d_past) return;
+    const int p = *d_past;
+    kv_len += p;
+    q_pos0 += p;
+    if (lo_dyn && window > 0) {
+        const long lo = (long)q_pos0 - (long)k_pos0 - (long)window + 1;
+        const int chunk_full = (kv_len + n_splits - 1) / n_splits;
+        kv_lo = (lo >= chunk_full && lo < (long)kv_len) ? (int)lo : 0;
+    }
+}
+
 template <int ROWS, int NWARPS>
 __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     float* __restrict__ p_m, float* __restrict__ p_l, float* __restrict__ p_acc,
     int q_len, int kv_lo, int kv_len, int n_q, int n_kv,
-    int q_pos0, int k_pos0, int window, bool causal, float scale, int n_splits) {
+    int q_pos0, int k_pos0, int window, bool causal, float scale, int n_splits,
+    const int* __restrict__ d_past, int lo_dyn) {
     constexpr int D = 128, E = D / 32;
+    attn_apply_past(d_past, lo_dyn, n_splits, k_pos0, window, kv_lo, kv_len, q_pos0);
     const int rg = blockIdx.x, qh = blockIdx.y, sp = blockIdx.z;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int base = lane * E;
@@ -485,8 +516,10 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_tile_hd128(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     float* __restrict__ p_m, float* __restrict__ p_l, float* __restrict__ p_acc,
     int q_len, int kv_lo, int kv_len, int n_q, int n_kv,
-    int q_pos0, int k_pos0, int window, bool causal, float scale, int n_splits) {
+    int q_pos0, int k_pos0, int window, bool causal, float scale, int n_splits,
+    const int* __restrict__ d_past, int lo_dyn) {
     constexpr int D = 128, E = D / 32;
+    attn_apply_past(d_past, lo_dyn, n_splits, k_pos0, window, kv_lo, kv_len, q_pos0);
     const int rg = blockIdx.x, qh = blockIdx.y, sp = blockIdx.z;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int base = lane * E;
@@ -1198,6 +1231,10 @@ __global__ void k_gemv_batched_fused3_q4(
 //
 // Draft-only, so this is NOMINATION-only: it can move which tokens are proposed, never which are
 // emitted. LOSSLESS is unaffected.
+// d_past / y_off_mask: GRAPH-REPLAY form (see k_rms_heads_rope). Output i whose bit is set in
+// y_off_mask advances by past * N_i elements -- i.e. `past` rows of its own width -- so a launch
+// that projects straight into a KV-cache slice can be captured once and replayed as the cache
+// fills. Null d_past (every pre-existing caller) is bit-identical to the eager form.
 template <int BATCH, int ROWS, int KSPLIT>
 __global__ void k_gemv_batched_fused3_q4_dp4a(
         const si_q81_blk* __restrict__ xq,
@@ -1205,8 +1242,15 @@ __global__ void k_gemv_batched_fused3_q4_dp4a(
         const unsigned char* __restrict__ Q2,
         const __half2* __restrict__ D0, const __half2* __restrict__ D1, const __half2* __restrict__ D2,
         bf16* __restrict__ y0, bf16* __restrict__ y1, bf16* __restrict__ y2,
-        int N0, int N1, int N2, int K) {
+        int N0, int N1, int N2, int K,
+        const int* __restrict__ d_past, int y_off_mask) {
     __shared__ float red[KSPLIT][ROWS][BATCH];
+    if (d_past) {
+        const size_t p = (size_t)(*d_past);
+        if (y_off_mask & 1) y0 += p * (size_t)N0;
+        if (y_off_mask & 2) y1 += p * (size_t)N1;
+        if (y_off_mask & 4) y2 += p * (size_t)N2;
+    }
     const int total = N0 + N1 + N2;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -1390,7 +1434,7 @@ void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,
                                         const void* D0, const void* D1, const void* D2,
                                         void* y0, void* y1, void* y2,
                                         int N0, int N1, int N2, int K, cudaStream_t stream,
-                                        int batch) {
+                                        int batch, const int* d_past, int y_off_mask) {
     const int total = N0 + N1 + N2;
     if (total <= 0 || (K & 31)) return;
     constexpr int ROWS = 4, KS = 2;
@@ -1400,7 +1444,7 @@ void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,
 #define SI_DP4A_F3(BW_) k_gemv_batched_fused3_q4_dp4a<BW_, ROWS, KS><<<grid, blk, 0, stream>>>( \
         xp, (const unsigned char*)Q0, (const unsigned char*)Q1, (const unsigned char*)Q2,       \
         (const __half2*)D0, (const __half2*)D1, (const __half2*)D2,                            \
-        (bf16*)y0, (bf16*)y1, (bf16*)y2, N0, N1, N2, K)
+        (bf16*)y0, (bf16*)y1, (bf16*)y2, N0, N1, N2, K, d_past, y_off_mask)
     if (batch == 1)      SI_DP4A_F3(1);
     else if (batch == 2) SI_DP4A_F3(2);
     else if (batch == 3) SI_DP4A_F3(3);
@@ -1559,12 +1603,14 @@ void launch_add_rms(const void* a, const void* b, void* sum, const void* w, void
 
 void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
                            int pos0, float theta, cudaStream_t stream,
-                           const float* inv_freq, float att_scale) {
+                           const float* inv_freq, float att_scale,
+                           const int* d_past, int x_off_per_past) {
     if (seq <= 0 || n_heads <= 0) return;
     constexpr int WPB = 4;
     const int total = seq * n_heads;
     k_rms_heads_rope<<<(total + WPB - 1) / WPB, WPB * 32, 0, stream>>>(
-        (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta, inv_freq, att_scale);
+        (bf16*)x, (const bf16*)w, seq, n_heads, d, eps, pos0, theta, inv_freq, att_scale,
+        d_past, x_off_per_past);
 }
 
 // See k_rms_heads_rope_normal for why Muse Glimmer's DFlash draft needs this consecutive-pair
@@ -1639,16 +1685,36 @@ int attn_gqa_kv_lo(int q_len, int kv_len, int n_q, int n_kv, int d,
     return 0;
 }
 
+bool attn_gqa_graph_ok(int q_len, int kv_len, int n_q, int n_kv, int d, int window) {
+    // The captured launch fixes grid.z = n_splits and the kernel re-derives the key floor from
+    // that same count, so the replay is exact only while attn_gqa_splits() would keep returning
+    // the compiled cap for every key range the block can see: the full cache, and the windowed
+    // tail (>= window keys, since the newest key is always inside the window).
+    if (!attn_gqa_split_path_ok(q_len, kv_len, n_q, n_kv, d)) return false;
+    static const int cap = attn_gqa_splits(1 << 30);
+    if (attn_gqa_splits(kv_len) != cap) return false;
+    if (window > 0 && attn_gqa_splits(window) != cap) return false;
+    return true;
+}
+
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
                      int q_pos0, int k_pos0, int window, bool causal, float scale,
-                     cudaStream_t stream, float* fa_m, float* fa_l, float* fa_acc) {
-    if (q_len <= 0 || kv_len <= 0) return;
+                     cudaStream_t stream, float* fa_m, float* fa_l, float* fa_acc,
+                     const int* d_past, int past_at_capture) {
+    // GRAPH-REPLAY form: kv_len / q_pos0 arrive without `past`; every host-side decision below
+    // is taken on the real values (this launch IS the capture, so *d_past == past_at_capture),
+    // and the kernel adds *d_past itself on every replay. Callers must have checked
+    // attn_gqa_graph_ok() first, which is what makes the fixed n_splits below exact.
+    const int past_h = d_past ? past_at_capture : 0;
+    const int kv_len_real = kv_len + past_h;
+    const int q_pos0_real = q_pos0 + past_h;
+    if (q_len <= 0 || kv_len_real <= 0) return;
     dim3 grid(q_len, n_q);
     if (d == 128) {
         // Row-batched + KV-split path. Needs the caller's partial-state scratch; without it
         // (or below the sweep's crossover) fall through to the single-CTA-per-row kernel.
-        if (fa_m && fa_l && fa_acc && attn_gqa_split_path_ok(q_len, kv_len, n_q, n_kv, d)) {
+        if (fa_m && fa_l && fa_acc && attn_gqa_split_path_ok(q_len, kv_len_real, n_q, n_kv, d)) {
             constexpr int NWARPS = 8;
             // QUERY ROWS PER CTA. The grid is (ceil(q_len/ROWS), n_q, n_splits) and the kv head is
             // derived per q head, so each K/V byte is re-read (n_q/n_kv) x ceil(q_len/ROWS) times.
@@ -1671,15 +1737,24 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                 int v = e ? atoi(e) : 8;
                 return (v == 2 || v == 4 || v == 8) ? v : 8;
             }();
-            const int n_splits_full = attn_gqa_splits(kv_len);
+            const int n_splits_full = attn_gqa_splits(kv_len_real);
             // A sliding-window layer masks a key only after the kernel has loaded it and reduced
             // its QK dot, so past the window length it streams the whole cache to discard most of
             // it -- at a 16k context with a 4096 window that is 3/4 of the traffic on every
             // windowed layer. The kernel's own predicate is (q_pos - k_pos) >= window, and the
             // block's smallest query position is q_pos0, so every key at or below
             // q_pos0 - k_pos0 - window is dead for the whole block: start the partition above it.
-            const int kv_lo = attn_gqa_kv_lo(q_len, kv_len, n_q, n_kv, d, q_pos0, k_pos0, window);
-            const int n_splits = kv_lo > 0 ? attn_gqa_splits(kv_len - kv_lo) : n_splits_full;
+            const int kv_lo_real = attn_gqa_kv_lo(q_len, kv_len_real, n_q, n_kv, d,
+                                                  q_pos0_real, k_pos0, window);
+            const int n_splits = kv_lo_real > 0 ? attn_gqa_splits(kv_len_real - kv_lo_real)
+                                                : n_splits_full;
+            // Replay form: the kernel re-derives the floor from *d_past on every launch (lo_dyn),
+            // under exactly the conditions attn_gqa_kv_lo applies it on the host. Eager form
+            // passes the host value and lo_dyn=0, unchanged.
+            static const int kWinSpanDyn = []{ const char* e = getenv("SPARKINFER_DFLASH_WINSPAN");
+                                               return (e && e[0] == '0') ? 0 : 1; }();
+            const int lo_dyn = (d_past && window > 0 && kWinSpanDyn) ? 1 : 0;
+            const int kv_lo = d_past ? 0 : kv_lo_real;
             // KEYS PER TRIP for the tiled kernel above. 0 keeps the one-key-at-a-time kernel,
             // which is what every earlier measurement on this shape was taken against.
             // KEYS PER TRIP for the tiled kernel above. Swept end to end at ctx 4k, one binary,
@@ -1704,12 +1779,12 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                     k_attn_rows_tile_hd128<(R), NWARPS, 2><<<g, NWARPS * 32, smem, stream>>>(     \
                         (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,       \
                         q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale,   \
-                        n_splits);                                                                \
+                        n_splits, d_past, lo_dyn);                                                \
                 else                                                                              \
                     k_attn_rows_split_hd128<(R), NWARPS><<<g, NWARPS * 32, smem, stream>>>(       \
                         (const bf16*)q, (const bf16*)k, (const bf16*)v, fa_m, fa_l, fa_acc,       \
                         q_len, kv_lo, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale,   \
-                        n_splits);                                                                \
+                        n_splits, d_past, lo_dyn);                                                \
             } while (0)
             if (rows_env == 8)      SI_DF_ATTN_ROWS(8);
             else if (rows_env == 4) SI_DF_ATTN_ROWS(4);
@@ -1722,15 +1797,17 @@ void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
         constexpr int THREADS = 512;
         constexpr int NWARPS = THREADS / 32;
         constexpr int SMEM = (2 * NWARPS + NWARPS * 128) * sizeof(float);
+        // These fallbacks take no d_past: a replay caller is required to have passed
+        // attn_gqa_graph_ok(), which guarantees the split path above.
         k_attn_multiwarp_hd128<<<grid, THREADS, SMEM, stream>>>(
             (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)out,
-            q_len, kv_len, n_q, n_kv, q_pos0, k_pos0, window, causal, scale);
+            q_len, kv_len_real, n_q, n_kv, q_pos0_real, k_pos0, window, causal, scale);
         return;
     }
     int smem = (2 * d + 128) * (int)sizeof(float);
     k_attn<<<grid, 128, smem, stream>>>((const bf16*)q, (const bf16*)k, (const bf16*)v,
-                                        (bf16*)out, q_len, kv_len, n_q, n_kv, d,
-                                        q_pos0, k_pos0, window, causal, scale);
+                                        (bf16*)out, q_len, kv_len_real, n_q, n_kv, d,
+                                        q_pos0_real, k_pos0, window, causal, scale);
 }
 
 void launch_gemv_batched16(const void* x, const void* W, void* y, int N, int K,

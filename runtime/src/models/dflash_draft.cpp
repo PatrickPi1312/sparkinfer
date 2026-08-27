@@ -386,6 +386,19 @@ struct DFlashDraftModel::Impl {
     std::vector<bf16*> k_cache, v_cache;
     int seq_len = 0;
 
+    // GRAPH REPLAY (see forward_block): the block's `past` in device memory, uploaded from the
+    // pinned mirror as the graph's first node, plus one instantiated graph per tier.
+    int* d_past = nullptr;
+    int* h_past = nullptr;
+    struct DraftGraph {
+        int ctx_len, width, depth;
+        const void* hidden;
+        bool confidence;
+        cudaGraphExec_t exec;
+    };
+    std::vector<DraftGraph> graphs;
+    bool graph_disabled = false;
+
     // The draft's quantized weight copies are built on first use, not at load. Constructing them
     // is what makes merely loading the draft tax the TARGET's decode: measured on RTX 5090 with
     // the same bench_decode call either side of draft.load(), 501.9 -> 460.1 tok/s at 512-ctx, and
@@ -482,6 +495,8 @@ struct DFlashDraftModel::Impl {
         // the draft block -- immediately after the verify has left a 158 us GDN state commit in
         // flight on the target's stream, which shares no data with the draft and should overlap it.
         cu(cudaHostAlloc(&h_ids, (B + 1) * sizeof(int), cudaHostAllocDefault), "h_ids");
+        d_past = alloc<int>(1);
+        cu(cudaHostAlloc(&h_past, sizeof(int), cudaHostAllocDefault), "h_past");
         {
             int kmax = (cfg.intermediate > cfg.hidden ? cfg.intermediate : cfg.hidden);
             const int kfc = (int)cfg.target_layer_ids.size() * cfg.hidden;   // the fc projector
@@ -579,9 +594,11 @@ DFlashDraftModel::DFlashDraftModel(const DFlashDraftConfig& cfg) : p_(new Impl()
 
 DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
+    for (auto& g : p_->graphs) if (g.exec) cudaGraphExecDestroy(g.exec);
     for (void* p : p_->owned) cudaFree(p);
     if (p_->h_out) cudaFreeHost(p_->h_out);
     if (p_->h_ids) cudaFreeHost(p_->h_ids);
+    if (p_->h_past) cudaFreeHost(p_->h_past);
     if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
     if (p_->stream) cudaStreamDestroy(p_->stream);
     delete p_;
@@ -1135,13 +1152,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // Stage through pinned memory (see h_ids): a pageable H2D would sync the stream here.
     static const bool kPinIds = []{ const char* e = getenv("SPARKINFER_DFLASH_PIN_IDS");
                                     return !(e && e[0] == '0'); }();
-    if (kPinIds && s.h_ids) {
-        for (int i = 0; i < BW; i++) s.h_ids[i] = noise_ids[i];
-        cu(cudaMemcpyAsync(s.d_ids, s.h_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
-    } else {
-        cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
-    }
-    kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);
+    // (The ids upload and the noise embedding are issued inside `issue` below, so that the graph
+    // form captures them: same launches, same stream order relative to everything that reads
+    // s.d_ids / s.noise.)
 
     // target_hidden [ctx, n_cap*H] -> fc -> hidden_norm -> target_proj [ctx, H]
     // fc.weight is [H, n_cap*H] (out, in). Loop gemv per row.
@@ -1185,6 +1198,70 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // per-layer context K/V below -- through the Q4 copies. 0 restores bf16 for both.
     static const bool kCtxQ4 = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_Q4");
                                    return !(e && e[0] == '0'); }();
+
+    // GRAPH REPLAY (SPARKINFER_DFLASH_GRAPH=0 restores eager launches for an A/B).
+    //
+    // The steady-state block is launch-bound: ~90 kernels of 1-3 us each, issued one at a time
+    // from the host, with the gaps between them the same size as the kernels (see the note at the
+    // K/V projection below). Its weight traffic is ~0.6 GB a block, ~0.35 ms at this card's
+    // bandwidth, against a measured 1.5 ms per call. Everything a block launches is a function of
+    // (ctx_len, block width, proposal depth, the capture buffer it reads) EXCEPT the draft KV
+    // length `past` it appends at, which grows every step and reaches the kernels as cache
+    // pointers and positions. So `past` lives in device memory instead: the three kernels that
+    // consume it (the KV-cache projections, the per-head norm+RoPE and the attention) add it
+    // themselves from `d_past`, the graph's first node uploads it from pinned memory, and one
+    // captured graph per (ctx_len, ...) tier replays for the rest of the generation. Same kernels,
+    // same arguments after the in-kernel add, same stream order: the proposals are bit-identical
+    // to the eager form, which SPARKINFER_DFLASH_GRAPH=0 keeps for comparison.
+    //
+    // The first block of a generation (the whole-prompt ingestion through the tensor-core GEMM)
+    // and anything the replay form does not cover -- windowed context trimming that skips rows,
+    // a split count that would move, a non-NeoX RoPE, the bf16/Q8 weight paths, the dump and
+    // ablation env hooks -- stay on the eager path, unchanged.
+    static const bool kGraphEnv = []{
+        const char* e = getenv("SPARKINFER_DFLASH_GRAPH");
+        if (e && e[0] == '0') return false;
+        if (getenv("SPARKINFER_DFLASH_ZERO_CTX") || getenv("SPARKINFER_DSPARK_DUMP")) return false;
+        return true;
+    }();
+    bool graph_ok = kGraphEnv && !s.graph_disabled && s.d_past && s.h_past && kPinIds && s.h_ids &&
+                    ctx_len >= 1 && ctx_len <= 8 && !ctx_gemm && fc_skip == 0 &&
+                    pos0 == past + ctx_len && past + ctx_len + BW <= c.max_seq &&
+                    !c.rope_normal && fast16 && dp4a_ok && dp4a_qkv && kCtxQ4 && s.q8_fc.q4 &&
+                    s.fa_m && s.fa_l && s.fa_acc && kFullWindow >= 0;
+    if (graph_ok) {
+        const int kv_len_chk = past + ctx_len + BW;
+        static const int kCtxTrimChk = []{ const char* e = getenv("SPARKINFER_DFLASH_CTX_TRIM");
+                                           return (e && e[0] == '0') ? 0 : 1; }();
+        for (int L = 0; L < c.n_layers && graph_ok; L++) {
+            const LayerWeights& w = s.layers[L];
+            int win = (L < (int)c.sliding_layers.size() && c.sliding_layers[L]) ? c.sliding_window : 0;
+            if (win == 0 && kFullWindow > 0) win = kFullWindow;
+            const int lo = kCtxTrimChk
+                ? dflash_kernels::attn_gqa_kv_lo(BW, kv_len_chk, c.n_q_heads, c.n_kv_heads, d,
+                                                 pos0, 0, win)
+                : 0;
+            if (lo > past) graph_ok = false;                       // would skip context rows
+            if (!(w.q8_wq.q4 && w.q8_wk.q4 && w.q8_wv.q4)) graph_ok = false;
+            if (!dflash_kernels::attn_gqa_graph_ok(BW, kv_len_chk, c.n_q_heads, c.n_kv_heads, d,
+                                                   win)) graph_ok = false;
+        }
+    }
+
+    // Everything the block launches, from the ids upload to the argmax/confidence readback.
+    // `dp` non-null = replay form: `past_h` is 0, cache pointers and positions are issued
+    // without `past`, and the kernels add *dp (uploaded as the first node). Null = eager form,
+    // `past_h == past`, bit-for-bit the pre-existing launch sequence.
+    auto issue = [&](const int* dp, const int past_h) -> bool {
+    if (dp) cu(cudaMemcpyAsync(s.d_past, s.h_past, sizeof(int), cudaMemcpyHostToDevice, st),
+               "past upload");
+    if (kPinIds && s.h_ids) {
+        for (int i = 0; i < BW; i++) s.h_ids[i] = noise_ids[i];
+        cu(cudaMemcpyAsync(s.d_ids, s.h_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    } else {
+        cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
+    }
+    kernels::launch_embedding(s.d_ids, s.embed, s.noise, BW, H, st);
     if (fc_rows > 0) {
         const bf16* th = (const bf16*)target_hidden + (size_t)fc_skip * n_cap * H;
         bf16* tp = s.target_proj + (size_t)fc_skip * H;
@@ -1243,8 +1320,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         int window_of_layer = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
                                         ? c.sliding_window : 0;
         if (window_of_layer == 0 && kFullWindow > 0) window_of_layer = kFullWindow;
-        bf16* const kdst = s.k_cache[L] + (size_t)past * kvdim;
-        bf16* const vdst = s.v_cache[L] + (size_t)past * kvdim;
+        // Replay form: `past_h` is 0 here and the kernels add *dp to these (see `issue`).
+        bf16* const kdst = s.k_cache[L] + (size_t)past_h * kvdim;
+        bf16* const vdst = s.v_cache[L] + (size_t)past_h * kvdim;
         if (L == 0)
             dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
 
@@ -1255,7 +1333,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                     xn_ready ? s.xq81 : q81(s.xn, H), w.q8_wq.q4, w.q8_wk.q4, w.q8_wv.q4,
                     w.q8_wq.dm, w.q8_wk.dm, w.q8_wv.dm,
                     s.q, kdst + (size_t)ctx_len * kvdim, vdst + (size_t)ctx_len * kvdim,
-                    qdim, kvdim, kvdim, H, st, BW);
+                    qdim, kvdim, kvdim, H, st, BW, dp, /*y_off_mask=*/2 | 4);
             else if (w.q8_wq.q4)
                 dflash_kernels::launch_gemv_batched_q4_fused3(
                     s.xn, w.q8_wq.q4, w.q8_wk.q4, w.q8_wv.q4, w.q8_wq.dm, w.q8_wk.dm, w.q8_wv.dm,
@@ -1329,7 +1407,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
                 q81n(ctx_src, H, ctx_rows), w.q8_wk.q4, w.q8_wv.q4, nullptr,
                 w.q8_wk.dm, w.q8_wv.dm, nullptr,
-                kdst_ctx, vdst_ctx, nullptr, kvdim, kvdim, 0, H, st, ctx_rows);
+                kdst_ctx, vdst_ctx, nullptr, kvdim, kvdim, 0, H, st, ctx_rows,
+                dp, /*y_off_mask=*/1 | 2);
         } else if (ctx_q4) {
             // Same fused pair the noise rows use; y0/y1 are written as [row][kvdim], which is
             // exactly the cache slice's layout.
@@ -1362,8 +1441,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // k positions: past .. past+new_len-1 when past==seq_len and we're appending.
         // Absolute: k_pos0 = pos0 - ctx_len (context features align with tokens just before noise),
         // q_pos0 = pos0.
-        const int k_pos0 = pos0 - ctx_len;
-        const int q_pos0 = pos0;
+        // Replay form: positions are issued relative to `past` (which is `past_h` = 0 here) and
+        // the RoPE / attention kernels add *dp. pos0 == past + ctx_len was checked above.
+        const int q_pos0 = dp ? past_h + ctx_len : pos0;
+        const int k_pos0 = q_pos0 - ctx_len;
         // c.rope_normal selects consecutive-pair ("normal"/LLAMA_ROPE_TYPE_NORM) RoPE instead of
         // the NeoX split-half pairing every other DFlash draft checkpoint (Qwen3.6) uses -- see
         // DFlashDraftConfig::rope_normal and k_rms_heads_rope_normal (dflash_kernels.cu) for why
@@ -1384,15 +1465,17 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             // rotated with the same table or their relative phase is wrong.
             dflash_kernels::launch_rms_heads_rope(s.q, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
                                                  q_pos0, c.rope_theta, st,
-                                                 s.d_yarn_inv_freq, s.yarn_att_scale);
+                                                 s.d_yarn_inv_freq, s.yarn_att_scale,
+                                                 dp, /*x_off_per_past=*/0);
             dflash_kernels::launch_rms_heads_rope(kdst + (size_t)ctx_skip * kvdim, w.k_norm,
                                                  new_len - ctx_skip, c.n_kv_heads, d,
                                                  c.rms_eps, k_pos0 + ctx_skip, c.rope_theta, st,
-                                                 s.d_yarn_inv_freq, s.yarn_att_scale);
+                                                 s.d_yarn_inv_freq, s.yarn_att_scale,
+                                                 dp, /*x_off_per_past=*/kvdim);
         }
 
         // K/V are already in the cache at offset `past` -- attend over the full past+new.
-        const int kv_len = past + new_len;
+        const int kv_len = past_h + new_len;
         const int window = window_of_layer;
         static int mixed_causal = [] {
             const char* e = getenv("SPARKINFER_DFLASH_MIXED_CAUSAL");
@@ -1417,7 +1500,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L], s.v_cache[L], s.attn,
                                         BW, kv_len, c.n_q_heads, c.n_kv_heads, d,
                                         q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st,
-                                        s.fa_m, s.fa_l, s.fa_acc);
+                                        s.fa_m, s.fa_l, s.fa_acc, dp, dp ? past : 0);
 
         if (fast16) {
             if (w.q8_wo.q4 && dp4a_o)
@@ -1785,6 +1868,50 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         cu(cudaMemcpyAsync(s.h_confidence + 1, s.d_confidence + 1,
                            kProposalDepth * sizeof(float), cudaMemcpyDeviceToHost, st),
            "confidence readback");
+    return true;
+    };   // issue
+
+    bool issued = false;
+    if (graph_ok) {
+        *s.h_past = past;
+        cudaGraphExec_t exec = nullptr;
+        for (const auto& g : s.graphs)
+            if (g.ctx_len == ctx_len && g.width == BW && g.depth == kProposalDepth &&
+                g.hidden == target_hidden && g.confidence == (out_confidence != nullptr)) {
+                exec = g.exec;
+                break;
+            }
+        if (!exec) {
+            // First block at this tier: capture it (nothing runs during capture), instantiate,
+            // and launch the instantiated graph as this block. A capture that fails for any
+            // reason leaves nothing executed, so the eager form below simply issues the block.
+            cudaGraph_t graph = nullptr;
+            bool ok = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+            if (ok) {
+                const bool body = issue(s.d_past, 0);
+                if (cudaStreamEndCapture(st, &graph) != cudaSuccess || !graph) ok = false;
+                if (!body) ok = false;
+            }
+            if (ok && cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
+                exec = nullptr;
+                ok = false;
+            }
+            if (graph) cudaGraphDestroy(graph);   // the exec holds its own copy
+            if (ok && exec) {
+                s.graphs.push_back(Impl::DraftGraph{ctx_len, BW, kProposalDepth, target_hidden,
+                                                    out_confidence != nullptr, exec});
+            } else {
+                (void)cudaGetLastError();          // clear the capture error, if any
+                s.graph_disabled = true;
+                exec = nullptr;
+            }
+        }
+        if (exec) {
+            cu(cudaGraphLaunch(exec, st), "draft graph launch");
+            issued = true;
+        }
+    }
+    if (!issued && !issue(nullptr, past)) return false;
     cu(cudaStreamSynchronize(st), "draft sync");
     for (int t = head_done ? 1 : 0; t <= kProposalDepth; t++) out_argmax[t] = s.h_out[t];
     if (out_confidence && s.confidence_w)

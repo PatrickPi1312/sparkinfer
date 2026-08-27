@@ -23,11 +23,22 @@ constexpr int kDFlashAttnMinKv = 1024;
 // fa_m / fa_l / fa_acc: optional partial-state scratch for the hd128 KV-split path, sized
 // [kDFlashAttnMaxRows * n_q * kDFlashAttnMaxSplits] (and * 128 for fa_acc). Pass nullptr to
 // force the single-CTA-per-row kernel.
+// d_past / past_at_capture: GRAPH-REPLAY form. Pass kv_len and q_pos0 WITHOUT the block's `past`
+// plus a device int holding it; the kernel adds *d_past on every launch, so the launch can be
+// captured into a CUDA graph once and replayed as the cache fills. past_at_capture is the value
+// *d_past holds at THIS launch, for the host-side decisions (split count, window floor). Callers
+// must check attn_gqa_graph_ok() first. d_past == nullptr is the eager form, bit-identical to
+// before.
 void launch_attn_gqa(const void* q, const void* k, const void* v, void* out,
                      int q_len, int kv_len, int n_q, int n_kv, int d,
                      int q_pos0, int k_pos0, int window, bool causal, float scale,
                      cudaStream_t stream, float* fa_m = nullptr, float* fa_l = nullptr,
-                     float* fa_acc = nullptr);
+                     float* fa_acc = nullptr, const int* d_past = nullptr,
+                     int past_at_capture = 0);
+// True when a launch_attn_gqa for this shape takes the row-batched KV-split path with a split
+// count that stays constant for every key range the block can see -- the precondition for
+// capturing it with d_past set.
+bool attn_gqa_graph_ok(int q_len, int kv_len, int n_q, int n_kv, int d, int window);
 
 // First key index launch_attn_gqa will actually read for a windowed layer, given a block whose
 // smallest query position is q_pos0; 0 when it will read from the start. Everything below the
@@ -89,12 +100,16 @@ void launch_quantize_w_q4(const void* w, void* q, void* dm, int N, int K, cudaSt
 
 // int4-weight form of launch_gemv_batched16_fused3 (~5 bits/weight vs Q8_0's 9).
 // dp4a twin of the Q4 fused3 below; `xq81` is Q8_1(x), 36 B per 32 values per batch row.
+// d_past / y_off_mask: GRAPH-REPLAY form. Output i with bit i set in y_off_mask is advanced by
+// (*d_past) * N_i elements inside the kernel -- `past` rows of that output -- so a projection
+// straight into a KV-cache slice can be captured once. nullptr = eager form, unchanged.
 void launch_gemv_batched_q4_dp4a_fused3(const void* xq81,
                                         const void* Q0, const void* Q1, const void* Q2,
                                         const void* D0, const void* D1, const void* D2,
                                         void* y0, void* y1, void* y2,
                                         int N0, int N1, int N2, int K, cudaStream_t stream,
-                                        int batch);
+                                        int batch, const int* d_past = nullptr,
+                                        int y_off_mask = 0);
 void launch_gemv_batched_q4_fused3(const void* x,
                                    const void* Q0, const void* Q1, const void* Q2,
                                    const void* D0, const void* D1, const void* D2,
@@ -135,9 +150,12 @@ void launch_rms_heads(void* x, const void* w, int seq, int n_heads, int d,
 // inv_freq (optional, [d/2]) + att_scale carry YaRN. Null/1.0f => the original inline
 // theta^(-2i/d), bit-identical for every pre-existing caller. YaRN's NTK-by-parts ramp scales each
 // frequency band differently, so it cannot be folded into theta; see k_rms_heads_rope.
+// d_past / x_off_per_past: GRAPH-REPLAY form. `x` advances by (*d_past) * x_off_per_past
+// elements and every position by *d_past inside the kernel. nullptr = eager form, unchanged.
 void launch_rms_heads_rope(void* x, const void* w, int seq, int n_heads, int d, float eps,
                            int pos0, float theta, cudaStream_t stream,
-                           const float* inv_freq = nullptr, float att_scale = 1.0f);
+                           const float* inv_freq = nullptr, float att_scale = 1.0f,
+                           const int* d_past = nullptr, int x_off_per_past = 0);
 
 // Same as launch_rms_heads_rope, but "normal" (consecutive-pair, LLAMA_ROPE_TYPE_NORM) RoPE
 // pairing instead of NeoX split-half. Needed for the Muse Glimmer DFlash draft checkpoint --
