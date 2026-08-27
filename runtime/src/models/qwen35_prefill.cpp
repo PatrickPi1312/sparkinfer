@@ -2833,6 +2833,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         recording = false;
     };
     bool head_ok = false;
+    bool head_argmax_ok = false;
     if (graph_model_key != s.w.lm_head || graph_state_key != s.lin_state ||
         graph_conv_key != s.lin_conv_state || graph_capture_key != capture_dst ||
         graph_btable_key != btable || graph_ns_key != ns) {
@@ -3409,9 +3410,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const char* e = getenv("SPARKINFER_DFLASH_VERIFY_HEAD_ROWS");
             return !(e && e[0] == '0');
         }();
-        head_ok = head_rows_on && N > 1 &&
-                  kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
-                                                N, c.vocab, H, st);
+        static const bool head_argmax_on = [] {
+            const char* e = getenv("SPARKINFER_Q4K_HEAD_ARGMAX");
+            return !(e && e[0] == '0');
+        }();
+        head_argmax_ok = head_argmax_on && head_rows_on && N > 1 &&
+                         kernels::launch_mmvq_rows_argmax(
+                             s.w.lm_head_type, q81, s.w.lm_head, logits, out_ids,
+                             N, c.vocab, H, st);
+        head_ok = head_argmax_ok ||
+                  (head_rows_on && N > 1 &&
+                   kernels::launch_mmvq_rows_f32(s.w.lm_head_type, q81, s.w.lm_head, logits,
+                                                 N, c.vocab, H, st));
         if (!head_ok) {
             const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
             for (int r = 0; r < N; ++r) {
@@ -3430,7 +3440,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         abandon_capture();
         return -1;
     }
-    kernels::launch_argmax(logits, out_ids, N, c.vocab, st);
+    if (!head_argmax_ok) kernels::launch_argmax(logits, out_ids, N, c.vocab, st);
     pf_cu(cudaMemcpyAsync(ph_out, out_ids, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost, st),
           "verify argmax");
     if (recording) {

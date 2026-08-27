@@ -1927,6 +1927,127 @@ __global__ void si_mmvq_q4k_rows_exact_kernel(const si_block_q8_1* __restrict__ 
         __syncthreads();   // every thread of the CTA must reach the same barrier
     }
 }
+
+// Qwen3.8 verifier LM-head + greedy argmax without materialising [M, vocab] logits.
+//
+// The ordinary exact-row kernel launches one CTA for every OROWS vocabulary rows, writes every
+// fp32 logit, then launch_argmax reads the whole matrix back. Here a fixed resident-sized grid
+// walks those same vocabulary-row tiles. Every tile still goes through si_vec_dot_q4_K_tiled and
+// the identical four-warp reduction, so each logit has exactly the same floating-point association
+// as si_mmvq_q4k_rows_exact_kernel (and AR decode). A CTA retains only its best (value, token id)
+// per activation row; a second tiny kernel reduces those partial winners with the same smaller-id
+// tie break as launch_argmax. `scratch` needs 2*M*grid floats; the verifier's existing logits arena
+// is much larger and is deliberately reused for it.
+template <int MMAX, int OROWS>
+__global__ void si_mmvq_q4k_rows_argmax_kernel(
+        const si_block_q8_1* __restrict__ q, const unsigned char* __restrict__ W,
+        float* __restrict__ partial_val, int* __restrict__ partial_id, int M, int N) {
+    constexpr int NSUPER = 20, NW = 4, WS = 32, vdr = 2, qi = 32;
+    constexpr int QPR = NSUPER * 8;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    __shared__ float partial[OROWS][MMAX][NW - 1][WS];
+    float best[MMAX];
+    int best_id[MMAX];
+    #pragma unroll
+    for (int m = 0; m < MMAX; ++m) {
+        best[m] = -1.0e30f;
+        best_id[m] = 0;
+    }
+
+    for (int row0 = (int)blockIdx.x * OROWS; row0 < N;
+         row0 += (int)gridDim.x * OROWS) {
+        const int orows = (N - row0 < OROWS) ? (N - row0) : OROWS;
+        const si_block_q4_K* x_row = reinterpret_cast<const si_block_q4_K*>(
+            W + (size_t)row0 * NSUPER * 144);
+        constexpr int blocks_per_iter = vdr * NW * WS / qi;
+        float tmp[OROWS][MMAX];
+        #pragma unroll
+        for (int o = 0; o < OROWS; ++o)
+            #pragma unroll
+            for (int m = 0; m < MMAX; ++m) tmp[o][m] = 0.f;
+        #pragma unroll
+        for (int kbx = tid / (qi / vdr); kbx < NSUPER; kbx += blocks_per_iter) {
+            const int kqs = vdr * (tid % (qi / vdr));
+            si_vec_dot_q4_K_tiled<OROWS, MMAX>(x_row + kbx, (size_t)NSUPER, orows,
+                                               q + kbx * 8, kqs, QPR, M, tmp);
+        }
+        if (warp > 0) {
+            #pragma unroll
+            for (int o = 0; o < OROWS; ++o)
+                #pragma unroll
+                for (int m = 0; m < MMAX; ++m)
+                    if (o < orows && m < M) partial[o][m][warp - 1][lane] = tmp[o][m];
+        }
+        __syncthreads();
+        if (warp == 0) {
+            #pragma unroll
+            for (int o = 0; o < OROWS; ++o) {
+                if (o >= orows) break;
+                #pragma unroll
+                for (int m = 0; m < MMAX; ++m) {
+                    if (m >= M) break;
+                    #pragma unroll
+                    for (int l = 0; l < NW - 1; ++l) tmp[o][m] += partial[o][m][l][lane];
+                    #pragma unroll
+                    for (int s = 16; s > 0; s >>= 1)
+                        tmp[o][m] += __shfl_xor_sync(0xffffffff, tmp[o][m], s);
+                    if (lane == 0) {
+                        const int id = row0 + o;
+                        const float val = tmp[o][m];
+                        if (val > best[m] || (val == best[m] && id < best_id[m])) {
+                            best[m] = val;
+                            best_id[m] = id;
+                        }
+                    }
+                }
+            }
+        }
+        // Warp 0 must finish reading the shared reduction slots before the other warps overwrite
+        // them for the next vocabulary tile.
+        __syncthreads();
+    }
+    if (tid == 0) {
+        #pragma unroll
+        for (int m = 0; m < MMAX; ++m) {
+            if (m >= M) break;
+            partial_val[(size_t)m * gridDim.x + blockIdx.x] = best[m];
+            partial_id[(size_t)m * gridDim.x + blockIdx.x] = best_id[m];
+        }
+    }
+}
+
+__device__ __forceinline__ void si_argmax_pair(float& best, int& best_id,
+                                                float other, int other_id) {
+    if (other > best || (other == best && other_id < best_id)) {
+        best = other;
+        best_id = other_id;
+    }
+}
+
+__global__ void si_mmvq_q4k_argmax_reduce_kernel(
+        const float* __restrict__ partial_val, const int* __restrict__ partial_id,
+        int* __restrict__ out_id, int nblocks) {
+    const int row = blockIdx.x;
+    __shared__ float s_val[256];
+    __shared__ int s_id[256];
+    float best = -1.0e30f;
+    int best_id = 0;
+    for (int i = threadIdx.x; i < nblocks; i += blockDim.x)
+        si_argmax_pair(best, best_id,
+                       partial_val[(size_t)row * nblocks + i],
+                       partial_id[(size_t)row * nblocks + i]);
+    s_val[threadIdx.x] = best;
+    s_id[threadIdx.x] = best_id;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            si_argmax_pair(s_val[threadIdx.x], s_id[threadIdx.x],
+                           s_val[threadIdx.x + stride], s_id[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out_id[row] = s_id[0];
+}
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q4k_rows_exact_kernel<__nv_bfloat16, 8, 8, SI_Q4K_OROWS, 1>(
     const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
@@ -3564,6 +3685,29 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
         return true;
     }
     return false;
+}
+bool launch_mmvq_rows_argmax(int qtype, const void* q81, const void* W, float* scratch,
+                             int* out_id, int M, int N, int K, cudaStream_t stream) {
+    // This is deliberately narrow: Qwen3.8's exact Q4_K verifier head is the scored workload and
+    // the kernel has K=5120 (20 super-blocks) compiled into its reduction order.
+    if (qtype != 12 || K != 5120 || M < 2 || M > 6 || N < 1 || !scratch || !out_id) return false;
+    static const int blocks = [] {
+        const char* e = getenv("SPARKINFER_Q4K_HEAD_BLOCKS");
+        const int v = e ? atoi(e) : 512;
+        return (v == 256 || v == 512 || v == 1024 || v == 2048 || v == 4096) ? v : 2048;
+    }();
+    auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    auto* w = reinterpret_cast<const unsigned char*>(W);
+    int* partial_id = reinterpret_cast<int*>(scratch + (size_t)M * blocks);
+    if (M <= 4)
+        si_mmvq_q4k_rows_argmax_kernel<4, 2><<<blocks, 4 * 32, 0, stream>>>(
+            q, w, scratch, partial_id, M, N);
+    else
+        si_mmvq_q4k_rows_argmax_kernel<6, 2><<<blocks, 4 * 32, 0, stream>>>(
+            q, w, scratch, partial_id, M, N);
+    si_mmvq_q4k_argmax_reduce_kernel<<<M, 256, 0, stream>>>(
+        scratch, partial_id, out_id, blocks);
+    return true;
 }
 void launch_mmvq_q80(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);

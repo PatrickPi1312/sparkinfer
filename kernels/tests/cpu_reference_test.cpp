@@ -297,6 +297,33 @@ static double test_argmax_twopass(int vocab, int nblocks, bool ties) {
     return (double)std::abs(ri - gi);   // expect 0: same index as serial argmax
 }
 
+// Persistent LM-head mapping: block b owns OROWS adjacent vocabulary ids, then advances by the
+// whole grid. Reducing one winner per block must cover every id exactly once and preserve the
+// smallest-id tie break used by the production argmax.
+static double test_argmax_persistent(int vocab, int nblocks, int orows, bool ties) {
+    vector<float> L(vocab);
+    for (auto& v : L) v = frand();
+    if (ties) {
+        for (auto& v : L) v = 0.f;
+        for (int i : {5, 250, 77777 % vocab, vocab - 1}) L[i] = 7.f;
+    }
+    auto merge = [](float& bv, int& bi, float ov, int oi) {
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    };
+    float gv = -1e30f; int gi = 0;
+    for (int v = 0; v < vocab; ++v) merge(gv, gi, L[v], v);
+
+    vector<float> pv(nblocks, -1e30f);
+    vector<int> pi(nblocks, 0);
+    for (int b = 0; b < nblocks; ++b)
+        for (int row0 = b * orows; row0 < vocab; row0 += nblocks * orows)
+            for (int o = 0; o < orows && row0 + o < vocab; ++o)
+                merge(pv[b], pi[b], L[row0 + o], row0 + o);
+    float rv = -1e30f; int ri = 0;
+    for (int b = 0; b < nblocks; ++b) merge(rv, ri, pv[b], pi[b]);
+    return (double)std::abs(ri - gi);
+}
+
 int main() {
     printf("sparkinfer kernel algorithm correctness (CPU reference)\n");
     check("attention hd128 kv1",   test_attention(128, 1),    1e-4);
@@ -317,6 +344,12 @@ int main() {
     check("argmax 2pass qwen vocab",test_argmax_twopass(151936, 512, false), 0.0);
     check("argmax 2pass gemma vocab",test_argmax_twopass(262144, 512, false), 0.0);
     check("argmax 2pass tie-break",  test_argmax_twopass(151936, 512, true),  0.0);
+    check("argmax persistent 256",  test_argmax_persistent(248320, 256, 2, false), 0.0);
+    check("argmax persistent 512",  test_argmax_persistent(248320, 512, 2, false), 0.0);
+    check("argmax persistent 1024", test_argmax_persistent(248320, 1024, 2, false), 0.0);
+    check("argmax persistent 2048", test_argmax_persistent(248320, 2048, 2, false), 0.0);
+    check("argmax persistent 4096", test_argmax_persistent(248320, 4096, 2, false), 0.0);
+    check("argmax persistent ties", test_argmax_persistent(248320, 512, 2, true), 0.0);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

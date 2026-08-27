@@ -202,6 +202,11 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
 // FP32-output counterpart for verifier logits. It preserves the serial decode reduction order.
 bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
                           int M, int N, int K, cudaStream_t stream = nullptr);
+// Exact Q4_K short-row LM head fused with greedy argmax. Uses `scratch` for partial winners and
+// returns false for unsupported shapes so callers can fall back to logits + launch_argmax.
+bool launch_mmvq_rows_argmax(int qtype, const void* q81, const void* W, float* scratch,
+                             int* out_id, int M, int N, int K,
+                             cudaStream_t stream = nullptr);
 // GDN: four Q4_K projections from one block_q8_1 activation in a single grid (K=2048).
 void launch_gdn_quad_mmvq_q4k(const void* q81,
     const void* W0, const void* W1, const void* W2, const void* W3,
