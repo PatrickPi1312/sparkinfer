@@ -172,6 +172,10 @@ int main(int argc, char** argv) {
     memck("after target load");
 
     sparkinfer::DFlashDraftConfig dcfg;
+    // The draft must cover the same per-run token budget as the target. Its legacy 8192 default
+    // otherwise fails at an exactly-8k prompt before the first proposal (the B-token block needs
+    // headroom beyond the prompt), even though the target was sized correctly above.
+    dcfg.max_seq = cfg.max_seq;
     sparkinfer::DFlashDraftModel draft(dcfg);
     if (!draft.load(dpath)) { printf("[FAIL] draft load\n"); return 1; }
     memck("after draft load");
