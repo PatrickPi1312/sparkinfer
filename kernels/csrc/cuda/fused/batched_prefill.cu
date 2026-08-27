@@ -672,6 +672,122 @@ __global__ void df_gdn_scan_checkpoint_kernel(
     }
 }
 
+// CONV FOLDED INTO THE VERIFY SCAN. df_gdn_conv_par_kernel + df_gdn_scan_checkpoint_kernel<..,false>
+// were two graph nodes per GDN layer -- 96 a verify on Qwen3.8-27B, and nsys puts the conv at
+// ~3 us of kernel plus its node gap for ~40 KB of work. The conv is a 4-tap FIR over the token
+// axis with a SiLU (and, for q/k, a per-head RMS norm), i.e. a few hundred FLOPs per head per
+// token: cheap enough for every scan CTA to re-derive the q/k head vector and the v column it
+// consumes, straight from the pre-conv projection it already has in L2, so the conv launch goes.
+//
+// BIT-IDENTICAL to the pair: the same taps in the same ascending order with the current token's
+// tap last, the same SiLU, the same two-stage norm (a 32-lane butterfly per 32-dim slice, then a
+// butterfly over the four slice sums seated in lanes 0..3, exactly the conv kernel's warp -> smem
+// -> warp fold), and each value rounded through bf16 before the scan reads it, as it was when it
+// travelled through memory. The scan itself is df_gdn_scan_checkpoint_kernel's, unchanged. The
+// commit still needs post-conv k/v, so this kernel writes them where the conv did: v from every
+// warp for its own column, k once per q head from the first CTA of that head's group.
+template <int COLS, int HEAD_DIM>
+__global__ void df_gdn_conv_scan_compact_kernel(
+    const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
+    const __nv_bfloat16* __restrict__ conv_live,
+    __nv_bfloat16* __restrict__ k_out, __nv_bfloat16* __restrict__ v_out,
+    const __nv_bfloat16* __restrict__ alpha, const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ dt, const __nv_bfloat16* __restrict__ a,
+    const float* __restrict__ live_state, __nv_bfloat16* __restrict__ out,
+    int n_tokens, int q_heads, int v_heads, int conv_kernel, float eps, bool qh_block) {
+    constexpr int NROW = HEAD_DIM / 32;
+    static_assert(NROW == 4, "the folded norm seats one 32-dim slice sum per lane 0..3");
+    const int vh = blockIdx.x;
+    const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads || j >= HEAD_DIM) return;
+    const int qh = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
+    const int q_dim = q_heads * HEAD_DIM;
+    const int v_dim = v_heads * HEAD_DIM;
+    const int qkv_dim = 2 * q_dim + v_dim;
+    const size_t col_off = ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;
+    const float scale = rsqrtf((float)HEAD_DIM);
+    const float a_h = pf_to_f(a[vh]);
+    const float dt_h = pf_to_f(dt[vh]);
+    // The one CTA per q head that materialises k for the commit.
+    const bool write_k = (blockIdx.y == 0) &&
+                         (qh_block ? (vh % (v_heads / q_heads)) == 0 : vh < q_heads);
+
+    // conv for one pre-conv column d at token t: taps ascending, current token last (the order
+    // df_gdn_conv_par_kernel uses), then SiLU. Negative positions come from the live conv state.
+    auto conv_at = [&](int d, int t) -> float {
+        float y = 0.f;
+#pragma unroll
+        for (int c = 0; c < 7; c++) {
+            if (c >= conv_kernel - 1) break;
+            const int p = t - (conv_kernel - 1) + c;
+            const float h = p >= 0 ? pf_to_f(qkv[(size_t)p * qkv_dim + d])
+                                   : pf_to_f(conv_live[(size_t)(t + c) * qkv_dim + d]);
+            y += h * pf_to_f(conv_w[(size_t)d * conv_kernel + c]);
+        }
+        y += pf_to_f(qkv[(size_t)t * qkv_dim + d]) *
+             pf_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+        return pf_silu(y);
+    };
+    // The conv kernel's norm over a 128-dim head: warp w summed dims 32w..32w+31 with one
+    // butterfly, the four sums were folded by a second butterfly over lanes 0..3 (zeros beyond),
+    // and the head was scaled by rsqrtf(sum + eps). Slice r here IS dims 32r..32r+31, lane by lane.
+    auto head_norm = [&](const float (&cv)[NROW]) -> float {
+        float ss[NROW];
+#pragma unroll
+        for (int r = 0; r < NROW; r++) ss[r] = pf_wsum(cv[r] * cv[r]);
+        float vv = lane == 0 ? ss[0] : lane == 1 ? ss[1] : lane == 2 ? ss[2] : lane == 3 ? ss[3] : 0.f;
+        vv = pf_wsum(vv);
+        return rsqrtf(vv + eps);
+    };
+
+    float sloc[NROW];
+#pragma unroll
+    for (int r = 0; r < NROW; r++) sloc[r] = live_state[col_off + lane + r * 32];
+
+    for (int t = 0; t < n_tokens; t++) {
+        // q and k heads for this token, exactly as the conv kernel would have stored them.
+        float qc[NROW], kc[NROW];
+#pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const int i = lane + r * 32;
+            qc[r] = conv_at(qh * HEAD_DIM + i, t);
+            kc[r] = conv_at(q_dim + qh * HEAD_DIM + i, t);
+        }
+        const float qinv = head_norm(qc);
+        const float kinv = head_norm(kc);
+        float qv[NROW], kv[NROW];
+#pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const __nv_bfloat16 qb = __float2bfloat16(qc[r] * qinv);
+            const __nv_bfloat16 kb = __float2bfloat16(kc[r] * kinv);
+            qv[r] = pf_to_f(qb);
+            kv[r] = pf_to_f(kb);
+            if (write_k) k_out[(size_t)t * q_dim + qh * HEAD_DIM + lane + r * 32] = kb;
+        }
+        const __nv_bfloat16 vb = __float2bfloat16(conv_at(2 * q_dim + vh * HEAD_DIM + j, t));
+        const float vval = pf_to_f(vb);
+        if (lane == 0) v_out[(size_t)t * v_dim + vh * HEAD_DIM + j] = vb;
+
+        const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * v_heads + vh]));
+        const float g = __expf(pf_softplus(pf_to_f(alpha[(size_t)t * v_heads + vh]) + dt_h) * a_h);
+        float part_sk = 0.f;
+#pragma unroll
+        for (int r = 0; r < NROW; r++) part_sk += sloc[r] * kv[r];
+        const float sk = g * pf_wsum(part_sk);
+        const float delta = (vval - sk) * bb;
+        float part_y = 0.f;
+#pragma unroll
+        for (int r = 0; r < NROW; r++) {
+            const float s_new = sloc[r] * g + kv[r] * delta;
+            sloc[r] = s_new;
+            part_y += s_new * qv[r] * scale;
+        }
+        const float y = pf_wsum(part_y);
+        if (lane == 0) out[(size_t)t * v_dim + vh * HEAD_DIM + j] = __float2bfloat16(y);
+    }
+}
+
 // Commit only the accepted compact recurrence inputs. Verification already retained k/v and the
 // scalar gates for each row, so materializing N full state checkpoints is unnecessary: replay the
 // accepted prefix once into the live state. The update expression and reduction order are the
@@ -1510,6 +1626,31 @@ void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
         reinterpret_cast<const __nv_bfloat16*>(beta), reinterpret_cast<const __nv_bfloat16*>(dt),
         reinterpret_cast<const __nv_bfloat16*>(a), live_state,
         reinterpret_cast<__nv_bfloat16*>(out), nullptr, n_tokens, q_heads, v_heads, qh_block);
+}
+
+bool launch_dflash_gdn_conv_scan_compact(const void* qkv, const void* conv_w,
+                                         const void* conv_live, void* k_out, void* v_out,
+                                         const void* alpha, const void* beta,
+                                         const void* dt, const void* a, const float* live_state,
+                                         void* out, int n_tokens, int q_heads, int v_heads,
+                                         int head_dim, int conv_kernel, float eps,
+                                         bool qh_block, cudaStream_t stream) {
+    // SPARKINFER_DFLASH_GDN_FUSE=0 keeps the conv + scan pair, for an A/B out of one binary.
+    static const bool on = []{ const char* e = getenv("SPARKINFER_DFLASH_GDN_FUSE");
+                               return !(e && e[0] == '0'); }();
+    if (!on || n_tokens <= 0 || head_dim != 128 || conv_kernel < 2 || conv_kernel > 8) return false;
+    if (q_heads <= 0 || v_heads <= 0 || (qh_block ? (v_heads % q_heads) != 0 : false)) return false;
+    constexpr int COLS = 4;
+    dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
+    df_gdn_conv_scan_compact_kernel<COLS, 128><<<grid, COLS * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+        reinterpret_cast<const __nv_bfloat16*>(conv_live),
+        reinterpret_cast<__nv_bfloat16*>(k_out), reinterpret_cast<__nv_bfloat16*>(v_out),
+        reinterpret_cast<const __nv_bfloat16*>(alpha), reinterpret_cast<const __nv_bfloat16*>(beta),
+        reinterpret_cast<const __nv_bfloat16*>(dt), reinterpret_cast<const __nv_bfloat16*>(a),
+        live_state, reinterpret_cast<__nv_bfloat16*>(out), n_tokens, q_heads, v_heads,
+        conv_kernel, eps, qh_block);
+    return true;
 }
 
 void launch_dflash_gdn_conv_commit(const void* qkv, void* live_state, int n_tokens,
