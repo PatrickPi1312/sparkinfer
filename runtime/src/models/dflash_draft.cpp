@@ -1253,12 +1253,16 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // `dp` non-null = replay form: `past_h` is 0, cache pointers and positions are issued
     // without `past`, and the kernels add *dp (uploaded as the first node). Null = eager form,
     // `past_h == past`, bit-for-bit the pre-existing launch sequence.
+    // Host-side per-block state goes to its pinned mirrors HERE, before either form launches: a
+    // replayed graph re-reads the mirrors (the ids upload is one of its nodes) and runs none of
+    // the host code inside `issue`, so nothing the block depends on may be staged in there.
+    if (kPinIds && s.h_ids)
+        for (int i = 0; i < BW; i++) s.h_ids[i] = noise_ids[i];
     bool head_done = s.head_done_last;
     auto issue = [&](const int* dp, const int past_h) -> bool {
     if (dp) cu(cudaMemcpyAsync(s.d_past, s.h_past, sizeof(int), cudaMemcpyHostToDevice, st),
                "past upload");
     if (kPinIds && s.h_ids) {
-        for (int i = 0; i < BW; i++) s.h_ids[i] = noise_ids[i];
         cu(cudaMemcpyAsync(s.d_ids, s.h_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
     } else {
         cu(cudaMemcpyAsync(s.d_ids, noise_ids, BW * sizeof(int), cudaMemcpyHostToDevice, st), "ids");
