@@ -398,6 +398,7 @@ struct DFlashDraftModel::Impl {
     };
     std::vector<DraftGraph> graphs;
     bool graph_disabled = false;
+    bool head_done_last = false;    // head path taken by the last issued block (see forward_block)
 
     // The draft's quantized weight copies are built on first use, not at load. Constructing them
     // is what makes merely loading the draft tax the TARGET's decode: measured on RTX 5090 with
@@ -1252,6 +1253,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // `dp` non-null = replay form: `past_h` is 0, cache pointers and positions are issued
     // without `past`, and the kernels add *dp (uploaded as the first node). Null = eager form,
     // `past_h == past`, bit-for-bit the pre-existing launch sequence.
+    bool head_done = s.head_done_last;
     auto issue = [&](const int* dp, const int past_h) -> bool {
     if (dp) cu(cudaMemcpyAsync(s.d_past, s.h_past, sizeof(int), cudaMemcpyHostToDevice, st),
                "past upload");
@@ -1674,7 +1676,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         return (e && e[0] == '0') ? 0 : 1;
     }();
     const int head_row0 = kRowShift ? 0 : 1;
-    bool head_done = false;
+    // Which head path ran decides where the readback below starts. It is a pure function of the
+    // draft's shape, so a replayed graph took the same path its capture did: remember it.
+    head_done = false;
     if (head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
         // Score only the proposal rows the verifier can consume. One row-batched quantize launch
         // instead of kProposalDepth tiny ones (8 CTAs each, so launch latency dominated them).
@@ -1868,6 +1872,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         cu(cudaMemcpyAsync(s.h_confidence + 1, s.d_confidence + 1,
                            kProposalDepth * sizeof(float), cudaMemcpyDeviceToHost, st),
            "confidence readback");
+    s.head_done_last = head_done;
     return true;
     };   // issue
 
