@@ -422,6 +422,15 @@ int main(int argc, char** argv) {
     printf(" ]\n  SPEC[");
     for (size_t i = 0; i < std::min<size_t>(8, spec.size()); i++) printf(" %d", spec[i]);
     printf(" ]\n");
+    // Full streams for cross-runtime differential debugging. Keep this opt-in: routine eval logs
+    // only need the compact prefix above, while a parity investigation needs every token id.
+    if (getenv("SPARKINFER_DSPARK_DUMP_TOKENS")) {
+        printf("DSPARK_AR_TOKENS");
+        for (int token : ar) printf(" %d", token);
+        printf("\nDSPARK_SPEC_TOKENS");
+        for (int token : spec) printf(" %d", token);
+        printf("\n");
+    }
     if (same < n) {
         size_t lo = same >= 3 ? same - 3 : 0, hi = std::min(n, same + 5);
         printf("  first divergence at index %zu, window [%zu,%zu):\n  AR  [", same, lo, hi);

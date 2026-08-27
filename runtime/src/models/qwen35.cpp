@@ -3379,10 +3379,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // Clamp to block_size: the draft can only back as many proposals as its block has rows
     // (row r-1 -> proposal r), so asking for more than B silently indexes past every
     // depth-sized buffer above and reads stale argmax rows.
-    // Short-context depth is 4, not 3. The draft proposes a token per block row and the verify
-    // planner then prices each row against its own measured width cost, so the depth only has to
-    // be deep enough that the planner has a row left to buy when the draft is confident. Measured
-    // at ctx 4096, same binary, arms alternated and repeated (tok/s):
+    // Mid-context depth is 4. The draft proposes a token per block row and the verify planner then
+    // prices each row against its own measured width cost, so the depth only has to be deep enough
+    // that the planner has a row left to buy when the draft is confident. Measured at ctx 4096,
+    // same binary, arms alternated and repeated (tok/s):
     //     depth 3 (main)  119.8543 / 119.8760      depth 4  124.7007 / 124.4120
     //     depth 5         123.2482 / 123.4245      depth 6  121.6701 / 121.6861
     //     depth 7         117.0281
@@ -3390,8 +3390,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // wider bootstrap walk, and buys nothing: uncensored acceptance -- planner disabled so every
     // proposal reaches the target -- saturates at depth 6, where depth 6 and depth 7 return an
     // IDENTICAL tau of 1.9692 over 65 steps.
+    // Very short generations are different: target verification has little KV to read, and the
+    // width planner can cheaply narrow an eight-row verify when confidence is poor. Keeping all
+    // seven checkpoint proposals available lets structured output collapse far more decode steps.
+    // On the six matched 19-41 prompt-token / 200-256 output-token workloads this moved throughput
+    // from 92-318 to 151-432 tok/s, while the 4k regime above keeps its measured depth-4 optimum.
+    const bool kShortGeneration = (n + max_new + B) <= kCompactMaxSeq;
     const int kProposalDepth = std::min(B, kProposalDepthEnv > 0 ? kProposalDepthEnv
-                             : ((n + max_new) >= kDeepMinSeq ? 7 : 4));
+                             : (kShortGeneration || (n + max_new) >= kDeepMinSeq ? 7 : 4));
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
@@ -3641,8 +3647,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // decay hand the stream back to the token loop within a couple of steps if the draft turns
         // out not to be landing blocks. Below the floor the ramp is untouched.
         if (step_no == 0 && (start + B) >= kEngageMinSeq) keep_ema8 = kEngageKeepEighths;
+        // At full checkpoint depth the width planner, rather than the old all-or-nothing compact
+        // gate, decides how many rows pay. Falling back to the token loop after a partial block is
+        // especially costly here: it serializes up to seven ~10.7 ms target forwards. Keep the
+        // explicit COMPACT_VERIFY=0 override, but make planned batching the adaptive default for
+        // short full-depth generations.
+        const bool short_planned_verify = short_ctx && kProposalDepth == B;
         const bool compact_verify = compact_mode == 1 ||
-            (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
+            (compact_mode != 0 && (short_ctx ? (short_planned_verify || compact_score >= kBlockScore)
                                              : ((start + B) >= kEngageMinSeq &&
                                                 keep_ema8 >= kEngageKeepEighths)));
         if (compact_verify) disarmed_run = 0; else ++disarmed_run;
